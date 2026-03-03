@@ -1,4 +1,4 @@
-# Especificacion tecnica MVP (v1.1)
+# Especificacion tecnica MVP (v1.2)
 
 ## Objetivo
 Implementar un flujo de auditoria en tiempo real con:
@@ -6,6 +6,7 @@ Implementar un flujo de auditoria en tiempo real con:
 - Ingestion de eventos de sesion.
 - Entrega webhook robusta con idempotencia y reintentos.
 - Presencia remota colaborativa (participantes y control activo).
+- Dashboard web supervisor con autenticacion local.
 
 ## API interna
 
@@ -40,6 +41,37 @@ Eventos SSE emitidos:
 ### `GET /api/v1/sessions/presence`
 
 Lista sesiones con participantes activos.
+
+## API dashboard y auth
+
+### `POST /api/v1/auth/login`
+- Entrada: `AuthLoginRequestV1` (`username`, `password`).
+- Salida: `AuthLoginResponseV1` (`user`, `expires_at`).
+- Side effect: crea cookie `dashboard_session` (HTTP-only, `SameSite=Lax`).
+
+### `POST /api/v1/auth/logout`
+- Elimina sesion local web y limpia cookie.
+
+### `GET /api/v1/auth/me`
+- Requiere cookie valida.
+- Devuelve usuario autenticado y expiracion de sesion.
+
+### `GET /api/v1/dashboard/summary?from=&to=`
+- Requiere cookie valida.
+- Resumen agregado del rango solicitado.
+
+### `GET /api/v1/events?...`
+- Requiere cookie valida.
+- Filtros: `session_id`, `user_id`, `event_type`, `from`, `to`, `page`, `page_size`.
+- Salida paginada: `PaginatedResponseV1<SessionTimelineItemV1>`.
+
+### `GET /api/v1/sessions/:session_id/timeline?page=&page_size=`
+- Requiere cookie valida.
+- Timeline paginado por sesion.
+
+### `GET /api/v1/reports/sessions.csv?from=&to=&user_id=`
+- Requiere cookie valida.
+- Exporta CSV de sesiones agregadas por rango.
 
 ## Contrato `SessionEventV1`
 
@@ -108,6 +140,21 @@ Reglas:
 - `control_changed`: limpia control previo y asigna control activo al nuevo participante.
 - `participant_activity`: refresca actividad y mantiene participante activo.
 - `session_ended`: desactiva todos los participantes de la sesion.
+
+## Persistencia dashboard (SQLite)
+
+Tabla `dashboard_users`:
+- `id`, `username`, `password_hash`, `role`, `is_active`, `created_at`, `updated_at`
+
+Tabla `dashboard_sessions`:
+- `session_token`, `user_id`, `expires_at`, `created_at`, `last_seen_at`
+
+Indices:
+- `idx_session_events_timestamp`
+- `idx_session_events_session_timestamp`
+- `idx_session_events_user_timestamp`
+- `idx_session_events_type_timestamp`
+- `idx_dashboard_sessions_expiry`
 
 ## Metricas disponibles (`GET /metrics`)
 - `events_received_total`

@@ -1,59 +1,46 @@
-# RustDesk Monitoring MVP (CLI + Webhook + Presence)
+# RustDesk Monitoring MVP (Backend + Dashboard)
 
-Implementacion MVP basada en el plan de monitoreo y auditoria:
-- Control de grabacion por CLI (entrante/saliente, auto/manual/off).
-- Ingestion de eventos de sesion en server.
-- Outbox SQLite con entrega webhook, HMAC y retries exponenciales.
-- Presencia remota colaborativa (participantes, control activo, actividad).
-- Idempotencia por `event_id`.
-- Metricas y logs estructurados.
+MVP de monitoreo y auditoria para un fork corporativo de RustDesk.
 
-## Componentes
+Incluye:
+- Ingestion de eventos de sesion (`SessionEventV1`) con idempotencia por `event_id`.
+- Outbox SQLite para webhook con HMAC, retries exponenciales y circuit breaker.
+- Presencia colaborativa por sesion + SSE en tiempo real.
+- Dashboard web (`React + Vite + TypeScript`) con login local para supervisor.
+- Reporte CSV y timeline historico de sesiones.
 
-- `monitoring-server`
-  - Endpoint interno: `POST /api/v1/session-events`
-  - Endpoints de presencia:
-    - `GET /api/v1/sessions/:session_id/presence`
-    - `GET /api/v1/sessions/:session_id/presence/stream` (SSE en tiempo real)
-    - `GET /api/v1/sessions/presence`
-  - Endpoints operativos: `GET /health`, `GET /metrics`
-  - Cola outbox en SQLite
-  - Worker de webhook con retry + circuit breaker
-- `rustdesk-cli`
-  - Flags de grabacion:
-    - `--recording-mode=off|auto|manual`
-    - `--recording-incoming=on|off`
-    - `--recording-outgoing=on|off`
-    - `--recording-storage-path=<ruta>`
-  - Comandos runtime:
-    - `session start --session-id <id>`
-    - `session end --session-id <id>`
-    - `recording start --session-id <id>`
-    - `recording stop --session-id <id>`
-    - `presence join --session-id <id> [--participant-id <id>] [--display-name <name>] [--avatar-url <url>]`
-    - `presence leave --session-id <id> [--participant-id <id>]`
-    - `presence control --session-id <id> --participant-id <id>`
-    - `presence activity --session-id <id> [--participant-id <id>] [--signal <texto>]`
-    - `presence show --session-id <id>`
-    - `presence sessions`
+## Estructura del repo
+- `src/`: backend Rust (`monitoring-server`) + CLI (`rustdesk-cli`).
+- `web-dashboard/`: frontend supervisor.
+- `scripts/`: scripts de arranque Linux/Windows.
+- `docs/technical-spec.md`: especificacion tecnica.
+- `docs/operations.md`: guia de operacion y despliegue.
 
-## Contrato de evento
+## Arquitectura funcional
+1. RustDesk corporativo envia eventos a `POST /api/v1/session-events`.
+2. Backend guarda eventos en `session_events`, actualiza presencia y cola outbox.
+3. Worker entrega webhook con firma HMAC y retries.
+4. Dashboard consulta API protegida por cookie HTTP-only.
+5. Vista detalle usa SSE (`/presence/stream`) para cambios en tiempo real.
 
-`SessionEventV1` contiene:
-- `event_id` (uuid)
-- `event_type` (`session_started|session_ended|recording_started|recording_stopped|participant_joined|participant_left|control_changed|participant_activity`)
-- `session_id`
-- `user_id`
-- `direction` (`incoming|outgoing`)
-- `timestamp` (UTC)
-- `host_info` (opcional)
-- `meta` (objeto JSON opcional)
+## Requisitos
+
+Backend:
+- Rust (cargo/rustc).
+- Toolchain C/C++ para dependencias nativas.
+
+Dashboard:
+- Node.js 20+.
+- npm 10+.
+
+## Variables de entorno (dashboard auth)
+- `DASHBOARD_SUPERVISOR_USERNAME` (default: `supervisor`)
+- `DASHBOARD_SUPERVISOR_PASSWORD` (default inseguro: `ChangeMeNow123!`)
+- `DASHBOARD_SESSION_TTL_MINUTES` (default: `480`)
+- `DASHBOARD_COOKIE_SECURE` (default: `false`; en produccion usar `true` con HTTPS)
 
 ## Configuracion del server
-
-Usa `server-config.example.toml` como base.
-
-Opciones principales:
+Usa `server-config.example.toml` como base:
 - `webhook.enabled`
 - `webhook.url`
 - `webhook.method`
@@ -62,171 +49,118 @@ Opciones principales:
 - `webhook.retry.backoff_ms`
 - `webhook.hmac.enabled`
 - `webhook.hmac.secret`
+- `presence.stale_after_seconds` (TTL de presencia activa antes de expirar)
+- `presence.cleanup_interval_seconds` (frecuencia de limpieza de presencia)
 
-## Ejecucion
+## Levantar en Linux
 
-1. Instalar Rust (`rustup`) para obtener `cargo` y `rustc`.
-2. Instalar compilador C (`cc/gcc/clang`) para dependencias nativas (`ring`, `sqlite`).
-3. Compilar:
-
+1. Levantar backend:
 ```bash
-cargo build
+bash scripts/run-monitoring-server.sh
 ```
 
-4. Levantar server:
+Nota: el script recompila `monitoring-server` en modo release en cada arranque para evitar binarios desactualizados.  
+Si quieres saltar compilacion: `SKIP_BUILD=1 bash scripts/run-monitoring-server.sh`
 
+2. Levantar dashboard (dev):
 ```bash
-cargo run --bin monitoring-server -- \
-  --config ./server-config.example.toml \
-  --database-path ./data/outbox.db \
-  --bind 0.0.0.0:8080
+bash scripts/run-dashboard-dev.sh
 ```
 
-5. Simular sesion desde CLI:
+3. Abrir:
+- Dashboard: `http://127.0.0.1:5173`
+- Health: `http://127.0.0.1:8080/health`
+- Metrics: `http://127.0.0.1:8080/metrics`
 
+## Levantar en Windows (PowerShell)
+
+1. Levantar backend:
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\run-monitoring-server.ps1
+```
+
+Nota: el script recompila `monitoring-server.exe` en release en cada arranque para evitar binarios desactualizados.  
+Si quieres saltar compilacion: `powershell -ExecutionPolicy Bypass -File .\scripts\run-monitoring-server.ps1 -SkipBuild`
+
+2. Levantar dashboard (dev):
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\run-dashboard-dev.ps1
+```
+
+3. Abrir:
+- Dashboard: `http://127.0.0.1:5173`
+- Health: `http://127.0.0.1:8080/health`
+- Metrics: `http://127.0.0.1:8080/metrics`
+
+## Endpoints
+
+Publicos:
+- `POST /api/v1/session-events`
+- `GET /api/v1/sessions/presence`
+- `GET /api/v1/sessions/:session_id/presence`
+- `GET /api/v1/sessions/:session_id/presence/stream`
+- `GET /health`
+- `GET /metrics`
+
+Auth:
+- `POST /api/v1/auth/login`
+- `POST /api/v1/auth/logout`
+- `GET /api/v1/auth/me`
+
+Dashboard protegido:
+- `GET /api/v1/dashboard/summary?from=&to=`
+- `GET /api/v1/events?session_id=&user_id=&event_type=&from=&to=&page=&page_size=`
+- `GET /api/v1/sessions/:session_id/timeline?page=&page_size=`
+- `GET /api/v1/reports/sessions.csv?from=&to=&user_id=`
+
+## Uso del jefe (flujo real)
+1. Abrir dashboard y autenticar.
+2. Ver resumen diario (eventos, sesiones, estado webhook).
+3. Filtrar eventos por trabajador, sesion, fecha y tipo.
+4. Abrir detalle de sesion para timeline + presencia en vivo.
+5. Exportar CSV para evidencia auditable.
+
+## Uso de trabajadores (flujo real)
+1. Instalar RustDesk corporativo (fork, no cliente oficial).
+2. Ejecutar soporte remoto normal.
+3. El cliente envia eventos automaticamente al backend.
+4. TI debe comunicar aviso obligatorio de politica de monitoreo.
+
+## Prueba rapida con CLI
+
+Iniciar sesion:
 ```bash
 cargo run --bin rustdesk-cli -- \
   --server-url http://127.0.0.1:8080 \
-  --user-id admin01 \
-  --recording-mode auto \
-  session start --session-id ses-001
+  --user-id supervisor \
+  session start --session-id worker-001
 ```
 
-```bash
-cargo run --bin rustdesk-cli -- session end --session-id ses-001
-```
-
-6. Probar presencia colaborativa:
-
+Actividad/presencia:
 ```bash
 cargo run --bin rustdesk-cli -- \
   --server-url http://127.0.0.1:8080 \
-  presence join --session-id ses-001 --participant-id bob --display-name Bob
+  presence join --session-id worker-001 --participant-id empleado1 --display-name "Empleado 1"
 ```
 
+Cerrar sesion:
 ```bash
 cargo run --bin rustdesk-cli -- \
   --server-url http://127.0.0.1:8080 \
-  presence control --session-id ses-001 --participant-id bob
+  session end --session-id worker-001
 ```
 
-```bash
-cargo run --bin rustdesk-cli -- \
-  --server-url http://127.0.0.1:8080 \
-  presence show --session-id ses-001
-```
-
-7. Probar stream en tiempo real (SSE):
-
-```bash
-curl -N http://127.0.0.1:8080/api/v1/sessions/ses-001/presence/stream
-```
-
-En otra terminal, dispara cambios:
-
-```bash
-cargo run --bin rustdesk-cli -- \
-  --server-url http://127.0.0.1:8080 \
-  presence activity --session-id ses-001 --participant-id bob --signal mouse_move
-```
-
-## Notas
-
-- Si `webhook.enabled=true`, se exige `webhook.url`.
-- Si `webhook.hmac.enabled=true`, se exige `webhook.hmac.secret`.
-- El server retorna:
-  - `202 Accepted` evento encolado.
-  - `409 Conflict` `event_id` duplicado.
-  - `4xx` payload invalido.
-
-## Fork RustDesk (Ubuntu)
-
-Para compilar el fork real de RustDesk en Linux y conectar eventos al `monitoring-server`:
-
+## Integracion con fork RustDesk
+Para preparar un fork real en Ubuntu:
 ```bash
 bash scripts/install-rustdesk-ubuntu-deps.sh
 bash scripts/check-rustdesk-fork.sh
 ```
 
-Guia detallada:
+Referencia:
 - `docs/rustdesk-fork-setup-ubuntu.md`
 
-## Antes de presentar: que faltaba
-
-- Publicar este proyecto en un repo remoto (GitHub/GitLab) para que tu jefe lo pueda clonar.
-- Publicar tambien tu fork de RustDesk con los cambios de `feature/monitoring-events`.
-- Tener una URL/IP accesible del `monitoring-server` desde la red donde hara la prueba.
-- Definir receptor webhook de prueba (si quieren validar entrega/HMAC en vivo).
-- Para prueba completa de presencia, idealmente usar el fork en ambos extremos de la sesion.
-
-## Publicar este proyecto para clonado
-
-```bash
-cd /home/choy/Escritorio/Reto
-git init
-git add .
-git commit -m "MVP monitoreo RustDesk: CLI + Webhook + Presence"
-git branch -M main
-git remote add origin <URL_REPO_RETO>
-git push -u origin main
-```
-
-Haz lo mismo con tu fork de RustDesk y sube la rama:
-
-```bash
-cd /home/choy/Escritorio/rustdesk
-git push -u origin feature/monitoring-events
-```
-
-## Prueba para jefe en Linux
-
-1. Clonar y levantar server:
-
-```bash
-git clone <URL_REPO_RETO>
-cd Reto
-bash scripts/run-monitoring-server.sh
-```
-
-2. Iniciar RustDesk fork apuntando al server:
-
-```bash
-export RUSTDESK_MONITORING_URL="http://IP_DEL_SERVER:8080"
-/ruta/a/rustdesk-fork/target/debug/rustdesk
-```
-
-3. Verificar recepcion de eventos:
-
-```bash
-curl -s http://IP_DEL_SERVER:8080/metrics
-curl -s http://IP_DEL_SERVER:8080/api/v1/sessions/presence
-```
-
-## Prueba para jefe en Windows
-
-Requisitos minimos:
-- Git
-- Rustup (cargo/rustc)
-- Visual Studio Build Tools (C++ workload), si va a compilar.
-
-1. Clonar y levantar server desde PowerShell:
-
-```powershell
-git clone <URL_REPO_RETO>
-cd Reto
-powershell -ExecutionPolicy Bypass -File .\scripts\run-monitoring-server.ps1
-```
-
-2. Ejecutar RustDesk fork con variable de entorno:
-
-```powershell
-$env:RUSTDESK_MONITORING_URL = "http://IP_DEL_SERVER:8080"
-Start-Process "C:\ruta\tu-rustdesk-fork\rustdesk.exe"
-```
-
-3. Hacer una sesion real y validar:
-
-```powershell
-curl.exe http://IP_DEL_SERVER:8080/metrics
-curl.exe http://IP_DEL_SERVER:8080/api/v1/sessions/presence
-```
+## Notas de seguridad MVP
+- Cambiar password supervisor antes de demo.
+- En produccion: HTTPS + `DASHBOARD_COOKIE_SECURE=true`.
+- Mantener repo privado para codigo corporativo.

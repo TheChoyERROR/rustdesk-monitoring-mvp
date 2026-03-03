@@ -1,7 +1,8 @@
 param(
   [string]$ConfigPath = "",
   [string]$DatabasePath = "",
-  [string]$Bind = "0.0.0.0:8080"
+  [string]$Bind = "0.0.0.0:8080",
+  [switch]$SkipBuild
 )
 
 $ErrorActionPreference = "Stop"
@@ -23,8 +24,16 @@ if ($DbDir -and -not (Test-Path $DbDir)) {
 }
 
 $ExePath = Join-Path $RootDir "target/release/monitoring-server.exe"
-if (-not (Test-Path $ExePath)) {
+if (-not $SkipBuild) {
   Write-Host "Compilando monitoring-server (release)..."
+  Push-Location $RootDir
+  try {
+    cargo build --release --bin monitoring-server
+  } finally {
+    Pop-Location
+  }
+} elseif (-not (Test-Path $ExePath)) {
+  Write-Host "Binario release no encontrado, compilando..."
   Push-Location $RootDir
   try {
     cargo build --release --bin monitoring-server
