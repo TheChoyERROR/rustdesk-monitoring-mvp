@@ -1,0 +1,272 @@
+:root {
+  --bg: #f2efe8;
+  --bg-soft: #fffdf8;
+  --ink: #1f2e2d;
+  --ink-soft: #56605f;
+  --accent: #0f766e;
+  --accent-soft: #b9efe8;
+  --danger: #b42318;
+  --border: #d6d2c8;
+  --shadow: 0 14px 28px rgba(20, 40, 42, 0.12);
+  font-family: 'IBM Plex Sans', 'Segoe UI', 'Helvetica Neue', sans-serif;
+  line-height: 1.4;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  color: var(--ink);
+  background:
+    radial-gradient(circle at 10% 10%, #e7fff9 0%, transparent 34%),
+    radial-gradient(circle at 85% 12%, #ffe7c8 0%, transparent 30%),
+    linear-gradient(160deg, #f8f5ef 0%, #ece8de 100%);
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+h1,
+h2,
+h3,
+h4,
+p {
+  margin: 0;
+}
+
+input,
+select,
+button {
+  font: inherit;
+}
+
+label {
+  display: block;
+  margin-bottom: 0.35rem;
+  font-size: 0.85rem;
+  color: var(--ink-soft);
+}
+
+input,
+select {
+  width: 100%;
+  padding: 0.58rem 0.72rem;
+  border: 1px solid var(--border);
+  border-radius: 0.6rem;
+  background: #fff;
+}
+
+.centered-screen {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 1.5rem;
+}
+
+.login-panel {
+  width: min(460px, 100%);
+}
+
+.panel {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-radius: 1rem;
+  padding: 1rem;
+  box-shadow: var(--shadow);
+}
+
+.stack {
+  display: grid;
+  gap: 1rem;
+}
+
+.app-shell {
+  padding: 1rem;
+  max-width: 1320px;
+  margin: 0 auto;
+}
+
+.app-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: end;
+  gap: 1rem;
+  margin-bottom: 1rem;
+}
+
+.app-header h1 {
+  font-size: 1.55rem;
+}
+
+.app-header p {
+  color: var(--ink-soft);
+  margin-top: 0.2rem;
+}
+
+.header-actions {
+  display: flex;
+  gap: 0.6rem;
+  align-items: center;
+}
+
+.chip {
+  background: var(--accent-soft);
+  color: #07534d;
+  padding: 0.35rem 0.6rem;
+  border-radius: 999px;
+  font-weight: 700;
+}
+
+.app-nav {
+  display: flex;
+  gap: 0.8rem;
+  margin-bottom: 1rem;
+}
+
+.app-nav a {
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0.45rem 0.9rem;
+  font-weight: 600;
+}
+
+.btn {
+  border: 1px solid transparent;
+  padding: 0.54rem 0.92rem;
+  border-radius: 0.65rem;
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.btn.primary {
+  background: var(--accent);
+  color: #fff;
+}
+
+.btn.secondary {
+  border-color: var(--border);
+  background: #fff;
+  color: var(--ink);
+}
+
+.filter-row,
+.filter-grid {
+  display: grid;
+  gap: 0.8rem;
+}
+
+.filter-row {
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  align-items: end;
+}
+
+.filter-grid {
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+}
+
+.filter-actions {
+  margin-top: 0.8rem;
+  display: flex;
+  gap: 0.6rem;
+}
+
+.cards-grid {
+  display: grid;
+  gap: 0.8rem;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+}
+
+.card-accent,
+.card-muted {
+  border-radius: 1rem;
+  padding: 0.95rem;
+  display: grid;
+  gap: 0.25rem;
+}
+
+.card-accent {
+  background: linear-gradient(130deg, #074a45 0%, #0f766e 100%);
+  color: #ebfffc;
+}
+
+.card-muted {
+  background: linear-gradient(130deg, #f2efe8 0%, #e9e3d6 100%);
+}
+
+.card-accent strong,
+.card-muted strong {
+  font-size: 1.55rem;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 0.7rem;
+}
+
+th,
+td {
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+  padding: 0.55rem;
+  font-size: 0.92rem;
+}
+
+th {
+  color: var(--ink-soft);
+  font-weight: 600;
+}
+
+.pager {
+  margin-top: 0.85rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.participants-grid {
+  margin-top: 0.7rem;
+  display: grid;
+  gap: 0.7rem;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+}
+
+.participant-card {
+  border: 1px solid var(--border);
+  border-radius: 0.75rem;
+  padding: 0.72rem;
+  background: #fff;
+  display: grid;
+  gap: 0.22rem;
+}
+
+.error-text {
+  color: var(--danger);
+}
+
+@media (max-width: 720px) {
+  .app-header {
+    align-items: start;
+    flex-direction: column;
+  }
+
+  th,
+  td {
+    font-size: 0.83rem;
+  }
+}

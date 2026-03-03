@@ -3,3 +3,5 @@
 /data/*.db-shm
 /data/*.db-wal
 **/.DS_Store
+web-dashboard/node_modules/
+web-dashboard/dist/
