@@ -98,6 +98,83 @@ pub struct PresenceSessionSummaryV1 {
     pub updated_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthRoleV1 {
+    Supervisor,
+}
+
+impl AuthRoleV1 {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Supervisor => "supervisor",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthUserV1 {
+    pub id: i64,
+    pub username: String,
+    pub role: AuthRoleV1,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthLoginRequestV1 {
+    pub username: String,
+    pub password: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthLoginResponseV1 {
+    pub user: AuthUserV1,
+    pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DashboardSummaryV1 {
+    pub from: DateTime<Utc>,
+    pub to: DateTime<Utc>,
+    pub events_total: u64,
+    pub sessions_started: u64,
+    pub sessions_ended: u64,
+    pub active_sessions: u64,
+    pub webhook_pending: u64,
+    pub webhook_failed: u64,
+    pub webhook_delivered: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionTimelineItemV1 {
+    pub event_id: Uuid,
+    pub event_type: SessionEventType,
+    pub session_id: String,
+    pub user_id: String,
+    pub direction: SessionDirection,
+    pub timestamp: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_info: Option<HostInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaginatedResponseV1<T> {
+    pub items: Vec<T>,
+    pub page: u64,
+    pub page_size: u64,
+    pub total: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionReportRowV1 {
+    pub session_id: String,
+    pub started_at: DateTime<Utc>,
+    pub last_event_at: DateTime<Utc>,
+    pub events_total: u64,
+    pub users: Vec<String>,
+}
+
 impl SessionEventV1 {
     pub fn validate(&self) -> Result<(), EventValidationError> {
         if self.session_id.trim().is_empty() {

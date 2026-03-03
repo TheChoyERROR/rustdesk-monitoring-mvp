@@ -11,6 +11,8 @@ pub struct ServerConfig {
     pub worker: WorkerConfig,
     #[serde(default)]
     pub retention: RetentionConfig,
+    #[serde(default)]
+    pub presence: PresenceConfig,
 }
 
 impl Default for ServerConfig {
@@ -19,6 +21,7 @@ impl Default for ServerConfig {
             webhook: WebhookConfig::default(),
             worker: WorkerConfig::default(),
             retention: RetentionConfig::default(),
+            presence: PresenceConfig::default(),
         }
     }
 }
@@ -145,6 +148,23 @@ impl Default for RetentionConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PresenceConfig {
+    #[serde(default = "default_presence_stale_after_seconds")]
+    pub stale_after_seconds: u64,
+    #[serde(default = "default_presence_cleanup_interval_seconds")]
+    pub cleanup_interval_seconds: u64,
+}
+
+impl Default for PresenceConfig {
+    fn default() -> Self {
+        Self {
+            stale_after_seconds: default_presence_stale_after_seconds(),
+            cleanup_interval_seconds: default_presence_cleanup_interval_seconds(),
+        }
+    }
+}
+
 const fn default_timeout_ms() -> u64 {
     3_000
 }
@@ -179,4 +199,12 @@ const fn default_failed_retention_days() -> u64 {
 
 const fn default_cleanup_interval_minutes() -> u64 {
     60
+}
+
+const fn default_presence_stale_after_seconds() -> u64 {
+    120
+}
+
+const fn default_presence_cleanup_interval_seconds() -> u64 {
+    30
 }

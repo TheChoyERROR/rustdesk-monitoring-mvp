@@ -21,3 +21,7 @@ circuit_breaker_cooldown_ms = 10000
 [retention]
 failed_retention_days = 7
 cleanup_interval_minutes = 60
+
+[presence]
+stale_after_seconds = 120
+cleanup_interval_seconds = 30
