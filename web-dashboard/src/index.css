@@ -300,6 +300,41 @@ th {
   color: var(--ink-soft);
 }
 
+.activity-legend {
+  margin-top: 0.45rem;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.65rem 1rem;
+  color: var(--ink-soft);
+  font-size: 0.82rem;
+}
+
+.activity-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.activity-legend-dot {
+  width: 0.68rem;
+  height: 0.68rem;
+  border-radius: 999px;
+  display: inline-block;
+  border: 1px solid transparent;
+}
+
+.activity-legend-dot.connected {
+  background: #22c55e;
+}
+
+.activity-legend-dot.disconnected {
+  background: #ef4444;
+}
+
+.activity-legend-dot.neutral {
+  background: #94a3b8;
+}
+
 .activity-users-grid {
   margin-top: 0.8rem;
   display: grid;
@@ -345,6 +380,7 @@ th {
   border-radius: 0.55rem;
   background: linear-gradient(180deg, #fbfbfb 0%, #f4f7f7 100%);
   padding: 0.25rem;
+  position: relative;
 }
 
 .activity-sparkline {
@@ -353,12 +389,39 @@ th {
   display: block;
 }
 
+.activity-sparkline-baseline {
+  stroke: #c7d2da;
+  stroke-width: 1.2;
+  stroke-dasharray: 2 3;
+}
+
 .activity-sparkline-line {
   fill: none;
-  stroke: var(--series-color, var(--accent));
-  stroke-width: 2.6;
+  stroke: #94a3b8;
+  stroke-width: 2;
   stroke-linecap: round;
   stroke-linejoin: round;
+}
+
+.activity-status-node {
+  stroke: #ffffff;
+  stroke-width: 1.3;
+}
+
+.activity-axis-labels {
+  position: relative;
+  margin-top: 0.15rem;
+  padding-bottom: 1rem;
+  height: 1rem;
+}
+
+.activity-axis-label {
+  position: absolute;
+  transform: translateX(-50%);
+  font-size: 0.72rem;
+  color: var(--ink-soft);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
 .error-text {
