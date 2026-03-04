@@ -39,6 +39,8 @@ Configura en Render:
 - `DASHBOARD_SUPERVISOR_PASSWORD=<clave-fuerte>`
 - `DASHBOARD_COOKIE_SECURE=true`
 - `RUST_LOG=info`
+- `WEBHOOK_ENABLED=false` (default en demo)
+- `WEBHOOK_HMAC_ENABLED=false` (default en demo)
 
 ## 4) Validacion
 
@@ -60,3 +62,21 @@ Con la URL publica de Render (`https://<service>.onrender.com`):
 1. Pasar a plan con persistencia o VPS.
 2. Habilitar webhook real (`webhook.url` + HMAC secret).
 3. Cambiar password supervisor y rotar secretos.
+
+## 7) Activar webhook para prueba de jefe
+
+Si quieres mostrar flujo completo de entrega webhook en Render:
+
+1. Crea endpoint temporal en `https://webhook.site/` y copia tu URL unica.
+2. En Variables de Render configura:
+   - `WEBHOOK_ENABLED=true`
+   - `WEBHOOK_URL=<tu-url-webhook.site>`
+   - `WEBHOOK_METHOD=POST`
+   - `WEBHOOK_HMAC_ENABLED=true`
+   - `WEBHOOK_HMAC_SECRET=<secret-fuerte>`
+   - `WEBHOOK_MAX_ATTEMPTS=5`
+   - `WEBHOOK_BACKOFF_MS=500`
+3. Haz `Manual Deploy` -> `Clear build cache & deploy`.
+4. Genera eventos y valida:
+   - Dashboard: sube `webhook_entregados`
+   - webhook.site: recibe payloads firmados (`x-signature`, `x-event-id`, `x-event-type`)

@@ -159,3 +159,18 @@ Siguiente hito recomendado: generar instalador corporativo del fork de RustDesk
 Guia y script listos:
 - `docs/windows-installer.md`
 - `scripts/build-rustdesk-windows-installer.ps1`
+
+## 8) Prueba con 3-5 trabajadores (piloto)
+
+1. Jefe:
+- Abre dashboard en Render y deja pestaña `Resumen` + `Sesiones`.
+
+2. Cada trabajador (fork RustDesk):
+- Configura URL de monitoreo a Render:
+  - `RUSTDESK_MONITORING_URL=https://rustdesk-monitoring-mvp.onrender.com`
+- Inicia sesion remota normal.
+
+3. Verificacion esperada:
+- `events_total` sube en tiempo real.
+- `sesiones_activas` refleja conexiones activas.
+- Al cerrar sesion, aumenta `sesiones_cerradas`.

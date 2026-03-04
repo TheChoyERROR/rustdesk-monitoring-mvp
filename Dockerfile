@@ -30,12 +30,13 @@ RUN apt-get update \
 COPY --from=rust-build /app/target/release/monitoring-server ./monitoring-server
 COPY --from=web-build /app/web-dashboard/dist ./web-dashboard/dist
 COPY server-config.railway.toml ./server-config.railway.toml
+COPY entrypoint-monitoring.sh ./entrypoint-monitoring.sh
 
-RUN mkdir -p /app/data
+RUN mkdir -p /app/data && chmod +x /app/entrypoint-monitoring.sh
 
 ENV RUST_LOG=info
 ENV DASHBOARD_DIST_DIR=/app/web-dashboard/dist
 
 EXPOSE 8080
 
-CMD ["sh", "-c", "./monitoring-server --bind 0.0.0.0:${PORT:-8080} --database-path /app/data/outbox.db --config /app/server-config.railway.toml"]
+CMD ["/app/entrypoint-monitoring.sh"]

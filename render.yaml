@@ -16,3 +16,7 @@ services:
         value: "true"
       - key: RUST_LOG
         value: info
+      - key: WEBHOOK_ENABLED
+        value: "false"
+      - key: WEBHOOK_HMAC_ENABLED
+        value: "false"
