@@ -1,0 +1,98 @@
+RUSTDESK MONITORING MVP - REPORTE PROFESIONAL DE AVANCE
+Fecha: 2026-03-04
+Proyecto: rustdesk-monitoring-mvp
+
+1) Resumen Ejecutivo
+- Se implemento un MVP robusto para monitoreo y auditoria de sesiones RustDesk corporativas.
+- El sistema ya cubre ingestion de eventos, outbox persistente, entrega webhook con seguridad HMAC, presencia en tiempo real, dashboard web con login y exportacion CSV.
+- Se validaron flujos locales y despliegue cloud de demo (Render), quedando una base operativa para pruebas con jefe + trabajadores.
+
+2) Alcance Implementado
+Backend (Rust):
+- API de ingestion: POST /api/v1/session-events
+- Idempotencia por event_id (rechazo de duplicados)
+- Persistencia SQLite para eventos, outbox, presencia y auth dashboard
+- Worker webhook con:
+  - retries exponenciales
+  - timeout
+  - circuit breaker basico
+  - firma HMAC (sha256)
+- Metricas Prometheus:
+  - events_received_total
+  - webhook_sent_total
+  - webhook_failed_total
+  - webhook_retry_total
+  - webhook_latency_ms_sum/count
+- Health endpoint: GET /health
+
+Presencia y tiempo real:
+- Snapshot de presencia por sesion
+- Listado de sesiones con presencia activa
+- Streaming SSE por sesion:
+  - presence_snapshot
+  - presence_missing
+  - presence_lagged
+  - presence_error
+- Limpieza automatica de presencia estancada (TTL configurable)
+
+Dashboard (React + Vite + TypeScript):
+- Login/logout/me con cookie HTTP-only
+- Resumen operativo (eventos, sesiones, estado webhook)
+- Vista de sesiones con filtros/paginacion
+- Detalle de sesion con:
+  - presencia en tiempo real
+  - avatares por participante
+  - timeline historico
+  - actividad por usuario (estado por intervalo y leyenda visual)
+- Exportacion CSV de reportes
+
+Operacion y despliegue:
+- Scripts Linux/Windows para correr backend y dashboard
+- Documentacion de operacion y despliegue en Railway/Render
+- Dockerfile y render.yaml para despliegue cloud rapido
+
+3) Integracion con Fork de RustDesk (repositorio separado)
+Se avanzo en el fork para integracion real de cliente corporativo:
+- Emision de eventos de sesion/presencia hacia backend de monitoreo.
+- Soporte de perfil de monitoreo en UI (display name + avatar).
+- Soporte de avatar local (archivo JPG/PNG/WEBP) y URL.
+- Ajustes de robustez en selector/cierre de dialogo de avatar.
+- Script para empaquetado .deb corporativo con URL de monitoreo.
+
+Nota:
+- Estos cambios viven en la rama feature/monitoring-events del fork RustDesk, no dentro de este repo.
+
+4) Evidencia Tecnica y Validaciones
+- Endpoints de salud y metricas respondiendo correctamente en entorno local y cloud.
+- Dashboard mostrando sesiones/presencia/timeline alimentados por eventos.
+- Flujo de webhook probado con endpoint temporal (webhook.site) para validar entrega y headers.
+- Build frontend validado en produccion (vite build).
+- Scripts de arranque y guias de ejecucion documentados para Linux/Windows.
+
+5) Riesgos Detectados y Mitigaciones
+- Riesgo: trabajadores usando RustDesk oficial en vez del corporativo.
+  Mitigacion: distribucion TI del instalador corporativo y politica interna obligatoria.
+- Riesgo: confusiones de build entre repos (MVP vs fork RustDesk).
+  Mitigacion: documentacion por repo y playbooks separados.
+- Riesgo: endpoint webhook inestable.
+  Mitigacion: retries + timeout + circuit breaker + auditoria en outbox.
+- Riesgo: dudas legales/RRHH sobre monitoreo.
+  Mitigacion: aviso explicito de politica y registro documental de aceptacion.
+
+6) Brechas Actuales (No bloqueantes para demo controlada)
+- Empaquetado Windows final del fork corporativo en entorno Windows aun pendiente de estandarizacion completa.
+- Firma de codigo (code signing) no aplicada en esta etapa MVP.
+- Sin SSO/roles avanzados (solo login local supervisor en MVP).
+- Retencion/backups de SQLite deben formalizarse en entorno productivo.
+
+7) Recomendaciones Inmediatas (siguiente iteracion)
+1. Cerrar pipeline de instalador Windows (.exe) reproducible en CI.
+2. Ejecutar piloto con 3-5 trabajadores y checklist de soporte.
+3. Activar webhook productivo (destino interno) con secreto HMAC rotado.
+4. Definir runbook formal de incidentes y backup/restore.
+5. Preparar decision de escalamiento SQLite -> Postgres segun carga.
+
+8) Estado General
+- Estado del MVP: OPERATIVO para demo y piloto controlado.
+- Calidad de arquitectura: adecuada para crecer por fases sin rehacer contrato de eventos.
+- Resultado para direccion/jefatura: ya es posible supervisar actividad real desde panel web sin depender de CLI.
