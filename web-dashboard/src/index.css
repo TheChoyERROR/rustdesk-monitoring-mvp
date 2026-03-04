@@ -255,6 +255,46 @@ th {
   gap: 0.22rem;
 }
 
+.participant-heading {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  margin-bottom: 0.35rem;
+}
+
+.participant-avatar,
+.participant-avatar-fallback {
+  width: 42px;
+  height: 42px;
+  border-radius: 999px;
+  flex: 0 0 auto;
+}
+
+.participant-avatar {
+  object-fit: cover;
+  border: 1px solid var(--border);
+}
+
+.participant-avatar-fallback {
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--border);
+  background: linear-gradient(145deg, #d8efe9 0%, #bfe3da 100%);
+  color: #0f5d56;
+  font-weight: 700;
+}
+
+.participant-badge {
+  display: inline-block;
+  margin-top: 0.2rem;
+  font-size: 0.76rem;
+  font-weight: 700;
+  color: #0b544e;
+  background: #c7efe8;
+  border-radius: 999px;
+  padding: 0.15rem 0.45rem;
+}
+
 .error-text {
   color: var(--danger);
 }

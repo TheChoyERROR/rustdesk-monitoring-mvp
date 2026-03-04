@@ -89,6 +89,17 @@ cargo run --bin rustdesk-cli -- \
   --display-name "Empleado 1"
 ```
 
+### Actividad/presencia con avatar
+```bash
+cd /home/choy/Escritorio/Reto
+cargo run --bin rustdesk-cli -- \
+  --server-url http://127.0.0.1:8080 \
+  presence join --session-id worker-001 \
+  --participant-id empleado1 \
+  --display-name "Empleado 1" \
+  --avatar-url "https://i.pravatar.cc/96?u=empleado1"
+```
+
 ### Cierre de sesion
 ```bash
 cd /home/choy/Escritorio/Reto

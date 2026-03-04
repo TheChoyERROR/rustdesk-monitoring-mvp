@@ -63,7 +63,7 @@ export interface PaginatedResponse<T> {
 export interface PresenceParticipant {
   participant_id: string;
   display_name: string;
-  avatar_url?: string;
+  avatar_url?: string | null;
   is_active: boolean;
   is_control_active: boolean;
   last_activity_at: string;

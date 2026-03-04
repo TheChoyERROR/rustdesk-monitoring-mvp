@@ -147,6 +147,15 @@ cargo run --bin rustdesk-cli -- \
   presence join --session-id worker-001 --participant-id empleado1 --display-name "Empleado 1"
 ```
 
+Actividad/presencia con avatar (visible en detalle de sesion):
+```bash
+cargo run --bin rustdesk-cli -- \
+  --server-url http://127.0.0.1:8080 \
+  presence join --session-id worker-001 --participant-id empleado1 \
+  --display-name "Empleado 1" \
+  --avatar-url "https://i.pravatar.cc/96?u=empleado1"
+```
+
 Cerrar sesion:
 ```bash
 cargo run --bin rustdesk-cli -- \

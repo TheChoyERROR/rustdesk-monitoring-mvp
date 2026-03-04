@@ -3,7 +3,24 @@ import { useParams } from 'react-router-dom';
 
 import { apiSessionPresence, apiSessionTimeline, sessionPresenceStreamUrl } from '../api';
 import { formatDateTime } from '../lib/time';
-import type { SessionPresence, SessionTimelineItem } from '../types';
+import type { PresenceParticipant, SessionPresence, SessionTimelineItem } from '../types';
+
+function participantName(participant: PresenceParticipant): string {
+  const fromDisplayName = participant.display_name?.trim();
+  if (fromDisplayName) {
+    return fromDisplayName;
+  }
+  return participant.participant_id;
+}
+
+function participantInitial(participant: PresenceParticipant): string {
+  const name = participantName(participant);
+  return name.charAt(0).toUpperCase();
+}
+
+function hasAvatarUrl(participant: PresenceParticipant): participant is PresenceParticipant & { avatar_url: string } {
+  return typeof participant.avatar_url === 'string' && participant.avatar_url.trim().length > 0;
+}
 
 export default function SessionDetailPage() {
   const { sessionId = '' } = useParams();
@@ -13,6 +30,7 @@ export default function SessionDetailPage() {
   const [presence, setPresence] = useState<SessionPresence | null>(null);
   const [streamState, setStreamState] = useState('conectando');
   const [error, setError] = useState<string | null>(null);
+  const [failedAvatarIds, setFailedAvatarIds] = useState<Record<string, boolean>>({});
 
   const load = useCallback(async () => {
     try {
@@ -22,6 +40,7 @@ export default function SessionDetailPage() {
       ]);
       setTimeline(timelineData.items);
       setPresence(presenceData);
+      setFailedAvatarIds({});
       setError(null);
     } catch {
       setError('No se pudo cargar el detalle de sesion.');
@@ -94,10 +113,39 @@ export default function SessionDetailPage() {
             <div className="participants-grid">
               {presence.participants.map((participant) => (
                 <article key={participant.participant_id} className="participant-card">
-                  <h4>{participant.display_name}</h4>
+                  <div className="participant-heading">
+                    {hasAvatarUrl(participant) ? (
+                      failedAvatarIds[participant.participant_id] ? (
+                        <div className="participant-avatar-fallback" aria-hidden="true">
+                          {participantInitial(participant)}
+                        </div>
+                      ) : (
+                        <img
+                          src={participant.avatar_url}
+                          alt={`Avatar de ${participantName(participant)}`}
+                          className="participant-avatar"
+                          loading="lazy"
+                          onError={() => {
+                            setFailedAvatarIds((prev) => ({
+                              ...prev,
+                              [participant.participant_id]: true,
+                            }));
+                          }}
+                        />
+                      )
+                    ) : (
+                      <div className="participant-avatar-fallback" aria-hidden="true">
+                        {participantInitial(participant)}
+                      </div>
+                    )}
+                    <div>
+                      <h4>{participantName(participant)}</h4>
+                      {participant.is_control_active && <span className="participant-badge">Control activo</span>}
+                    </div>
+                  </div>
                   <p>ID: {participant.participant_id}</p>
                   <p>Activo: {participant.is_active ? 'si' : 'no'}</p>
-                  <p>Control: {participant.is_control_active ? 'si' : 'no'}</p>
+                  <p>Avatar: {hasAvatarUrl(participant) ? 'si' : 'no'}</p>
                   <p>Ultima actividad: {formatDateTime(participant.last_activity_at)}</p>
                 </article>
               ))}
