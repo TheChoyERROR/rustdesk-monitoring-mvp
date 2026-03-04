@@ -1,0 +1,25 @@
+[webhook]
+enabled = false
+method = "POST"
+timeout_ms = 3000
+
+[webhook.retry]
+max_attempts = 5
+backoff_ms = 500
+
+[webhook.hmac]
+enabled = false
+
+[worker]
+concurrency = 4
+poll_interval_ms = 500
+circuit_breaker_threshold = 5
+circuit_breaker_cooldown_ms = 10000
+
+[retention]
+failed_retention_days = 7
+cleanup_interval_minutes = 60
+
+[presence]
+stale_after_seconds = 120
+cleanup_interval_seconds = 30

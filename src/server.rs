@@ -1,5 +1,5 @@
 use std::convert::Infallible;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -9,7 +9,7 @@ use axum::http::{header, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::response::sse::{Event, KeepAlive, Sse};
-use axum::routing::{get, post};
+use axum::routing::{get, get_service, post};
 use axum::{Extension, Json, Router};
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -18,6 +18,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
+use tower_http::services::{ServeDir, ServeFile};
 use tracing::{error, info, warn};
 
 use crate::auth::{self, AuthSettings, DASHBOARD_SESSION_COOKIE};
@@ -143,7 +144,7 @@ pub async fn run(bind_addr: &str, database_path: &Path, config: ServerConfig) ->
             require_dashboard_auth,
         ));
 
-    let router = Router::new()
+    let mut router = Router::new()
         .route("/health", get(health_handler))
         .route("/metrics", get(metrics_handler))
         .route("/api/v1/auth/login", post(auth_login_handler))
@@ -160,6 +161,24 @@ pub async fn run(bind_addr: &str, database_path: &Path, config: ServerConfig) ->
         .route("/api/v1/session-events", post(ingest_session_event))
         .merge(protected_routes)
         .with_state(state.clone());
+
+    if let Some(dist_dir) = resolve_dashboard_dist_dir() {
+        let index_file = dist_dir.join("index.html");
+        if index_file.is_file() {
+            info!(path = %dist_dir.display(), "dashboard static files enabled");
+            let static_service = get_service(
+                ServeDir::new(dist_dir).fallback(ServeFile::new(index_file)),
+            );
+            router = router.fallback_service(static_service);
+        } else {
+            warn!(
+                path = %index_file.display(),
+                "dashboard dist path found but index.html is missing; static UI disabled"
+            );
+        }
+    } else {
+        info!("dashboard static files not found; API-only mode");
+    }
 
     let mut background_jobs: Vec<JoinHandle<()>> = Vec::new();
 
@@ -213,6 +232,27 @@ fn validate_server_config(config: &ServerConfig) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn resolve_dashboard_dist_dir() -> Option<PathBuf> {
+    if let Ok(raw) = std::env::var("DASHBOARD_DIST_DIR") {
+        let candidate = PathBuf::from(raw.trim());
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+        warn!(
+            path = %candidate.display(),
+            "DASHBOARD_DIST_DIR is set but directory does not exist"
+        );
+    }
+
+    let candidates = [
+        PathBuf::from("web-dashboard/dist"),
+        PathBuf::from("./web-dashboard/dist"),
+        PathBuf::from("../web-dashboard/dist"),
+    ];
+
+    candidates.into_iter().find(|path| path.is_dir())
 }
 
 async fn health_handler() -> impl IntoResponse {

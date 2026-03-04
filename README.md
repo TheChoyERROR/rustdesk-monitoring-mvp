@@ -17,6 +17,8 @@ Incluye:
 - `docs/operations.md`: guia de operacion y despliegue.
 - `docs/run-binaries.md`: guia para ejecutar binarios y validar runtime.
 - `docs/windows-installer.md`: guia para generar instalador Windows corporativo.
+- `docs/railway-deploy.md`: deploy en Railway (API + dashboard en un servicio).
+- `docs/render-free-deploy.md`: deploy rapido en Render Free para demo.
 
 ## Arquitectura funcional
 1. RustDesk corporativo envia eventos a `POST /api/v1/session-events`.
