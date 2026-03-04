@@ -7,6 +7,7 @@ Incluye:
 - Outbox SQLite para webhook con HMAC, retries exponenciales y circuit breaker.
 - Presencia colaborativa por sesion + SSE en tiempo real.
 - Dashboard web (`React + Vite + TypeScript`) con login local para supervisor.
+- Vista de detalle con avatares y timeline de actividad por usuario.
 - Reporte CSV y timeline historico de sesiones.
 
 ## Estructura del repo

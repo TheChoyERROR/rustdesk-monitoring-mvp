@@ -295,6 +295,72 @@ th {
   padding: 0.15rem 0.45rem;
 }
 
+.activity-summary-line {
+  margin-top: 0.4rem;
+  color: var(--ink-soft);
+}
+
+.activity-users-grid {
+  margin-top: 0.8rem;
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+}
+
+.activity-user-card {
+  border: 1px solid var(--border);
+  border-radius: 0.75rem;
+  padding: 0.78rem;
+  background: #fff;
+  display: grid;
+  gap: 0.5rem;
+}
+
+.activity-user-card .participant-avatar,
+.activity-user-card .participant-avatar-fallback {
+  border-color: var(--series-color, var(--border));
+}
+
+.activity-user-header {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+}
+
+.activity-user-meta {
+  color: var(--ink-soft);
+  font-size: 0.82rem;
+}
+
+.activity-user-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 0.35rem 0.5rem;
+  color: var(--ink-soft);
+  font-size: 0.85rem;
+}
+
+.activity-sparkline-wrap {
+  border: 1px solid var(--border);
+  border-radius: 0.55rem;
+  background: linear-gradient(180deg, #fbfbfb 0%, #f4f7f7 100%);
+  padding: 0.25rem;
+}
+
+.activity-sparkline {
+  width: 100%;
+  height: auto;
+  display: block;
+}
+
+.activity-sparkline-line {
+  fill: none;
+  stroke: var(--series-color, var(--accent));
+  stroke-width: 2.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
 .error-text {
   color: var(--danger);
 }
