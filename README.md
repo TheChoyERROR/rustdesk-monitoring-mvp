@@ -15,6 +15,8 @@ Incluye:
 - `scripts/`: scripts de arranque Linux/Windows.
 - `docs/technical-spec.md`: especificacion tecnica.
 - `docs/operations.md`: guia de operacion y despliegue.
+- `docs/run-binaries.md`: guia para ejecutar binarios y validar runtime.
+- `docs/windows-installer.md`: guia para generar instalador Windows corporativo.
 
 ## Arquitectura funcional
 1. RustDesk corporativo envia eventos a `POST /api/v1/session-events`.
@@ -159,6 +161,7 @@ bash scripts/check-rustdesk-fork.sh
 
 Referencia:
 - `docs/rustdesk-fork-setup-ubuntu.md`
+- `docs/windows-installer.md`
 
 ## Notas de seguridad MVP
 - Cambiar password supervisor antes de demo.
