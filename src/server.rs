@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Context;
-use axum::extract::{Path as AxumPath, Query, Request, State};
+use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, Request, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -37,6 +37,8 @@ use crate::storage::{
     InsertOutcome, OutboxRecord, expire_stale_presence,
 };
 use crate::webhook::WebhookDispatcher;
+
+const MAX_SESSION_EVENT_BODY_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Clone)]
 struct AppState {
@@ -158,7 +160,10 @@ pub async fn run(bind_addr: &str, database_path: &Path, config: ServerConfig) ->
             "/api/v1/sessions/:session_id/presence/stream",
             get(stream_session_presence_handler),
         )
-        .route("/api/v1/session-events", post(ingest_session_event))
+        .route(
+            "/api/v1/session-events",
+            post(ingest_session_event).layer(DefaultBodyLimit::max(MAX_SESSION_EVENT_BODY_BYTES)),
+        )
         .merge(protected_routes)
         .with_state(state.clone());
 

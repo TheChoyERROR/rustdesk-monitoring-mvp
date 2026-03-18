@@ -1059,6 +1059,7 @@ async fn apply_presence_event_tx(
         }
         SessionEventType::ControlChanged => {
             let actor = extract_presence_actor(event);
+            let is_control_active = meta_bool(event.meta.as_ref(), "is_control_active").unwrap_or(true);
             sqlx::query(
                 r#"
                 UPDATE session_presence
@@ -1082,7 +1083,7 @@ async fn apply_presence_event_tx(
                 &event.session_id,
                 &actor,
                 Some(true),
-                Some(true),
+                Some(is_control_active),
                 event_ms,
                 now_ms,
             )
@@ -1208,6 +1209,10 @@ fn meta_string(meta: Option<&Value>, key: &str) -> Option<String> {
     } else {
         Some(raw.to_string())
     }
+}
+
+fn meta_bool(meta: Option<&Value>, key: &str) -> Option<bool> {
+    meta?.get(key)?.as_bool()
 }
 
 fn role_from_db(raw: &str) -> AuthRoleV1 {
@@ -1436,5 +1441,73 @@ mod tests {
         assert_eq!(after.participants.len(), 1);
         assert!(!after.participants[0].is_active);
         assert!(!after.participants[0].is_control_active);
+    }
+
+    #[tokio::test]
+    async fn control_changed_false_clears_active_controller() {
+        let temp = tempdir().expect("create temp dir");
+        let db_path = temp.path().join("presence-control.db");
+        let pool = connect_sqlite(&db_path).await.expect("connect sqlite");
+
+        let session_id = "sess-presence-control";
+        let joined = SessionEventV1 {
+            event_id: Uuid::new_v4(),
+            event_type: SessionEventType::ParticipantJoined,
+            session_id: session_id.to_string(),
+            user_id: "operator".to_string(),
+            direction: SessionDirection::Outgoing,
+            timestamp: Utc::now(),
+            host_info: None,
+            meta: Some(json!({
+                "participant_id": "alice",
+                "display_name": "Alice"
+            })),
+        };
+
+        let control_on = SessionEventV1 {
+            event_id: Uuid::new_v4(),
+            event_type: SessionEventType::ControlChanged,
+            session_id: session_id.to_string(),
+            user_id: "operator".to_string(),
+            direction: SessionDirection::Outgoing,
+            timestamp: Utc::now(),
+            host_info: None,
+            meta: Some(json!({
+                "participant_id": "alice",
+                "is_control_active": true
+            })),
+        };
+
+        let control_off = SessionEventV1 {
+            event_id: Uuid::new_v4(),
+            event_type: SessionEventType::ControlChanged,
+            session_id: session_id.to_string(),
+            user_id: "operator".to_string(),
+            direction: SessionDirection::Outgoing,
+            timestamp: Utc::now(),
+            host_info: None,
+            meta: Some(json!({
+                "participant_id": "alice",
+                "is_control_active": false
+            })),
+        };
+
+        insert_event(&pool, &joined).await.expect("insert joined");
+        insert_event(&pool, &control_on)
+            .await
+            .expect("insert control on");
+        insert_event(&pool, &control_off)
+            .await
+            .expect("insert control off");
+
+        let snapshot = get_session_presence(&pool, session_id)
+            .await
+            .expect("read presence")
+            .expect("presence exists");
+
+        assert_eq!(snapshot.control_participant_id, None);
+        assert_eq!(snapshot.participants.len(), 1);
+        assert!(snapshot.participants[0].is_active);
+        assert!(!snapshot.participants[0].is_control_active);
     }
 }
