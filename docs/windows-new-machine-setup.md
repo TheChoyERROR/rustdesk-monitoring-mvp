@@ -30,6 +30,17 @@ Valores esperados al momento de esta guia:
 - repo principal: `8940207`
 - fork: `a917fc630`
 
+## 1.5 Bootstrap de una sola pasada
+
+Si quieres una sola orden para preparar la maquina, usa:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\bootstrap-windows-dev-machine.ps1 -Execute -BuildRustDesk -BuildInstaller
+```
+
+Si todavia no tienes `tools\flutter-3.24.5`, ejecuta primero sin `-BuildRustDesk` y sin `-BuildInstaller`,
+o pasa `-FlutterRoot "C:\ruta\flutter-3.24.5"`.
+
 ## 2. Dependencias de Windows para el fork
 
 Recomendado ejecutar PowerShell como administrador:
