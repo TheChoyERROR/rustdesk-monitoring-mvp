@@ -1,16 +1,22 @@
 param(
   [string]$RustDeskRepo = "$HOME\Desktop\rustdesk",
+  [string]$RustDeskRepoPath = "",
+  [string]$RustDeskExePath = "",
   [string]$MonitoringUrl = "",
   [string]$Version = "",
   [string]$OutputDir = "",
   [string]$AppName = "RustDesk Monitoring Corporate",
   [string]$CompanyName = "YourCompany",
+  [string]$InstallDirName = "RustDeskMonitoringCorporate",
+  [string]$UninstallKey = "RustDeskMonitoringCorporate",
   [switch]$BuildRustDesk,
   [switch]$SkipZip,
   [switch]$SkipNsis
 )
 
 $ErrorActionPreference = "Stop"
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+. (Join-Path $scriptDir "rustdesk-flutter.ps1")
 
 function Resolve-ExistingPath {
   param(
@@ -45,6 +51,55 @@ function To-NsisPath {
   return $Path.Replace('\\', '\\\\')
 }
 
+function Get-FileSha256 {
+  param([Parameter(Mandatory = $true)][string]$Path)
+
+  return (Get-FileHash -Path $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+
+function Get-FileVersionValue {
+  param([Parameter(Mandatory = $true)][string]$ExePath)
+
+  try {
+    $versionInfo = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($ExePath)
+    if (-not [string]::IsNullOrWhiteSpace($versionInfo.ProductVersion)) {
+      return $versionInfo.ProductVersion.Trim()
+    }
+    if (-not [string]::IsNullOrWhiteSpace($versionInfo.FileVersion)) {
+      return $versionInfo.FileVersion.Trim()
+    }
+  } catch {
+  }
+
+  return ""
+}
+
+function Get-NsisPath {
+  $nsis = Get-Command makensis.exe -ErrorAction SilentlyContinue
+  if (-not $nsis) {
+    $nsis = Get-Command makensis -ErrorAction SilentlyContinue
+  }
+
+  if ($nsis) {
+    return $nsis.Source
+  }
+
+  foreach ($candidate in @(
+      "C:\Program Files (x86)\NSIS\makensis.exe",
+      "C:\Program Files\NSIS\makensis.exe"
+    )) {
+    if (Test-Path $candidate) {
+      return $candidate
+    }
+  }
+
+  return $null
+}
+
+if (-not [string]::IsNullOrWhiteSpace($RustDeskRepoPath)) {
+  $RustDeskRepo = $RustDeskRepoPath
+}
+
 if ([string]::IsNullOrWhiteSpace($MonitoringUrl)) {
   throw "Debes especificar -MonitoringUrl, por ejemplo http://192.168.0.103:8080"
 }
@@ -71,6 +126,13 @@ if ($BuildRustDesk) {
     throw "No se encontro python/py en PATH para ejecutar build.py"
   }
 
+  $repoRoot = Split-Path -Parent $PSScriptRoot
+  $flutterRoot = Use-RustDeskFlutter -RepoRoot $repoRoot
+  if (-not [string]::IsNullOrWhiteSpace($flutterRoot)) {
+    $flutterVersion = Get-RustDeskFlutterVersion -FlutterRoot $flutterRoot
+    Write-Host "Usando Flutter: $flutterRoot$(if ($flutterVersion) { " (version $flutterVersion)" })"
+  }
+
   Write-Host "Compilando fork RustDesk (flutter windows release, sin pack portable)..."
   Push-Location $rustDeskRepoPath
   try {
@@ -80,23 +142,33 @@ if ($BuildRustDesk) {
   }
 }
 
-$candidateExePaths = @(
+$candidateExePaths = @()
+if (-not [string]::IsNullOrWhiteSpace($RustDeskExePath)) {
+  $candidateExePaths += $RustDeskExePath
+}
+$candidateExePaths += @(
   (Join-Path $rustDeskRepoPath "flutter\build\windows\x64\runner\Release\rustdesk.exe"),
+  (Join-Path $rustDeskRepoPath "flutter\build\windows\x64\runner\Release\RustDesk.exe"),
   (Join-Path $rustDeskRepoPath "target\release\rustdesk.exe"),
   (Join-Path $rustDeskRepoPath "target\release\RustDesk.exe")
 )
 
-$rustDeskExePath = $candidateExePaths | Where-Object { Test-Path $_ } | Select-Object -First 1
+$rustDeskExePath = $candidateExePaths | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and (Test-Path $_) } | Select-Object -First 1
 if (-not $rustDeskExePath) {
-  throw "No se encontro rustdesk.exe compilado. Ejecuta primero el build del fork o usa -BuildRustDesk."
+  throw "No se encontro rustdesk.exe compilado. Ejecuta primero el build del fork, usa -BuildRustDesk o especifica -RustDeskExePath."
 }
 
 $rustDeskExePath = (Resolve-Path $rustDeskExePath).Path
 $sourceDir = Split-Path -Parent $rustDeskExePath
 $exeName = Split-Path -Leaf $rustDeskExePath
+$exeHash = Get-FileSha256 -Path $rustDeskExePath
+$exeVersion = Get-FileVersionValue -ExePath $rustDeskExePath
 
 if ([string]::IsNullOrWhiteSpace($Version)) {
   $Version = Get-CargoVersion -CargoTomlPath (Join-Path $rustDeskRepoPath "Cargo.toml")
+}
+if ([string]::IsNullOrWhiteSpace($Version)) {
+  $Version = $exeVersion
 }
 if ([string]::IsNullOrWhiteSpace($Version)) {
   $Version = Get-Date -Format "yyyy.MM.dd.HHmm"
@@ -116,8 +188,10 @@ Copy-Item -Path (Join-Path $sourceDir "*") -Destination $appDir -Recurse -Force
 
 $launcherCmdPath = Join-Path $stageDir "launch-rustdesk.cmd"
 $launcherPs1Path = Join-Path $stageDir "launch-rustdesk.ps1"
+$launcherEnvPath = Join-Path $stageDir "monitoring-launcher.env"
 $policyPath = Join-Path $stageDir "MONITORING-POLICY.txt"
 $readmePath = Join-Path $stageDir "README-INSTALL.txt"
+$manifestPath = Join-Path $packageRoot "package-manifest.json"
 
 @"
 @echo off
@@ -138,6 +212,13 @@ Start-Process -FilePath (Join-Path `$PSScriptRoot "app\\$exeName") -ArgumentList
 "@ | Set-Content -Path $launcherPs1Path -Encoding UTF8
 
 @"
+RUSTDESK_MONITORING_URL=$MonitoringUrl
+APP_NAME=$AppName
+PACKAGE_VERSION=$Version
+SOURCE_EXE_SHA256=$exeHash
+"@ | Set-Content -Path $launcherEnvPath -Encoding ASCII
+
+@"
 Este equipo usa una version corporativa de RustDesk con registro de eventos operativos
 para auditoria de soporte y seguridad.
 
@@ -153,6 +234,7 @@ Contenido instalado:
 - app\\$exeName
 - launch-rustdesk.cmd
 - launch-rustdesk.ps1
+- monitoring-launcher.env
 - MONITORING-POLICY.txt
 
 Uso recomendado:
@@ -162,6 +244,31 @@ Uso recomendado:
 El launcher configura RUSTDESK_MONITORING_URL en:
 $MonitoringUrl
 "@ | Set-Content -Path $readmePath -Encoding UTF8
+
+$manifest = [ordered]@{
+  package_name = $packageName
+  app_name = $AppName
+  company_name = $CompanyName
+  package_version = $Version
+  monitoring_url = $MonitoringUrl
+  generated_at = (Get-Date).ToString("o")
+  source_repo_path = $rustDeskRepoPath
+  source_exe_path = $rustDeskExePath
+  source_exe_name = $exeName
+  source_exe_sha256 = $exeHash
+  source_exe_file_version = $exeVersion
+  install_dir_name = $InstallDirName
+  uninstall_key = $UninstallKey
+  artifacts = [ordered]@{
+    stage_dir = $stageDir
+    launcher_cmd = $launcherCmdPath
+    launcher_ps1 = $launcherPs1Path
+    launcher_env = $launcherEnvPath
+    policy = $policyPath
+    readme = $readmePath
+  }
+}
+$manifest | ConvertTo-Json -Depth 6 | Set-Content -Path $manifestPath -Encoding UTF8
 
 if (-not $SkipZip) {
   $zipPath = Join-Path $packageRoot "$packageName-portable.zip"
@@ -173,10 +280,7 @@ if (-not $SkipZip) {
 }
 
 if (-not $SkipNsis) {
-  $nsis = Get-Command makensis.exe -ErrorAction SilentlyContinue
-  if (-not $nsis) {
-    $nsis = Get-Command makensis -ErrorAction SilentlyContinue
-  }
+  $nsis = Get-NsisPath
 
   if (-not $nsis) {
     Write-Warning "No se encontro makensis. Se omite setup.exe (NSIS)."
@@ -184,7 +288,6 @@ if (-not $SkipNsis) {
   } else {
     $setupExeName = "$packageName-setup.exe"
     $setupExePath = Join-Path $packageRoot $setupExeName
-    $uninstallKey = "RustDeskMonitoringCorporate"
 
     $nsiPath = Join-Path $packageRoot "installer.nsi"
     @"
@@ -198,68 +301,90 @@ SetCompressor /SOLID lzma
 !define EXE_NAME "$exeName"
 !define STAGE_DIR "$(To-NsisPath $stageDir)"
 !define OUTPUT_EXE "$(To-NsisPath $setupExePath)"
-!define UNINSTALL_KEY "$uninstallKey"
+!define INSTALL_DIR_NAME "$InstallDirName"
+!define UNINSTALL_KEY "$UninstallKey"
 
-Name "`$\{APP_NAME}`"
-OutFile "`$\{OUTPUT_EXE}`"
-InstallDir "`$PROGRAMFILES64\\RustDeskMonitoringCorporate"
-InstallDirRegKey HKLM "Software\\`$\{UNINSTALL_KEY}`" "InstallLocation"
+Name "`${APP_NAME}"
+OutFile "`${OUTPUT_EXE}"
+InstallDir "`$PROGRAMFILES64\\`${INSTALL_DIR_NAME}"
+InstallDirRegKey HKLM "Software\\`${UNINSTALL_KEY}" "InstallLocation"
 
 Page directory
 Page instfiles
 UninstPage uninstConfirm
 UninstPage instfiles
 
+Function CloseRunningRustDesk
+  DetailPrint "Cerrando instancias activas de `${EXE_NAME} si existen..."
+  ClearErrors
+  ExecWait '`"`$SYSDIR\\taskkill.exe`" /F /T /IM `${EXE_NAME}' `$0
+  Sleep 1000
+FunctionEnd
+
+Function un.CloseRunningRustDesk
+  DetailPrint "Cerrando instancias activas de `${EXE_NAME} si existen..."
+  ClearErrors
+  ExecWait '`"`$SYSDIR\\taskkill.exe`" /F /T /IM `${EXE_NAME}' `$0
+  Sleep 1000
+FunctionEnd
+
 Section "Install"
   SetShellVarContext all
+  Call CloseRunningRustDesk
   SetOutPath "`$INSTDIR\\app"
-  File /r "`$\{STAGE_DIR}\\app\\*.*"
+  File /r "`${STAGE_DIR}\\app\\*.*"
 
   SetOutPath "`$INSTDIR"
-  File "`$\{STAGE_DIR}\\launch-rustdesk.cmd"
-  File "`$\{STAGE_DIR}\\launch-rustdesk.ps1"
-  File "`$\{STAGE_DIR}\\MONITORING-POLICY.txt"
-  File "`$\{STAGE_DIR}\\README-INSTALL.txt"
+  File "`${STAGE_DIR}\\launch-rustdesk.cmd"
+  File "`${STAGE_DIR}\\launch-rustdesk.ps1"
+  File "`${STAGE_DIR}\\monitoring-launcher.env"
+  File "`${STAGE_DIR}\\MONITORING-POLICY.txt"
+  File "`${STAGE_DIR}\\README-INSTALL.txt"
 
-  CreateDirectory "`$SMPROGRAMS\\`$\{APP_NAME}"
-  CreateShortCut "`$SMPROGRAMS\\`$\{APP_NAME}\\`$\{APP_NAME}.lnk" "`$INSTDIR\\launch-rustdesk.cmd"
-  CreateShortCut "`$DESKTOP\\`$\{APP_NAME}.lnk" "`$INSTDIR\\launch-rustdesk.cmd"
+  CreateDirectory "`$SMPROGRAMS\\`${APP_NAME}"
+  CreateShortCut "`$SMPROGRAMS\\`${APP_NAME}\\`${APP_NAME}.lnk" "`$INSTDIR\\launch-rustdesk.cmd"
+  CreateShortCut "`$DESKTOP\\`${APP_NAME}.lnk" "`$INSTDIR\\launch-rustdesk.cmd"
 
   WriteUninstaller "`$INSTDIR\\Uninstall.exe"
 
-  WriteRegStr HKLM "Software\\`$\{UNINSTALL_KEY}" "DisplayName" "`$\{APP_NAME}"
-  WriteRegStr HKLM "Software\\`$\{UNINSTALL_KEY}" "DisplayVersion" "`$\{APP_VERSION}"
-  WriteRegStr HKLM "Software\\`$\{UNINSTALL_KEY}" "Publisher" "`$\{COMPANY_NAME}"
-  WriteRegStr HKLM "Software\\`$\{UNINSTALL_KEY}" "InstallLocation" "`$INSTDIR"
-  WriteRegStr HKLM "Software\\`$\{UNINSTALL_KEY}" "UninstallString" "`$\"`$INSTDIR\\Uninstall.exe`$\""
+  WriteRegStr HKLM "Software\\`${UNINSTALL_KEY}" "DisplayName" "`${APP_NAME}"
+  WriteRegStr HKLM "Software\\`${UNINSTALL_KEY}" "DisplayVersion" "`${APP_VERSION}"
+  WriteRegStr HKLM "Software\\`${UNINSTALL_KEY}" "Publisher" "`${COMPANY_NAME}"
+  WriteRegStr HKLM "Software\\`${UNINSTALL_KEY}" "InstallLocation" "`$INSTDIR"
+  WriteRegStr HKLM "Software\\`${UNINSTALL_KEY}" "UninstallString" "`$\"`$INSTDIR\\Uninstall.exe`$\""
 
-  WriteRegStr HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\`$\{UNINSTALL_KEY}" "DisplayName" "`$\{APP_NAME}"
-  WriteRegStr HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\`$\{UNINSTALL_KEY}" "DisplayVersion" "`$\{APP_VERSION}"
-  WriteRegStr HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\`$\{UNINSTALL_KEY}" "Publisher" "`$\{COMPANY_NAME}"
-  WriteRegStr HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\`$\{UNINSTALL_KEY}" "InstallLocation" "`$INSTDIR"
-  WriteRegStr HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\`$\{UNINSTALL_KEY}" "UninstallString" "`$\"`$INSTDIR\\Uninstall.exe`$\""
+  WriteRegStr HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\`${UNINSTALL_KEY}" "DisplayName" "`${APP_NAME}"
+  WriteRegStr HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\`${UNINSTALL_KEY}" "DisplayVersion" "`${APP_VERSION}"
+  WriteRegStr HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\`${UNINSTALL_KEY}" "Publisher" "`${COMPANY_NAME}"
+  WriteRegStr HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\`${UNINSTALL_KEY}" "InstallLocation" "`$INSTDIR"
+  WriteRegStr HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\`${UNINSTALL_KEY}" "UninstallString" "`$\"`$INSTDIR\\Uninstall.exe`$\""
 SectionEnd
 
 Section "Uninstall"
   SetShellVarContext all
-  Delete "`$DESKTOP\\`$\{APP_NAME}.lnk"
-  Delete "`$SMPROGRAMS\\`$\{APP_NAME}\\`$\{APP_NAME}.lnk"
-  RMDir "`$SMPROGRAMS\\`$\{APP_NAME}"
+  Call un.CloseRunningRustDesk
+  Delete "`$DESKTOP\\`${APP_NAME}.lnk"
+  Delete "`$SMPROGRAMS\\`${APP_NAME}\\`${APP_NAME}.lnk"
+  RMDir "`$SMPROGRAMS\\`${APP_NAME}"
 
   Delete "`$INSTDIR\\launch-rustdesk.cmd"
   Delete "`$INSTDIR\\launch-rustdesk.ps1"
+  Delete "`$INSTDIR\\monitoring-launcher.env"
   Delete "`$INSTDIR\\MONITORING-POLICY.txt"
   Delete "`$INSTDIR\\README-INSTALL.txt"
   Delete "`$INSTDIR\\Uninstall.exe"
   RMDir /r "`$INSTDIR\\app"
   RMDir "`$INSTDIR"
 
-  DeleteRegKey HKLM "Software\\`$\{UNINSTALL_KEY}"
-  DeleteRegKey HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\`$\{UNINSTALL_KEY}"
+  DeleteRegKey HKLM "Software\\`${UNINSTALL_KEY}"
+  DeleteRegKey HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\`${UNINSTALL_KEY}"
 SectionEnd
 "@ | Set-Content -Path $nsiPath -Encoding ASCII
 
-    & $nsis.Source /V2 $nsiPath
+    & $nsis /V2 $nsiPath
+    if ($LASTEXITCODE -ne 0) {
+      throw "Fallo makensis al generar setup.exe"
+    }
     Write-Host "Instalador NSIS generado: $setupExePath"
   }
 }
@@ -268,4 +393,5 @@ Write-Host ""
 Write-Host "Build de paquete corporativo finalizado."
 Write-Host "Carpeta de salida: $packageRoot"
 Write-Host "Binario usado: $rustDeskExePath"
+Write-Host "SHA256 binario: $exeHash"
 Write-Host "Monitoring URL: $MonitoringUrl"
