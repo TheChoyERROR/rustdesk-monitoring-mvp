@@ -25,20 +25,28 @@ use crate::auth::{self, AuthSettings, DASHBOARD_SESSION_COOKIE};
 use crate::config::ServerConfig;
 use crate::metrics::Metrics;
 use crate::model::{
-    AuthLoginRequestV1, AuthLoginResponseV1, AuthRoleV1, AuthUserV1, PaginatedResponseV1,
-    SessionEventType, SessionEventV1,
+    AuthLoginRequestV1, AuthLoginResponseV1, AuthRoleV1, AuthUserV1, HelpdeskAgentPresenceUpdateV1,
+    HelpdeskAssignmentStartRequestV1, HelpdeskTicketCreateRequestV1, HelpdeskTicketResolveRequestV1,
+    HelpdeskTicketSupervisorActionRequestV1, HelpdeskAgentStatus, PaginatedResponseV1, SessionEventType,
+    SessionEventV1,
 };
 use crate::storage::{
     claim_due_events, cleanup_expired_dashboard_sessions, cleanup_failed_older_than, connect_sqlite,
-    create_dashboard_session, delete_dashboard_session, get_dashboard_session_by_token, get_dashboard_summary,
-    get_dashboard_user_by_username, get_session_presence, insert_event, list_active_session_presence,
-    mark_delivered, mark_failed, query_session_report_rows, query_session_timeline, query_timeline_events,
-    reset_stuck_processing, schedule_retry, unix_millis_now, upsert_dashboard_user, EventQueryFilter,
-    InsertOutcome, OutboxRecord, expire_stale_presence,
+    cancel_helpdesk_ticket, create_dashboard_session, create_helpdesk_ticket, delete_dashboard_session,
+    get_dashboard_session_by_token, get_dashboard_summary, get_dashboard_user_by_username,
+    get_helpdesk_assignment_for_agent, get_helpdesk_operational_summary, get_helpdesk_ticket,
+    get_session_presence, insert_event, list_active_session_presence, list_helpdesk_agents,
+    list_helpdesk_ticket_audit_events, list_helpdesk_tickets, mark_delivered, mark_failed,
+    query_session_report_rows, query_session_timeline, query_timeline_events, reconcile_helpdesk_runtime,
+    requeue_helpdesk_ticket, reset_stuck_processing, resolve_helpdesk_ticket, schedule_retry,
+    start_helpdesk_ticket, unix_millis_now, upsert_dashboard_user, upsert_helpdesk_agent_presence,
+    EventQueryFilter, InsertOutcome, OutboxRecord, expire_stale_presence,
 };
 use crate::webhook::WebhookDispatcher;
 
 const MAX_SESSION_EVENT_BODY_BYTES: usize = 4 * 1024 * 1024;
+const HELPDESK_RECONCILE_INTERVAL_MS: u64 = 5_000;
+const HELPDESK_AGENT_STALE_AFTER_MS: i64 = 30_000;
 
 #[derive(Clone)]
 struct AppState {
@@ -85,6 +93,11 @@ struct CsvReportQuery {
     from: Option<String>,
     to: Option<String>,
     user_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct HelpdeskAuditQuery {
+    limit: Option<u64>,
 }
 
 pub async fn run(bind_addr: &str, database_path: &Path, config: ServerConfig) -> anyhow::Result<()> {
@@ -151,6 +164,35 @@ pub async fn run(bind_addr: &str, database_path: &Path, config: ServerConfig) ->
         .route("/metrics", get(metrics_handler))
         .route("/api/v1/auth/login", post(auth_login_handler))
         .route("/api/v1/auth/logout", post(auth_logout_handler))
+        .route("/api/v1/helpdesk/agents", get(list_helpdesk_agents_handler))
+        .route("/api/v1/helpdesk/agents/presence", post(upsert_helpdesk_agent_presence_handler))
+        .route("/api/v1/helpdesk/summary", get(get_helpdesk_summary_handler))
+        .route(
+            "/api/v1/helpdesk/agents/:agent_id/assignment",
+            get(get_helpdesk_assignment_for_agent_handler),
+        )
+        .route(
+            "/api/v1/helpdesk/agents/:agent_id/assignment/start",
+            post(start_helpdesk_assignment_handler),
+        )
+        .route("/api/v1/helpdesk/tickets", get(list_helpdesk_tickets_handler).post(create_helpdesk_ticket_handler))
+        .route("/api/v1/helpdesk/tickets/:ticket_id", get(get_helpdesk_ticket_handler))
+        .route(
+            "/api/v1/helpdesk/tickets/:ticket_id/audit",
+            get(list_helpdesk_ticket_audit_handler),
+        )
+        .route(
+            "/api/v1/helpdesk/tickets/:ticket_id/resolve",
+            post(resolve_helpdesk_ticket_handler),
+        )
+        .route(
+            "/api/v1/helpdesk/tickets/:ticket_id/requeue",
+            post(requeue_helpdesk_ticket_handler),
+        )
+        .route(
+            "/api/v1/helpdesk/tickets/:ticket_id/cancel",
+            post(cancel_helpdesk_ticket_handler),
+        )
         .route("/api/v1/sessions/presence", get(list_presence_sessions_handler))
         .route(
             "/api/v1/sessions/:session_id/presence",
@@ -194,6 +236,7 @@ pub async fn run(bind_addr: &str, database_path: &Path, config: ServerConfig) ->
     }
 
     background_jobs.push(tokio::spawn(presence_cleanup_worker(state.clone())));
+    background_jobs.push(tokio::spawn(helpdesk_reconcile_worker(state.clone())));
     background_jobs.push(tokio::spawn(cleanup_worker(state.clone())));
 
     let listener = tokio::net::TcpListener::bind(bind_addr)
@@ -271,6 +314,278 @@ async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
         [(header::CONTENT_TYPE, HeaderValue::from_static("text/plain; version=0.0.4"))],
         body,
     )
+}
+
+async fn list_helpdesk_agents_handler(State(state): State<AppState>) -> impl IntoResponse {
+    match list_helpdesk_agents(&state.pool).await {
+        Ok(agents) => (StatusCode::OK, Json(json!({ "agents": agents }))).into_response(),
+        Err(err) => {
+            error!(error = %err, "failed to list helpdesk agents");
+            internal_error()
+        }
+    }
+}
+
+async fn get_helpdesk_summary_handler(State(state): State<AppState>) -> impl IntoResponse {
+    match get_helpdesk_operational_summary(&state.pool).await {
+        Ok(summary) => (StatusCode::OK, Json(summary)).into_response(),
+        Err(err) => {
+            error!(error = %err, "failed to get helpdesk operational summary");
+            internal_error()
+        }
+    }
+}
+
+async fn upsert_helpdesk_agent_presence_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<HelpdeskAgentPresenceUpdateV1>,
+) -> impl IntoResponse {
+    if let Err(validation_error) = payload.validate() {
+        return bad_request(validation_error.to_string());
+    }
+
+    match upsert_helpdesk_agent_presence(&state.pool, &payload).await {
+        Ok(agent) => (StatusCode::OK, Json(json!({ "agent": agent }))).into_response(),
+        Err(err) => {
+            error!(error = %err, agent_id = payload.agent_id, "failed to upsert helpdesk agent presence");
+            internal_error()
+        }
+    }
+}
+
+async fn get_helpdesk_assignment_for_agent_handler(
+    State(state): State<AppState>,
+    AxumPath(agent_id): AxumPath<String>,
+) -> impl IntoResponse {
+    let agent_id = agent_id.trim().to_string();
+    if agent_id.is_empty() {
+        return bad_request("agent_id cannot be empty");
+    }
+
+    match get_helpdesk_assignment_for_agent(&state.pool, &agent_id).await {
+        Ok(Some(assignment)) => (StatusCode::OK, Json(json!({ "assignment": assignment }))).into_response(),
+        Ok(None) => (StatusCode::OK, Json(json!({ "assignment": null }))).into_response(),
+        Err(err) => {
+            error!(error = %err, agent_id, "failed to get helpdesk assignment for agent");
+            internal_error()
+        }
+    }
+}
+
+async fn start_helpdesk_assignment_handler(
+    State(state): State<AppState>,
+    AxumPath(agent_id): AxumPath<String>,
+    Json(payload): Json<HelpdeskAssignmentStartRequestV1>,
+) -> impl IntoResponse {
+    if let Err(validation_error) = payload.validate() {
+        return bad_request(validation_error.to_string());
+    }
+
+    match start_helpdesk_ticket(&state.pool, &agent_id, &payload.ticket_id).await {
+        Ok((ticket, agent)) => (
+            StatusCode::OK,
+            Json(json!({
+                "ticket": ticket,
+                "agent": agent,
+            })),
+        )
+            .into_response(),
+        Err(err) => {
+            error!(
+                error = %err,
+                agent_id,
+                ticket_id = payload.ticket_id,
+                "failed to start helpdesk assignment"
+            );
+            bad_request(err.to_string())
+        }
+    }
+}
+
+async fn list_helpdesk_tickets_handler(State(state): State<AppState>) -> impl IntoResponse {
+    match list_helpdesk_tickets(&state.pool).await {
+        Ok(tickets) => (StatusCode::OK, Json(json!({ "tickets": tickets }))).into_response(),
+        Err(err) => {
+            error!(error = %err, "failed to list helpdesk tickets");
+            internal_error()
+        }
+    }
+}
+
+async fn get_helpdesk_ticket_handler(
+    State(state): State<AppState>,
+    AxumPath(ticket_id): AxumPath<String>,
+) -> impl IntoResponse {
+    let ticket_id = ticket_id.trim().to_string();
+    if ticket_id.is_empty() {
+        return bad_request("ticket_id cannot be empty");
+    }
+
+    match get_helpdesk_ticket(&state.pool, &ticket_id).await {
+        Ok(Some(ticket)) => (StatusCode::OK, Json(json!({ "ticket": ticket }))).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "error": "ticket_not_found",
+                "ticket_id": ticket_id,
+            })),
+        )
+            .into_response(),
+        Err(err) => {
+            error!(error = %err, ticket_id, "failed to get helpdesk ticket");
+            internal_error()
+        }
+    }
+}
+
+async fn list_helpdesk_ticket_audit_handler(
+    State(state): State<AppState>,
+    AxumPath(ticket_id): AxumPath<String>,
+    Query(query): Query<HelpdeskAuditQuery>,
+) -> impl IntoResponse {
+    let ticket_id = ticket_id.trim().to_string();
+    if ticket_id.is_empty() {
+        return bad_request("ticket_id cannot be empty");
+    }
+
+    let limit = query.limit.unwrap_or(100).clamp(1, 500);
+    match list_helpdesk_ticket_audit_events(&state.pool, &ticket_id, limit).await {
+        Ok(events) => (
+            StatusCode::OK,
+            Json(json!({
+                "events": events,
+                "ticket_id": ticket_id,
+            })),
+        )
+            .into_response(),
+        Err(err) => {
+            error!(error = %err, ticket_id, "failed to list helpdesk ticket audit");
+            internal_error()
+        }
+    }
+}
+
+async fn create_helpdesk_ticket_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<HelpdeskTicketCreateRequestV1>,
+) -> impl IntoResponse {
+    if let Err(validation_error) = payload.validate() {
+        return bad_request(validation_error.to_string());
+    }
+
+    match create_helpdesk_ticket(&state.pool, &payload).await {
+        Ok(ticket) => (StatusCode::CREATED, Json(json!({ "ticket": ticket }))).into_response(),
+        Err(err) => {
+            error!(error = %err, client_id = payload.client_id, "failed to create helpdesk ticket");
+            internal_error()
+        }
+    }
+}
+
+async fn resolve_helpdesk_ticket_handler(
+    State(state): State<AppState>,
+    AxumPath(ticket_id): AxumPath<String>,
+    Json(payload): Json<HelpdeskTicketResolveRequestV1>,
+) -> impl IntoResponse {
+    if let Err(validation_error) = payload.validate() {
+        return bad_request(validation_error.to_string());
+    }
+
+    let next_agent_status = payload
+        .next_agent_status
+        .unwrap_or(HelpdeskAgentStatus::Available);
+
+    match resolve_helpdesk_ticket(&state.pool, &ticket_id, &payload.agent_id, next_agent_status).await {
+        Ok((ticket, agent)) => (
+            StatusCode::OK,
+            Json(json!({
+                "ticket": ticket,
+                "agent": agent,
+            })),
+        )
+            .into_response(),
+        Err(err) => {
+            error!(
+                error = %err,
+                ticket_id,
+                agent_id = payload.agent_id,
+                "failed to resolve helpdesk ticket"
+            );
+            bad_request(err.to_string())
+        }
+    }
+}
+
+async fn requeue_helpdesk_ticket_handler(
+    State(state): State<AppState>,
+    AxumPath(ticket_id): AxumPath<String>,
+    Json(payload): Json<HelpdeskTicketSupervisorActionRequestV1>,
+) -> impl IntoResponse {
+    if let Err(validation_error) = payload.validate() {
+        return bad_request(validation_error.to_string());
+    }
+
+    let next_agent_status = payload
+        .next_agent_status
+        .unwrap_or(HelpdeskAgentStatus::Available);
+
+    match requeue_helpdesk_ticket(
+        &state.pool,
+        &ticket_id,
+        next_agent_status,
+        payload.reason.as_deref(),
+    )
+    .await
+    {
+        Ok((ticket, agent)) => (
+            StatusCode::OK,
+            Json(json!({
+                "ticket": ticket,
+                "agent": agent,
+            })),
+        )
+            .into_response(),
+        Err(err) => {
+            error!(error = %err, ticket_id, "failed to requeue helpdesk ticket");
+            bad_request(err.to_string())
+        }
+    }
+}
+
+async fn cancel_helpdesk_ticket_handler(
+    State(state): State<AppState>,
+    AxumPath(ticket_id): AxumPath<String>,
+    Json(payload): Json<HelpdeskTicketSupervisorActionRequestV1>,
+) -> impl IntoResponse {
+    if let Err(validation_error) = payload.validate() {
+        return bad_request(validation_error.to_string());
+    }
+
+    let next_agent_status = payload
+        .next_agent_status
+        .unwrap_or(HelpdeskAgentStatus::Available);
+
+    match cancel_helpdesk_ticket(
+        &state.pool,
+        &ticket_id,
+        next_agent_status,
+        payload.reason.as_deref(),
+    )
+    .await
+    {
+        Ok((ticket, agent)) => (
+            StatusCode::OK,
+            Json(json!({
+                "ticket": ticket,
+                "agent": agent,
+            })),
+        )
+            .into_response(),
+        Err(err) => {
+            error!(error = %err, ticket_id, "failed to cancel helpdesk ticket");
+            bad_request(err.to_string())
+        }
+    }
 }
 
 async fn auth_login_handler(
@@ -1065,6 +1380,33 @@ async fn presence_cleanup_worker(state: AppState) {
             }
             Ok(_) => {}
             Err(err) => error!(error = %err, "failed to cleanup stale session presence rows"),
+        }
+    }
+}
+
+async fn helpdesk_reconcile_worker(state: AppState) {
+    let interval = Duration::from_millis(HELPDESK_RECONCILE_INTERVAL_MS);
+
+    loop {
+        tokio::time::sleep(interval).await;
+
+        match reconcile_helpdesk_runtime(&state.pool, HELPDESK_AGENT_STALE_AFTER_MS, unix_millis_now() as i64).await {
+            Ok(stats)
+                if stats.opening_timeouts > 0
+                    || stats.agents_marked_offline > 0
+                    || stats.tickets_requeued > 0
+                    || stats.tickets_failed > 0 =>
+            {
+                info!(
+                    opening_timeouts = stats.opening_timeouts,
+                    agents_marked_offline = stats.agents_marked_offline,
+                    tickets_requeued = stats.tickets_requeued,
+                    tickets_failed = stats.tickets_failed,
+                    "helpdesk runtime reconciliation applied"
+                );
+            }
+            Ok(_) => {}
+            Err(err) => error!(error = %err, "failed to reconcile helpdesk runtime"),
         }
     }
 }

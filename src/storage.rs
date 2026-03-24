@@ -5,10 +5,14 @@ use chrono::{DateTime, TimeZone, Utc};
 use serde_json::Value;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool, Transaction};
+use uuid::Uuid;
 
 use crate::model::{
-    AuthRoleV1, AuthUserV1, DashboardSummaryV1, PresenceParticipantV1, PresenceSessionSummaryV1,
-    SessionEventType, SessionEventV1, SessionPresenceV1, SessionReportRowV1, SessionTimelineItemV1,
+    AuthRoleV1, AuthUserV1, DashboardSummaryV1, HelpdeskAgentPresenceUpdateV1, HelpdeskAgentStatus,
+    HelpdeskAgentV1, HelpdeskAssignmentV1, HelpdeskAuditEventV1, HelpdeskOperationalSummaryV1,
+    HelpdeskTicketCreateRequestV1, HelpdeskTicketStatus, HelpdeskTicketV1, PresenceParticipantV1,
+    PresenceSessionSummaryV1, SessionEventType, SessionEventV1, SessionPresenceV1, SessionReportRowV1,
+    SessionTimelineItemV1,
 };
 
 #[derive(Debug, Clone)]
@@ -54,6 +58,14 @@ pub struct EventQueryFilter {
     pub event_type: Option<SessionEventType>,
     pub from: Option<DateTime<Utc>>,
     pub to: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct HelpdeskRuntimeReconcileResult {
+    pub opening_timeouts: u64,
+    pub agents_marked_offline: u64,
+    pub tickets_requeued: u64,
+    pub tickets_failed: u64,
 }
 
 pub async fn connect_sqlite(database_path: &Path) -> anyhow::Result<SqlitePool> {
@@ -251,6 +263,150 @@ pub async fn init_schema(pool: &SqlitePool) -> anyhow::Result<()> {
     .execute(pool)
     .await
     .context("failed to create dashboard_sessions expiry index")?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS helpdesk_agents (
+            agent_id TEXT PRIMARY KEY,
+            display_name TEXT NOT NULL,
+            status TEXT NOT NULL,
+            current_ticket_id TEXT,
+            last_heartbeat_at INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .context("failed to create helpdesk_agents table")?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_helpdesk_agents_status_updated
+        ON helpdesk_agents(status, updated_at)
+        "#,
+    )
+    .execute(pool)
+    .await
+    .context("failed to create helpdesk_agents status index")?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS helpdesk_tickets (
+            ticket_id TEXT PRIMARY KEY,
+            client_id TEXT NOT NULL,
+            client_display_name TEXT,
+            device_id TEXT,
+            requested_by TEXT,
+            summary TEXT,
+            status TEXT NOT NULL,
+            assigned_agent_id TEXT,
+            opening_deadline_at INTEGER,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .context("failed to create helpdesk_tickets table")?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_helpdesk_tickets_status_created
+        ON helpdesk_tickets(status, created_at)
+        "#,
+    )
+    .execute(pool)
+    .await
+    .context("failed to create helpdesk_tickets status index")?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_helpdesk_tickets_agent
+        ON helpdesk_tickets(assigned_agent_id, updated_at)
+        "#,
+    )
+    .execute(pool)
+    .await
+    .context("failed to create helpdesk_tickets agent index")?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS helpdesk_ticket_assignments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticket_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .context("failed to create helpdesk_ticket_assignments table")?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_helpdesk_ticket_assignments_ticket
+        ON helpdesk_ticket_assignments(ticket_id, updated_at DESC)
+        "#,
+    )
+    .execute(pool)
+    .await
+    .context("failed to create helpdesk_ticket_assignments ticket index")?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS helpdesk_agent_heartbeats (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            agent_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .context("failed to create helpdesk_agent_heartbeats table")?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_helpdesk_agent_heartbeats_agent_created
+        ON helpdesk_agent_heartbeats(agent_id, created_at DESC)
+        "#,
+    )
+    .execute(pool)
+    .await
+    .context("failed to create helpdesk_agent_heartbeats index")?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS helpdesk_audit_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            entity_type TEXT NOT NULL,
+            entity_id TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            payload TEXT,
+            created_at INTEGER NOT NULL
+        )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .context("failed to create helpdesk_audit_events table")?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_helpdesk_audit_entity
+        ON helpdesk_audit_events(entity_type, entity_id, created_at DESC)
+        "#,
+    )
+    .execute(pool)
+    .await
+    .context("failed to create helpdesk_audit_events index")?;
 
     Ok(())
 }
@@ -824,6 +980,1123 @@ pub async fn cleanup_expired_dashboard_sessions(
     Ok(result.rows_affected())
 }
 
+pub async fn upsert_helpdesk_agent_presence(
+    pool: &SqlitePool,
+    payload: &HelpdeskAgentPresenceUpdateV1,
+) -> anyhow::Result<HelpdeskAgentV1> {
+    let now_ms = unix_millis_now() as i64;
+    let display_name = payload
+        .display_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(payload.agent_id.trim())
+        .to_string();
+    let agent_id = payload.agent_id.trim().to_string();
+
+    let mut tx = pool.begin().await.context("failed to open helpdesk agent transaction")?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO helpdesk_agents (
+            agent_id, display_name, status, current_ticket_id, last_heartbeat_at, created_at, updated_at
+        )
+        VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6)
+        ON CONFLICT(agent_id) DO UPDATE SET
+            display_name = CASE
+                WHEN TRIM(?2) = '' THEN helpdesk_agents.display_name
+                ELSE ?2
+            END,
+            status = ?3,
+            current_ticket_id = CASE
+                WHEN ?3 IN ('available', 'away', 'offline') THEN NULL
+                ELSE helpdesk_agents.current_ticket_id
+            END,
+            last_heartbeat_at = ?4,
+            updated_at = ?6
+        "#,
+    )
+    .bind(&agent_id)
+    .bind(&display_name)
+    .bind(payload.status.as_str())
+    .bind(now_ms)
+    .bind(now_ms)
+    .bind(now_ms)
+    .execute(&mut *tx)
+    .await
+    .with_context(|| format!("failed to upsert helpdesk agent '{}'", agent_id))?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO helpdesk_agent_heartbeats (agent_id, status, created_at)
+        VALUES (?1, ?2, ?3)
+        "#,
+    )
+    .bind(&agent_id)
+    .bind(payload.status.as_str())
+    .bind(now_ms)
+    .execute(&mut *tx)
+    .await
+    .with_context(|| format!("failed to insert agent heartbeat '{}'", agent_id))?;
+
+    insert_helpdesk_audit_event_tx(
+        &mut tx,
+        "agent",
+        &agent_id,
+        "agent_presence_updated",
+        Some(serde_json::json!({
+            "status": payload.status.as_str(),
+            "display_name": display_name,
+        })),
+        now_ms,
+    )
+    .await?;
+
+    if payload.status == HelpdeskAgentStatus::Available {
+        reconcile_helpdesk_queue_tx(&mut tx, now_ms).await?;
+    }
+
+    let agent = get_helpdesk_agent_tx(&mut tx, &agent_id)
+        .await?
+        .with_context(|| format!("helpdesk agent '{}' not found after upsert", agent_id))?;
+
+    tx.commit().await.context("failed to commit helpdesk agent transaction")?;
+    Ok(agent)
+}
+
+pub async fn create_helpdesk_ticket(
+    pool: &SqlitePool,
+    payload: &HelpdeskTicketCreateRequestV1,
+) -> anyhow::Result<HelpdeskTicketV1> {
+    let now_ms = unix_millis_now() as i64;
+    let ticket_id = Uuid::new_v4().to_string();
+    let client_id = payload.client_id.trim().to_string();
+
+    let mut tx = pool.begin().await.context("failed to open helpdesk ticket transaction")?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO helpdesk_tickets (
+            ticket_id,
+            client_id,
+            client_display_name,
+            device_id,
+            requested_by,
+            summary,
+            status,
+            assigned_agent_id,
+            opening_deadline_at,
+            created_at,
+            updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued', NULL, NULL, ?7, ?8)
+        "#,
+    )
+    .bind(&ticket_id)
+    .bind(&client_id)
+    .bind(normalize_optional_text(payload.client_display_name.as_deref()))
+    .bind(normalize_optional_text(payload.device_id.as_deref()))
+    .bind(normalize_optional_text(payload.requested_by.as_deref()))
+    .bind(normalize_optional_text(payload.summary.as_deref()))
+    .bind(now_ms)
+    .bind(now_ms)
+    .execute(&mut *tx)
+    .await
+    .with_context(|| format!("failed to create helpdesk ticket '{}'", ticket_id))?;
+
+    insert_helpdesk_audit_event_tx(
+        &mut tx,
+        "ticket",
+        &ticket_id,
+        "help_request_created",
+        Some(serde_json::json!({
+            "client_id": client_id,
+            "device_id": payload.device_id,
+        })),
+        now_ms,
+    )
+    .await?;
+
+    reconcile_helpdesk_queue_tx(&mut tx, now_ms).await?;
+
+    let ticket = get_helpdesk_ticket_tx(&mut tx, &ticket_id)
+        .await?
+        .with_context(|| format!("helpdesk ticket '{}' not found after create", ticket_id))?;
+
+    tx.commit().await.context("failed to commit helpdesk ticket transaction")?;
+    Ok(ticket)
+}
+
+pub async fn list_helpdesk_agents(pool: &SqlitePool) -> anyhow::Result<Vec<HelpdeskAgentV1>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            agent_id,
+            display_name,
+            status,
+            current_ticket_id,
+            last_heartbeat_at,
+            updated_at
+        FROM helpdesk_agents
+        ORDER BY updated_at DESC, agent_id ASC
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .context("failed to list helpdesk agents")?;
+
+    rows.into_iter().map(row_to_helpdesk_agent).collect()
+}
+
+pub async fn list_helpdesk_tickets(pool: &SqlitePool) -> anyhow::Result<Vec<HelpdeskTicketV1>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            ticket_id,
+            client_id,
+            client_display_name,
+            device_id,
+            requested_by,
+            summary,
+            status,
+            assigned_agent_id,
+            opening_deadline_at,
+            created_at,
+            updated_at
+        FROM helpdesk_tickets
+        ORDER BY created_at DESC, ticket_id DESC
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .context("failed to list helpdesk tickets")?;
+
+    rows.into_iter().map(row_to_helpdesk_ticket).collect()
+}
+
+pub async fn get_helpdesk_assignment_for_agent(
+    pool: &SqlitePool,
+    agent_id: &str,
+) -> anyhow::Result<Option<HelpdeskAssignmentV1>> {
+    let row = sqlx::query(
+        r#"
+        SELECT current_ticket_id
+        FROM helpdesk_agents
+        WHERE agent_id = ?1
+        "#,
+    )
+    .bind(agent_id)
+    .fetch_optional(pool)
+    .await
+    .with_context(|| format!("failed to query current assignment for agent '{}'", agent_id))?;
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+
+    let Some(ticket_id): Option<String> = row.get("current_ticket_id") else {
+        return Ok(None);
+    };
+
+    let agent = get_helpdesk_agent(pool, agent_id)
+        .await?
+        .with_context(|| format!("missing helpdesk agent '{}'", agent_id))?;
+    let ticket = get_helpdesk_ticket(pool, &ticket_id)
+        .await?
+        .with_context(|| format!("missing helpdesk ticket '{}'", ticket_id))?;
+
+    Ok(Some(HelpdeskAssignmentV1 { ticket, agent }))
+}
+
+pub async fn get_helpdesk_ticket(
+    pool: &SqlitePool,
+    ticket_id: &str,
+) -> anyhow::Result<Option<HelpdeskTicketV1>> {
+    let row = sqlx::query(
+        r#"
+        SELECT
+            ticket_id,
+            client_id,
+            client_display_name,
+            device_id,
+            requested_by,
+            summary,
+            status,
+            assigned_agent_id,
+            opening_deadline_at,
+            created_at,
+            updated_at
+        FROM helpdesk_tickets
+        WHERE ticket_id = ?1
+        "#,
+    )
+    .bind(ticket_id)
+    .fetch_optional(pool)
+    .await
+    .with_context(|| format!("failed to query helpdesk ticket '{}'", ticket_id))?;
+
+    row.map(row_to_helpdesk_ticket).transpose()
+}
+
+pub async fn get_helpdesk_agent(
+    pool: &SqlitePool,
+    agent_id: &str,
+) -> anyhow::Result<Option<HelpdeskAgentV1>> {
+    let row = sqlx::query(
+        r#"
+        SELECT
+            agent_id,
+            display_name,
+            status,
+            current_ticket_id,
+            last_heartbeat_at,
+            updated_at
+        FROM helpdesk_agents
+        WHERE agent_id = ?1
+        "#,
+    )
+    .bind(agent_id)
+    .fetch_optional(pool)
+    .await
+    .with_context(|| format!("failed to query helpdesk agent '{}'", agent_id))?;
+
+    row.map(row_to_helpdesk_agent).transpose()
+}
+
+pub async fn list_helpdesk_ticket_audit_events(
+    pool: &SqlitePool,
+    ticket_id: &str,
+    limit: u64,
+) -> anyhow::Result<Vec<HelpdeskAuditEventV1>> {
+    let limit = limit.clamp(1, 500);
+    let rows = sqlx::query(
+        r#"
+        SELECT entity_type, entity_id, event_type, payload, created_at
+        FROM helpdesk_audit_events
+        WHERE (entity_type = 'ticket' AND entity_id = ?1)
+           OR (
+                entity_type = 'agent'
+                AND json_extract(payload, '$.ticket_id') = ?1
+           )
+        ORDER BY created_at DESC, id DESC
+        LIMIT ?2
+        "#,
+    )
+    .bind(ticket_id)
+    .bind(limit as i64)
+    .fetch_all(pool)
+    .await
+    .with_context(|| format!("failed to list helpdesk audit events for ticket '{}'", ticket_id))?;
+
+    rows.into_iter().map(row_to_helpdesk_audit_event).collect()
+}
+
+pub async fn get_helpdesk_operational_summary(pool: &SqlitePool) -> anyhow::Result<HelpdeskOperationalSummaryV1> {
+    let ticket_rows = sqlx::query(
+        r#"
+        SELECT status, COUNT(*) AS total
+        FROM helpdesk_tickets
+        GROUP BY status
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .context("failed to aggregate helpdesk ticket summary")?;
+
+    let agent_rows = sqlx::query(
+        r#"
+        SELECT status, COUNT(*) AS total
+        FROM helpdesk_agents
+        GROUP BY status
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .context("failed to aggregate helpdesk agent summary")?;
+
+    let mut summary = HelpdeskOperationalSummaryV1 {
+        tickets_new: 0,
+        tickets_queued: 0,
+        tickets_opening: 0,
+        tickets_in_progress: 0,
+        tickets_resolved: 0,
+        tickets_cancelled: 0,
+        tickets_failed: 0,
+        agents_offline: 0,
+        agents_available: 0,
+        agents_opening: 0,
+        agents_busy: 0,
+        agents_away: 0,
+    };
+
+    for row in ticket_rows {
+        let status: String = row.get("status");
+        let total = i64_to_u64(row.get("total"));
+        match status.as_str() {
+            "new" => summary.tickets_new = total,
+            "queued" => summary.tickets_queued = total,
+            "opening" => summary.tickets_opening = total,
+            "in_progress" => summary.tickets_in_progress = total,
+            "resolved" => summary.tickets_resolved = total,
+            "cancelled" => summary.tickets_cancelled = total,
+            "failed" => summary.tickets_failed = total,
+            _ => {}
+        }
+    }
+
+    for row in agent_rows {
+        let status: String = row.get("status");
+        let total = i64_to_u64(row.get("total"));
+        match status.as_str() {
+            "offline" => summary.agents_offline = total,
+            "available" => summary.agents_available = total,
+            "opening" => summary.agents_opening = total,
+            "busy" => summary.agents_busy = total,
+            "away" => summary.agents_away = total,
+            _ => {}
+        }
+    }
+
+    Ok(summary)
+}
+
+pub async fn start_helpdesk_ticket(
+    pool: &SqlitePool,
+    agent_id: &str,
+    ticket_id: &str,
+) -> anyhow::Result<(HelpdeskTicketV1, HelpdeskAgentV1)> {
+    let now_ms = unix_millis_now() as i64;
+    let agent_id = agent_id.trim();
+    let ticket_id = ticket_id.trim();
+
+    let mut tx = pool.begin().await.context("failed to open helpdesk start transaction")?;
+
+    let ticket_update = sqlx::query(
+        r#"
+        UPDATE helpdesk_tickets
+        SET status = 'in_progress',
+            opening_deadline_at = NULL,
+            updated_at = ?3
+        WHERE ticket_id = ?1
+          AND assigned_agent_id = ?2
+          AND status = 'opening'
+        "#,
+    )
+    .bind(ticket_id)
+    .bind(agent_id)
+    .bind(now_ms)
+    .execute(&mut *tx)
+    .await
+    .with_context(|| format!("failed to start helpdesk ticket '{}'", ticket_id))?;
+
+    if ticket_update.rows_affected() == 0 {
+        anyhow::bail!("ticket is not in opening state for this agent");
+    }
+
+    let agent_update = sqlx::query(
+        r#"
+        UPDATE helpdesk_agents
+        SET status = 'busy',
+            current_ticket_id = ?2,
+            updated_at = ?3
+        WHERE agent_id = ?1
+          AND status = 'opening'
+          AND current_ticket_id = ?2
+        "#,
+    )
+    .bind(agent_id)
+    .bind(ticket_id)
+    .bind(now_ms)
+    .execute(&mut *tx)
+    .await
+    .with_context(|| format!("failed to move helpdesk agent '{}' to busy", agent_id))?;
+
+    if agent_update.rows_affected() == 0 {
+        anyhow::bail!("agent is not in opening state for this ticket");
+    }
+
+    sqlx::query(
+        r#"
+        UPDATE helpdesk_ticket_assignments
+        SET status = 'in_progress', updated_at = ?3
+        WHERE ticket_id = ?1
+          AND agent_id = ?2
+          AND status = 'opening'
+        "#,
+    )
+    .bind(ticket_id)
+    .bind(agent_id)
+    .bind(now_ms)
+    .execute(&mut *tx)
+    .await
+    .with_context(|| format!("failed to update assignment state for ticket '{}'", ticket_id))?;
+
+    insert_helpdesk_audit_event_tx(
+        &mut tx,
+        "ticket",
+        ticket_id,
+        "remote_session_started",
+        Some(serde_json::json!({
+            "agent_id": agent_id,
+        })),
+        now_ms,
+    )
+    .await?;
+
+    insert_helpdesk_audit_event_tx(
+        &mut tx,
+        "agent",
+        agent_id,
+        "agent_became_busy",
+        Some(serde_json::json!({
+            "ticket_id": ticket_id,
+        })),
+        now_ms,
+    )
+    .await?;
+
+    let ticket = get_helpdesk_ticket_tx(&mut tx, ticket_id)
+        .await?
+        .with_context(|| format!("helpdesk ticket '{}' not found after start", ticket_id))?;
+    let agent = get_helpdesk_agent_tx(&mut tx, agent_id)
+        .await?
+        .with_context(|| format!("helpdesk agent '{}' not found after start", agent_id))?;
+
+    tx.commit().await.context("failed to commit helpdesk start transaction")?;
+    Ok((ticket, agent))
+}
+
+pub async fn resolve_helpdesk_ticket(
+    pool: &SqlitePool,
+    ticket_id: &str,
+    agent_id: &str,
+    next_agent_status: HelpdeskAgentStatus,
+) -> anyhow::Result<(HelpdeskTicketV1, HelpdeskAgentV1)> {
+    let now_ms = unix_millis_now() as i64;
+    let agent_id = agent_id.trim();
+    let ticket_id = ticket_id.trim();
+
+    let mut tx = pool.begin().await.context("failed to open helpdesk resolve transaction")?;
+
+    let ticket_update = sqlx::query(
+        r#"
+        UPDATE helpdesk_tickets
+        SET status = 'resolved',
+            opening_deadline_at = NULL,
+            updated_at = ?3
+        WHERE ticket_id = ?1
+          AND assigned_agent_id = ?2
+          AND status = 'in_progress'
+        "#,
+    )
+    .bind(ticket_id)
+    .bind(agent_id)
+    .bind(now_ms)
+    .execute(&mut *tx)
+    .await
+    .with_context(|| format!("failed to resolve helpdesk ticket '{}'", ticket_id))?;
+
+    if ticket_update.rows_affected() == 0 {
+        anyhow::bail!("ticket is not in progress for this agent");
+    }
+
+    let agent_status = next_agent_status.as_str();
+    let agent_update = sqlx::query(
+        r#"
+        UPDATE helpdesk_agents
+        SET status = ?3,
+            current_ticket_id = NULL,
+            updated_at = ?4
+        WHERE agent_id = ?1
+          AND current_ticket_id = ?2
+          AND status = 'busy'
+        "#,
+    )
+    .bind(agent_id)
+    .bind(ticket_id)
+    .bind(agent_status)
+    .bind(now_ms)
+    .execute(&mut *tx)
+    .await
+    .with_context(|| format!("failed to release helpdesk agent '{}'", agent_id))?;
+
+    if agent_update.rows_affected() == 0 {
+        anyhow::bail!("agent is not busy with this ticket");
+    }
+
+    sqlx::query(
+        r#"
+        UPDATE helpdesk_ticket_assignments
+        SET status = 'resolved', updated_at = ?3
+        WHERE ticket_id = ?1
+          AND agent_id = ?2
+          AND status IN ('opening', 'in_progress')
+        "#,
+    )
+    .bind(ticket_id)
+    .bind(agent_id)
+    .bind(now_ms)
+    .execute(&mut *tx)
+    .await
+    .with_context(|| format!("failed to resolve assignment for ticket '{}'", ticket_id))?;
+
+    insert_helpdesk_audit_event_tx(
+        &mut tx,
+        "ticket",
+        ticket_id,
+        "ticket_resolved",
+        Some(serde_json::json!({
+            "agent_id": agent_id,
+        })),
+        now_ms,
+    )
+    .await?;
+
+    insert_helpdesk_audit_event_tx(
+        &mut tx,
+        "agent",
+        agent_id,
+        if next_agent_status == HelpdeskAgentStatus::Away {
+            "agent_became_away"
+        } else {
+            "agent_became_available"
+        },
+        Some(serde_json::json!({
+            "ticket_id": ticket_id,
+        })),
+        now_ms,
+    )
+    .await?;
+
+    if next_agent_status == HelpdeskAgentStatus::Available {
+        reconcile_helpdesk_queue_tx(&mut tx, now_ms).await?;
+    }
+
+    let ticket = get_helpdesk_ticket_tx(&mut tx, ticket_id)
+        .await?
+        .with_context(|| format!("helpdesk ticket '{}' not found after resolve", ticket_id))?;
+    let agent = get_helpdesk_agent_tx(&mut tx, agent_id)
+        .await?
+        .with_context(|| format!("helpdesk agent '{}' not found after resolve", agent_id))?;
+
+    tx.commit().await.context("failed to commit helpdesk resolve transaction")?;
+    Ok((ticket, agent))
+}
+
+pub async fn requeue_helpdesk_ticket(
+    pool: &SqlitePool,
+    ticket_id: &str,
+    next_agent_status: HelpdeskAgentStatus,
+    reason: Option<&str>,
+) -> anyhow::Result<(HelpdeskTicketV1, Option<HelpdeskAgentV1>)> {
+    let now_ms = unix_millis_now() as i64;
+    let ticket_id = ticket_id.trim();
+
+    let mut tx = pool
+        .begin()
+        .await
+        .context("failed to open helpdesk requeue transaction")?;
+
+    let current_ticket = get_helpdesk_ticket_tx(&mut tx, ticket_id)
+        .await?
+        .with_context(|| format!("helpdesk ticket '{}' not found before requeue", ticket_id))?;
+
+    if current_ticket.status == HelpdeskTicketStatus::Resolved {
+        anyhow::bail!("resolved ticket cannot be requeued");
+    }
+
+    let assigned_agent_id = current_ticket.assigned_agent_id.clone();
+    let reason = reason.map(str::trim).filter(|value| !value.is_empty());
+
+    sqlx::query(
+        r#"
+        UPDATE helpdesk_tickets
+        SET status = 'queued',
+            assigned_agent_id = NULL,
+            opening_deadline_at = NULL,
+            updated_at = ?2
+        WHERE ticket_id = ?1
+        "#,
+    )
+    .bind(ticket_id)
+    .bind(now_ms)
+    .execute(&mut *tx)
+    .await
+    .with_context(|| format!("failed to requeue helpdesk ticket '{}'", ticket_id))?;
+
+    if let Some(agent_id) = assigned_agent_id.as_deref() {
+        sqlx::query(
+            r#"
+            UPDATE helpdesk_agents
+            SET status = ?3,
+                current_ticket_id = NULL,
+                updated_at = ?4
+            WHERE agent_id = ?1
+              AND current_ticket_id = ?2
+            "#,
+        )
+        .bind(agent_id)
+        .bind(ticket_id)
+        .bind(next_agent_status.as_str())
+        .bind(now_ms)
+        .execute(&mut *tx)
+        .await
+        .with_context(|| format!("failed to release helpdesk agent '{}' during requeue", agent_id))?;
+
+        sqlx::query(
+            r#"
+            UPDATE helpdesk_ticket_assignments
+            SET status = 'requeued', updated_at = ?3
+            WHERE ticket_id = ?1
+              AND agent_id = ?2
+              AND status IN ('opening', 'in_progress')
+            "#,
+        )
+        .bind(ticket_id)
+        .bind(agent_id)
+        .bind(now_ms)
+        .execute(&mut *tx)
+        .await
+        .with_context(|| format!("failed to requeue assignment for ticket '{}'", ticket_id))?;
+
+        insert_helpdesk_audit_event_tx(
+            &mut tx,
+            "agent",
+            agent_id,
+            "ticket_requeued_by_supervisor",
+            Some(serde_json::json!({
+                "ticket_id": ticket_id,
+                "next_agent_status": next_agent_status.as_str(),
+                "reason": reason,
+            })),
+            now_ms,
+        )
+        .await?;
+    }
+
+    insert_helpdesk_audit_event_tx(
+        &mut tx,
+        "ticket",
+        ticket_id,
+        "ticket_requeued_by_supervisor",
+        Some(serde_json::json!({
+            "previous_status": current_ticket.status.as_str(),
+            "previous_agent_id": assigned_agent_id,
+            "next_agent_status": next_agent_status.as_str(),
+            "reason": reason,
+        })),
+        now_ms,
+    )
+    .await?;
+
+    let ticket = get_helpdesk_ticket_tx(&mut tx, ticket_id)
+        .await?
+        .with_context(|| format!("helpdesk ticket '{}' not found after requeue", ticket_id))?;
+    let agent = if let Some(agent_id) = current_ticket.assigned_agent_id.as_deref() {
+        get_helpdesk_agent_tx(&mut tx, agent_id).await?
+    } else {
+        None
+    };
+
+    tx.commit()
+        .await
+        .context("failed to commit helpdesk requeue transaction")?;
+    Ok((ticket, agent))
+}
+
+pub async fn cancel_helpdesk_ticket(
+    pool: &SqlitePool,
+    ticket_id: &str,
+    next_agent_status: HelpdeskAgentStatus,
+    reason: Option<&str>,
+) -> anyhow::Result<(HelpdeskTicketV1, Option<HelpdeskAgentV1>)> {
+    let now_ms = unix_millis_now() as i64;
+    let ticket_id = ticket_id.trim();
+
+    let mut tx = pool
+        .begin()
+        .await
+        .context("failed to open helpdesk cancel transaction")?;
+
+    let current_ticket = get_helpdesk_ticket_tx(&mut tx, ticket_id)
+        .await?
+        .with_context(|| format!("helpdesk ticket '{}' not found before cancel", ticket_id))?;
+
+    if matches!(
+        current_ticket.status,
+        HelpdeskTicketStatus::Resolved | HelpdeskTicketStatus::Cancelled
+    ) {
+        anyhow::bail!("ticket is already terminal and cannot be cancelled");
+    }
+
+    let assigned_agent_id = current_ticket.assigned_agent_id.clone();
+    let reason = reason.map(str::trim).filter(|value| !value.is_empty());
+
+    sqlx::query(
+        r#"
+        UPDATE helpdesk_tickets
+        SET status = 'cancelled',
+            opening_deadline_at = NULL,
+            updated_at = ?2
+        WHERE ticket_id = ?1
+        "#,
+    )
+    .bind(ticket_id)
+    .bind(now_ms)
+    .execute(&mut *tx)
+    .await
+    .with_context(|| format!("failed to cancel helpdesk ticket '{}'", ticket_id))?;
+
+    if let Some(agent_id) = assigned_agent_id.as_deref() {
+        sqlx::query(
+            r#"
+            UPDATE helpdesk_agents
+            SET status = ?3,
+                current_ticket_id = NULL,
+                updated_at = ?4
+            WHERE agent_id = ?1
+              AND current_ticket_id = ?2
+            "#,
+        )
+        .bind(agent_id)
+        .bind(ticket_id)
+        .bind(next_agent_status.as_str())
+        .bind(now_ms)
+        .execute(&mut *tx)
+        .await
+        .with_context(|| format!("failed to release helpdesk agent '{}' during cancel", agent_id))?;
+
+        sqlx::query(
+            r#"
+            UPDATE helpdesk_ticket_assignments
+            SET status = 'cancelled', updated_at = ?3
+            WHERE ticket_id = ?1
+              AND agent_id = ?2
+              AND status IN ('opening', 'in_progress')
+            "#,
+        )
+        .bind(ticket_id)
+        .bind(agent_id)
+        .bind(now_ms)
+        .execute(&mut *tx)
+        .await
+        .with_context(|| format!("failed to cancel assignment for ticket '{}'", ticket_id))?;
+
+        insert_helpdesk_audit_event_tx(
+            &mut tx,
+            "agent",
+            agent_id,
+            "ticket_cancelled_by_supervisor",
+            Some(serde_json::json!({
+                "ticket_id": ticket_id,
+                "next_agent_status": next_agent_status.as_str(),
+                "reason": reason,
+            })),
+            now_ms,
+        )
+        .await?;
+    }
+
+    insert_helpdesk_audit_event_tx(
+        &mut tx,
+        "ticket",
+        ticket_id,
+        "ticket_cancelled_by_supervisor",
+        Some(serde_json::json!({
+            "previous_status": current_ticket.status.as_str(),
+            "previous_agent_id": assigned_agent_id,
+            "next_agent_status": next_agent_status.as_str(),
+            "reason": reason,
+        })),
+        now_ms,
+    )
+    .await?;
+
+    let ticket = get_helpdesk_ticket_tx(&mut tx, ticket_id)
+        .await?
+        .with_context(|| format!("helpdesk ticket '{}' not found after cancel", ticket_id))?;
+    let agent = if let Some(agent_id) = current_ticket.assigned_agent_id.as_deref() {
+        get_helpdesk_agent_tx(&mut tx, agent_id).await?
+    } else {
+        None
+    };
+
+    tx.commit()
+        .await
+        .context("failed to commit helpdesk cancel transaction")?;
+    Ok((ticket, agent))
+}
+
+pub async fn reconcile_helpdesk_runtime(
+    pool: &SqlitePool,
+    agent_stale_after_ms: i64,
+    now_ms: i64,
+) -> anyhow::Result<HelpdeskRuntimeReconcileResult> {
+    let stale_before_ms = now_ms.saturating_sub(agent_stale_after_ms);
+    let mut tx = pool
+        .begin()
+        .await
+        .context("failed to open helpdesk runtime reconcile transaction")?;
+    let mut stats = HelpdeskRuntimeReconcileResult::default();
+
+    let expired_openings = sqlx::query(
+        r#"
+        SELECT ticket_id, assigned_agent_id
+        FROM helpdesk_tickets
+        WHERE status = 'opening'
+          AND opening_deadline_at IS NOT NULL
+          AND opening_deadline_at <= ?1
+        ORDER BY opening_deadline_at ASC, ticket_id ASC
+        "#,
+    )
+    .bind(now_ms)
+    .fetch_all(&mut *tx)
+    .await
+    .context("failed to query expired helpdesk openings")?;
+
+    for row in expired_openings {
+        let ticket_id: String = row.get("ticket_id");
+        let agent_id: Option<String> = row.get("assigned_agent_id");
+
+        sqlx::query(
+            r#"
+            UPDATE helpdesk_tickets
+            SET status = 'queued',
+                assigned_agent_id = NULL,
+                opening_deadline_at = NULL,
+                updated_at = ?2
+            WHERE ticket_id = ?1
+              AND status = 'opening'
+            "#,
+        )
+        .bind(&ticket_id)
+        .bind(now_ms)
+        .execute(&mut *tx)
+        .await
+        .with_context(|| format!("failed to requeue expired opening ticket '{}'", ticket_id))?;
+
+        if let Some(agent_id) = agent_id {
+            sqlx::query(
+                r#"
+                UPDATE helpdesk_agents
+                SET status = 'available',
+                    current_ticket_id = NULL,
+                    updated_at = ?2
+                WHERE agent_id = ?1
+                  AND status = 'opening'
+                  AND current_ticket_id = ?3
+                "#,
+            )
+            .bind(&agent_id)
+            .bind(now_ms)
+            .bind(&ticket_id)
+            .execute(&mut *tx)
+            .await
+            .with_context(|| format!("failed to release expired opening agent '{}'", agent_id))?;
+
+            sqlx::query(
+                r#"
+                UPDATE helpdesk_ticket_assignments
+                SET status = 'expired', updated_at = ?3
+                WHERE ticket_id = ?1
+                  AND agent_id = ?2
+                  AND status = 'opening'
+                "#,
+            )
+            .bind(&ticket_id)
+            .bind(&agent_id)
+            .bind(now_ms)
+            .execute(&mut *tx)
+            .await
+            .with_context(|| format!("failed to expire assignment for ticket '{}'", ticket_id))?;
+
+            insert_helpdesk_audit_event_tx(
+                &mut tx,
+                "agent",
+                &agent_id,
+                "opening_countdown_cancelled",
+                Some(serde_json::json!({
+                    "ticket_id": ticket_id,
+                    "reason": "deadline_expired",
+                })),
+                now_ms,
+            )
+            .await?;
+        }
+
+        insert_helpdesk_audit_event_tx(
+            &mut tx,
+            "ticket",
+            &ticket_id,
+            "opening_countdown_cancelled",
+            Some(serde_json::json!({
+                "reason": "deadline_expired",
+            })),
+            now_ms,
+        )
+        .await?;
+
+        stats.opening_timeouts = stats.opening_timeouts.saturating_add(1);
+        stats.tickets_requeued = stats.tickets_requeued.saturating_add(1);
+    }
+
+    let stale_agents = sqlx::query(
+        r#"
+        SELECT agent_id, status, current_ticket_id
+        FROM helpdesk_agents
+        WHERE status != 'offline'
+          AND last_heartbeat_at < ?1
+        ORDER BY last_heartbeat_at ASC, agent_id ASC
+        "#,
+    )
+    .bind(stale_before_ms)
+    .fetch_all(&mut *tx)
+    .await
+    .context("failed to query stale helpdesk agents")?;
+
+    for row in stale_agents {
+        let agent_id: String = row.get("agent_id");
+        let status: String = row.get("status");
+        let current_ticket_id: Option<String> = row.get("current_ticket_id");
+
+        sqlx::query(
+            r#"
+            UPDATE helpdesk_agents
+            SET status = 'offline',
+                current_ticket_id = NULL,
+                updated_at = ?2
+            WHERE agent_id = ?1
+            "#,
+        )
+        .bind(&agent_id)
+        .bind(now_ms)
+        .execute(&mut *tx)
+        .await
+        .with_context(|| format!("failed to mark stale agent '{}' offline", agent_id))?;
+
+        insert_helpdesk_audit_event_tx(
+            &mut tx,
+            "agent",
+            &agent_id,
+            "agent_went_offline",
+            Some(serde_json::json!({
+                "previous_status": status,
+            })),
+            now_ms,
+        )
+        .await?;
+
+        stats.agents_marked_offline = stats.agents_marked_offline.saturating_add(1);
+
+        if let Some(ticket_id) = current_ticket_id {
+            if status == "opening" {
+                sqlx::query(
+                    r#"
+                    UPDATE helpdesk_tickets
+                    SET status = 'queued',
+                        assigned_agent_id = NULL,
+                        opening_deadline_at = NULL,
+                        updated_at = ?2
+                    WHERE ticket_id = ?1
+                      AND status = 'opening'
+                    "#,
+                )
+                .bind(&ticket_id)
+                .bind(now_ms)
+                .execute(&mut *tx)
+                .await
+                .with_context(|| format!("failed to requeue ticket '{}' for stale opening agent", ticket_id))?;
+
+                sqlx::query(
+                    r#"
+                    UPDATE helpdesk_ticket_assignments
+                    SET status = 'expired', updated_at = ?3
+                    WHERE ticket_id = ?1
+                      AND agent_id = ?2
+                      AND status = 'opening'
+                    "#,
+                )
+                .bind(&ticket_id)
+                .bind(&agent_id)
+                .bind(now_ms)
+                .execute(&mut *tx)
+                .await
+                .with_context(|| format!("failed to expire stale opening assignment '{}'", ticket_id))?;
+
+                insert_helpdesk_audit_event_tx(
+                    &mut tx,
+                    "ticket",
+                    &ticket_id,
+                    "opening_countdown_cancelled",
+                    Some(serde_json::json!({
+                        "reason": "agent_heartbeat_expired",
+                        "agent_id": agent_id,
+                    })),
+                    now_ms,
+                )
+                .await?;
+
+                stats.tickets_requeued = stats.tickets_requeued.saturating_add(1);
+            } else if status == "busy" {
+                sqlx::query(
+                    r#"
+                    UPDATE helpdesk_tickets
+                    SET status = 'failed',
+                        assigned_agent_id = NULL,
+                        opening_deadline_at = NULL,
+                        updated_at = ?2
+                    WHERE ticket_id = ?1
+                      AND status = 'in_progress'
+                    "#,
+                )
+                .bind(&ticket_id)
+                .bind(now_ms)
+                .execute(&mut *tx)
+                .await
+                .with_context(|| format!("failed to fail in-progress ticket '{}' for stale agent", ticket_id))?;
+
+                sqlx::query(
+                    r#"
+                    UPDATE helpdesk_ticket_assignments
+                    SET status = 'failed', updated_at = ?3
+                    WHERE ticket_id = ?1
+                      AND agent_id = ?2
+                      AND status IN ('opening', 'in_progress')
+                    "#,
+                )
+                .bind(&ticket_id)
+                .bind(&agent_id)
+                .bind(now_ms)
+                .execute(&mut *tx)
+                .await
+                .with_context(|| format!("failed to fail stale busy assignment '{}'", ticket_id))?;
+
+                insert_helpdesk_audit_event_tx(
+                    &mut tx,
+                    "ticket",
+                    &ticket_id,
+                    "remote_session_failed",
+                    Some(serde_json::json!({
+                        "reason": "agent_heartbeat_expired",
+                        "agent_id": agent_id,
+                    })),
+                    now_ms,
+                )
+                .await?;
+
+                stats.tickets_failed = stats.tickets_failed.saturating_add(1);
+            }
+        }
+    }
+
+    reconcile_helpdesk_queue_tx(&mut tx, now_ms).await?;
+
+    tx.commit()
+        .await
+        .context("failed to commit helpdesk runtime reconcile transaction")?;
+    Ok(stats)
+}
+
 pub async fn get_dashboard_summary(
     pool: &SqlitePool,
     from: DateTime<Utc>,
@@ -1264,6 +2537,304 @@ fn event_to_timeline_item(event: SessionEventV1) -> SessionTimelineItemV1 {
     }
 }
 
+async fn reconcile_helpdesk_queue_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    now_ms: i64,
+) -> anyhow::Result<Option<(String, String)>> {
+    let ticket_row = sqlx::query(
+        r#"
+        SELECT ticket_id
+        FROM helpdesk_tickets
+        WHERE status = 'queued'
+        ORDER BY created_at ASC, ticket_id ASC
+        LIMIT 1
+        "#,
+    )
+    .fetch_optional(&mut **tx)
+    .await
+    .context("failed to select queued helpdesk ticket")?;
+
+    let agent_row = sqlx::query(
+        r#"
+        SELECT agent_id
+        FROM helpdesk_agents
+        WHERE status = 'available'
+        ORDER BY updated_at ASC, agent_id ASC
+        LIMIT 1
+        "#,
+    )
+    .fetch_optional(&mut **tx)
+    .await
+    .context("failed to select available helpdesk agent")?;
+
+    let (Some(ticket_row), Some(agent_row)) = (ticket_row, agent_row) else {
+        return Ok(None);
+    };
+
+    let ticket_id: String = ticket_row.get("ticket_id");
+    let agent_id: String = agent_row.get("agent_id");
+    let deadline_ms = now_ms + 10_000;
+
+    let ticket_update = sqlx::query(
+        r#"
+        UPDATE helpdesk_tickets
+        SET status = 'opening',
+            assigned_agent_id = ?2,
+            opening_deadline_at = ?3,
+            updated_at = ?4
+        WHERE ticket_id = ?1 AND status = 'queued'
+        "#,
+    )
+    .bind(&ticket_id)
+    .bind(&agent_id)
+    .bind(deadline_ms)
+    .bind(now_ms)
+    .execute(&mut **tx)
+    .await
+    .with_context(|| format!("failed to move ticket '{}' to opening", ticket_id))?;
+
+    if ticket_update.rows_affected() == 0 {
+        return Ok(None);
+    }
+
+    let agent_update = sqlx::query(
+        r#"
+        UPDATE helpdesk_agents
+        SET status = 'opening',
+            current_ticket_id = ?2,
+            updated_at = ?3
+        WHERE agent_id = ?1 AND status = 'available'
+        "#,
+    )
+    .bind(&agent_id)
+    .bind(&ticket_id)
+    .bind(now_ms)
+    .execute(&mut **tx)
+    .await
+    .with_context(|| format!("failed to move agent '{}' to opening", agent_id))?;
+
+    if agent_update.rows_affected() == 0 {
+        sqlx::query(
+            r#"
+            UPDATE helpdesk_tickets
+            SET status = 'queued',
+                assigned_agent_id = NULL,
+                opening_deadline_at = NULL,
+                updated_at = ?2
+            WHERE ticket_id = ?1
+            "#,
+        )
+        .bind(&ticket_id)
+        .bind(now_ms)
+        .execute(&mut **tx)
+        .await
+        .with_context(|| format!("failed to rollback ticket '{}' opening state", ticket_id))?;
+        return Ok(None);
+    }
+
+    sqlx::query(
+        r#"
+        INSERT INTO helpdesk_ticket_assignments (
+            ticket_id, agent_id, status, created_at, updated_at
+        )
+        VALUES (?1, ?2, 'opening', ?3, ?4)
+        "#,
+    )
+    .bind(&ticket_id)
+    .bind(&agent_id)
+    .bind(now_ms)
+    .bind(now_ms)
+    .execute(&mut **tx)
+    .await
+    .with_context(|| format!("failed to insert assignment for ticket '{}'", ticket_id))?;
+
+    insert_helpdesk_audit_event_tx(
+        tx,
+        "ticket",
+        &ticket_id,
+        "ticket_assigned",
+        Some(serde_json::json!({
+            "agent_id": agent_id,
+            "opening_deadline_at": millis_to_utc(deadline_ms).to_rfc3339(),
+        })),
+        now_ms,
+    )
+    .await?;
+
+    insert_helpdesk_audit_event_tx(
+        tx,
+        "agent",
+        &agent_id,
+        "opening_countdown_started",
+        Some(serde_json::json!({
+            "ticket_id": ticket_id,
+            "opening_deadline_at": millis_to_utc(deadline_ms).to_rfc3339(),
+        })),
+        now_ms,
+    )
+    .await?;
+
+    Ok(Some((ticket_id, agent_id)))
+}
+
+async fn insert_helpdesk_audit_event_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    entity_type: &str,
+    entity_id: &str,
+    event_type: &str,
+    payload: Option<Value>,
+    now_ms: i64,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO helpdesk_audit_events (
+            entity_type, entity_id, event_type, payload, created_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5)
+        "#,
+    )
+    .bind(entity_type)
+    .bind(entity_id)
+    .bind(event_type)
+    .bind(payload.map(|value| value.to_string()))
+    .bind(now_ms)
+    .execute(&mut **tx)
+    .await
+    .with_context(|| format!("failed to insert helpdesk audit event '{}:{}'", entity_type, entity_id))?;
+
+    Ok(())
+}
+
+async fn get_helpdesk_agent_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    agent_id: &str,
+) -> anyhow::Result<Option<HelpdeskAgentV1>> {
+    let row = sqlx::query(
+        r#"
+        SELECT
+            agent_id,
+            display_name,
+            status,
+            current_ticket_id,
+            last_heartbeat_at,
+            updated_at
+        FROM helpdesk_agents
+        WHERE agent_id = ?1
+        "#,
+    )
+    .bind(agent_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .with_context(|| format!("failed to query helpdesk agent '{}' in tx", agent_id))?;
+
+    row.map(row_to_helpdesk_agent).transpose()
+}
+
+async fn get_helpdesk_ticket_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    ticket_id: &str,
+) -> anyhow::Result<Option<HelpdeskTicketV1>> {
+    let row = sqlx::query(
+        r#"
+        SELECT
+            ticket_id,
+            client_id,
+            client_display_name,
+            device_id,
+            requested_by,
+            summary,
+            status,
+            assigned_agent_id,
+            opening_deadline_at,
+            created_at,
+            updated_at
+        FROM helpdesk_tickets
+        WHERE ticket_id = ?1
+        "#,
+    )
+    .bind(ticket_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .with_context(|| format!("failed to query helpdesk ticket '{}' in tx", ticket_id))?;
+
+    row.map(row_to_helpdesk_ticket).transpose()
+}
+
+fn row_to_helpdesk_agent(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<HelpdeskAgentV1> {
+    let status: String = row.get("status");
+    Ok(HelpdeskAgentV1 {
+        agent_id: row.get("agent_id"),
+        display_name: row.get("display_name"),
+        status: helpdesk_agent_status_from_db(&status),
+        current_ticket_id: row.get("current_ticket_id"),
+        last_heartbeat_at: millis_to_utc(row.get("last_heartbeat_at")),
+        updated_at: millis_to_utc(row.get("updated_at")),
+    })
+}
+
+fn row_to_helpdesk_ticket(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<HelpdeskTicketV1> {
+    let status: String = row.get("status");
+    let opening_deadline_at: Option<i64> = row.get("opening_deadline_at");
+    Ok(HelpdeskTicketV1 {
+        ticket_id: row.get("ticket_id"),
+        client_id: row.get("client_id"),
+        client_display_name: row.get("client_display_name"),
+        device_id: row.get("device_id"),
+        requested_by: row.get("requested_by"),
+        summary: row.get("summary"),
+        status: helpdesk_ticket_status_from_db(&status),
+        assigned_agent_id: row.get("assigned_agent_id"),
+        opening_deadline_at: opening_deadline_at.map(millis_to_utc),
+        created_at: millis_to_utc(row.get("created_at")),
+        updated_at: millis_to_utc(row.get("updated_at")),
+    })
+}
+
+fn row_to_helpdesk_audit_event(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<HelpdeskAuditEventV1> {
+    let payload: Option<String> = row.get("payload");
+    Ok(HelpdeskAuditEventV1 {
+        entity_type: row.get("entity_type"),
+        entity_id: row.get("entity_id"),
+        event_type: row.get("event_type"),
+        payload: payload
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .context("failed to deserialize helpdesk audit payload")?,
+        created_at: millis_to_utc(row.get("created_at")),
+    })
+}
+
+fn helpdesk_agent_status_from_db(raw: &str) -> HelpdeskAgentStatus {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "available" => HelpdeskAgentStatus::Available,
+        "opening" => HelpdeskAgentStatus::Opening,
+        "busy" => HelpdeskAgentStatus::Busy,
+        "away" => HelpdeskAgentStatus::Away,
+        _ => HelpdeskAgentStatus::Offline,
+    }
+}
+
+fn helpdesk_ticket_status_from_db(raw: &str) -> HelpdeskTicketStatus {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "queued" => HelpdeskTicketStatus::Queued,
+        "assigned" => HelpdeskTicketStatus::Assigned,
+        "opening" => HelpdeskTicketStatus::Opening,
+        "in_progress" => HelpdeskTicketStatus::InProgress,
+        "resolved" => HelpdeskTicketStatus::Resolved,
+        "cancelled" => HelpdeskTicketStatus::Cancelled,
+        "failed" => HelpdeskTicketStatus::Failed,
+        _ => HelpdeskTicketStatus::New,
+    }
+}
+
+fn normalize_optional_text(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
 fn parse_rfc3339_to_utc(value: &str) -> DateTime<Utc> {
     DateTime::parse_from_rfc3339(value)
         .map(|value| value.with_timezone(&Utc))
@@ -1291,11 +2862,17 @@ mod tests {
     use tempfile::tempdir;
     use uuid::Uuid;
 
-    use crate::model::{SessionDirection, SessionEventType, SessionEventV1};
+    use crate::model::{
+        HelpdeskAgentPresenceUpdateV1, HelpdeskAgentStatus, HelpdeskTicketCreateRequestV1,
+        HelpdeskTicketStatus, SessionDirection, SessionEventType, SessionEventV1,
+    };
 
     use super::{
-        connect_sqlite, expire_stale_presence, get_session_presence, insert_event, list_active_session_presence,
-        unix_millis_now, InsertOutcome,
+        connect_sqlite, create_helpdesk_ticket, expire_stale_presence, get_helpdesk_assignment_for_agent,
+        get_helpdesk_agent, get_helpdesk_operational_summary, get_helpdesk_ticket, get_session_presence,
+        insert_event, list_active_session_presence, list_helpdesk_ticket_audit_events, list_helpdesk_tickets,
+        reconcile_helpdesk_runtime, requeue_helpdesk_ticket, cancel_helpdesk_ticket, resolve_helpdesk_ticket,
+        start_helpdesk_ticket, unix_millis_now, upsert_helpdesk_agent_presence, InsertOutcome,
     };
 
     #[tokio::test]
@@ -1509,5 +3086,410 @@ mod tests {
         assert_eq!(snapshot.participants.len(), 1);
         assert!(snapshot.participants[0].is_active);
         assert!(!snapshot.participants[0].is_control_active);
+    }
+
+    #[tokio::test]
+    async fn helpdesk_ticket_is_assigned_to_first_available_agent() {
+        let temp = tempdir().expect("create temp dir");
+        let db_path = temp.path().join("helpdesk-assign.db");
+        let pool = connect_sqlite(&db_path).await.expect("connect sqlite");
+
+        let agent = upsert_helpdesk_agent_presence(
+            &pool,
+            &HelpdeskAgentPresenceUpdateV1 {
+                agent_id: "agent-1".to_string(),
+                display_name: Some("Agent One".to_string()),
+                status: HelpdeskAgentStatus::Available,
+            },
+        )
+        .await
+        .expect("upsert agent");
+
+        assert_eq!(agent.status, HelpdeskAgentStatus::Available);
+
+        let ticket = create_helpdesk_ticket(
+            &pool,
+            &HelpdeskTicketCreateRequestV1 {
+                client_id: "client-1".to_string(),
+                client_display_name: Some("Cliente 1".to_string()),
+                device_id: Some("device-1".to_string()),
+                requested_by: Some("user@example.com".to_string()),
+                summary: Some("Necesito ayuda".to_string()),
+            },
+        )
+        .await
+        .expect("create ticket");
+
+        assert_eq!(ticket.status, HelpdeskTicketStatus::Opening);
+        assert_eq!(ticket.assigned_agent_id.as_deref(), Some("agent-1"));
+        assert!(ticket.opening_deadline_at.is_some());
+
+        let assignment = get_helpdesk_assignment_for_agent(&pool, "agent-1")
+            .await
+            .expect("get assignment")
+            .expect("assignment exists");
+        assert_eq!(assignment.ticket.ticket_id, ticket.ticket_id);
+        assert_eq!(assignment.agent.status, HelpdeskAgentStatus::Opening);
+    }
+
+    #[tokio::test]
+    async fn queued_helpdesk_ticket_is_picked_when_agent_becomes_available() {
+        let temp = tempdir().expect("create temp dir");
+        let db_path = temp.path().join("helpdesk-queue.db");
+        let pool = connect_sqlite(&db_path).await.expect("connect sqlite");
+
+        let ticket = create_helpdesk_ticket(
+            &pool,
+            &HelpdeskTicketCreateRequestV1 {
+                client_id: "client-queued".to_string(),
+                client_display_name: None,
+                device_id: None,
+                requested_by: None,
+                summary: Some("En cola".to_string()),
+            },
+        )
+        .await
+        .expect("create queued ticket");
+
+        assert_eq!(ticket.status, HelpdeskTicketStatus::Queued);
+        assert!(ticket.assigned_agent_id.is_none());
+
+        let agent = upsert_helpdesk_agent_presence(
+            &pool,
+            &HelpdeskAgentPresenceUpdateV1 {
+                agent_id: "agent-queued".to_string(),
+                display_name: Some("Agent Queue".to_string()),
+                status: HelpdeskAgentStatus::Available,
+            },
+        )
+        .await
+        .expect("upsert available agent");
+
+        assert_eq!(agent.status, HelpdeskAgentStatus::Opening);
+
+        let tickets = list_helpdesk_tickets(&pool).await.expect("list helpdesk tickets");
+        assert_eq!(tickets.len(), 1);
+        assert_eq!(tickets[0].status, HelpdeskTicketStatus::Opening);
+        assert_eq!(tickets[0].assigned_agent_id.as_deref(), Some("agent-queued"));
+    }
+
+    #[tokio::test]
+    async fn helpdesk_ticket_can_move_from_opening_to_resolved() {
+        let temp = tempdir().expect("create temp dir");
+        let db_path = temp.path().join("helpdesk-lifecycle.db");
+        let pool = connect_sqlite(&db_path).await.expect("connect sqlite");
+
+        upsert_helpdesk_agent_presence(
+            &pool,
+            &HelpdeskAgentPresenceUpdateV1 {
+                agent_id: "agent-life".to_string(),
+                display_name: Some("Agent Life".to_string()),
+                status: HelpdeskAgentStatus::Available,
+            },
+        )
+        .await
+        .expect("upsert agent");
+
+        let ticket = create_helpdesk_ticket(
+            &pool,
+            &HelpdeskTicketCreateRequestV1 {
+                client_id: "client-life".to_string(),
+                client_display_name: None,
+                device_id: None,
+                requested_by: None,
+                summary: Some("Lifecycle".to_string()),
+            },
+        )
+        .await
+        .expect("create ticket");
+
+        let (started_ticket, started_agent) = start_helpdesk_ticket(&pool, "agent-life", &ticket.ticket_id)
+            .await
+            .expect("start ticket");
+        assert_eq!(started_ticket.status, HelpdeskTicketStatus::InProgress);
+        assert_eq!(started_agent.status, HelpdeskAgentStatus::Busy);
+
+        let (resolved_ticket, resolved_agent) = resolve_helpdesk_ticket(
+            &pool,
+            &ticket.ticket_id,
+            "agent-life",
+            HelpdeskAgentStatus::Available,
+        )
+        .await
+        .expect("resolve ticket");
+        assert_eq!(resolved_ticket.status, HelpdeskTicketStatus::Resolved);
+        assert_eq!(resolved_agent.status, HelpdeskAgentStatus::Available);
+        assert_eq!(resolved_agent.current_ticket_id, None);
+    }
+
+    #[tokio::test]
+    async fn expired_opening_ticket_is_requeued() {
+        let temp = tempdir().expect("create temp dir");
+        let db_path = temp.path().join("helpdesk-expired-opening.db");
+        let pool = connect_sqlite(&db_path).await.expect("connect sqlite");
+
+        upsert_helpdesk_agent_presence(
+            &pool,
+            &HelpdeskAgentPresenceUpdateV1 {
+                agent_id: "agent-expire".to_string(),
+                display_name: Some("Agent Expire".to_string()),
+                status: HelpdeskAgentStatus::Available,
+            },
+        )
+        .await
+        .expect("upsert agent");
+
+        let ticket = create_helpdesk_ticket(
+            &pool,
+            &HelpdeskTicketCreateRequestV1 {
+                client_id: "client-expire".to_string(),
+                client_display_name: None,
+                device_id: None,
+                requested_by: None,
+                summary: Some("Opening timeout".to_string()),
+            },
+        )
+        .await
+        .expect("create ticket");
+
+        sqlx::query(
+            r#"
+            UPDATE helpdesk_tickets
+            SET opening_deadline_at = ?2
+            WHERE ticket_id = ?1
+            "#,
+        )
+        .bind(&ticket.ticket_id)
+        .bind(0_i64)
+        .execute(&pool)
+        .await
+        .expect("force expired deadline");
+
+        let stats = reconcile_helpdesk_runtime(&pool, 60_000, unix_millis_now() as i64)
+            .await
+            .expect("reconcile runtime");
+        assert_eq!(stats.opening_timeouts, 1);
+
+        let ticket_after = get_helpdesk_ticket(&pool, &ticket.ticket_id)
+            .await
+            .expect("get ticket")
+            .expect("ticket exists");
+        let agent_after = get_helpdesk_agent(&pool, "agent-expire")
+            .await
+            .expect("get agent")
+            .expect("agent exists");
+
+        assert_eq!(ticket_after.status, HelpdeskTicketStatus::Opening);
+        assert_eq!(ticket_after.assigned_agent_id.as_deref(), Some("agent-expire"));
+        assert_eq!(agent_after.status, HelpdeskAgentStatus::Opening);
+    }
+
+    #[tokio::test]
+    async fn stale_busy_agent_marks_ticket_failed_and_agent_offline() {
+        let temp = tempdir().expect("create temp dir");
+        let db_path = temp.path().join("helpdesk-stale-busy.db");
+        let pool = connect_sqlite(&db_path).await.expect("connect sqlite");
+
+        upsert_helpdesk_agent_presence(
+            &pool,
+            &HelpdeskAgentPresenceUpdateV1 {
+                agent_id: "agent-stale".to_string(),
+                display_name: Some("Agent Stale".to_string()),
+                status: HelpdeskAgentStatus::Available,
+            },
+        )
+        .await
+        .expect("upsert agent");
+
+        let ticket = create_helpdesk_ticket(
+            &pool,
+            &HelpdeskTicketCreateRequestV1 {
+                client_id: "client-stale".to_string(),
+                client_display_name: None,
+                device_id: None,
+                requested_by: None,
+                summary: Some("Busy stale".to_string()),
+            },
+        )
+        .await
+        .expect("create ticket");
+
+        start_helpdesk_ticket(&pool, "agent-stale", &ticket.ticket_id)
+            .await
+            .expect("start ticket");
+
+        sqlx::query(
+            r#"
+            UPDATE helpdesk_agents
+            SET last_heartbeat_at = 0
+            WHERE agent_id = ?1
+            "#,
+        )
+        .bind("agent-stale")
+        .execute(&pool)
+        .await
+        .expect("expire heartbeat");
+
+        let stats = reconcile_helpdesk_runtime(&pool, 1_000, unix_millis_now() as i64)
+            .await
+            .expect("reconcile runtime");
+        assert_eq!(stats.agents_marked_offline, 1);
+        assert_eq!(stats.tickets_failed, 1);
+
+        let ticket_after = get_helpdesk_ticket(&pool, &ticket.ticket_id)
+            .await
+            .expect("get ticket")
+            .expect("ticket exists");
+        let agent_after = get_helpdesk_agent(&pool, "agent-stale")
+            .await
+            .expect("get agent")
+            .expect("agent exists");
+
+        assert_eq!(ticket_after.status, HelpdeskTicketStatus::Failed);
+        assert_eq!(agent_after.status, HelpdeskAgentStatus::Offline);
+        assert_eq!(agent_after.current_ticket_id, None);
+    }
+
+    #[tokio::test]
+    async fn helpdesk_audit_and_summary_are_queryable() {
+        let temp = tempdir().expect("create temp dir");
+        let db_path = temp.path().join("helpdesk-audit-summary.db");
+        let pool = connect_sqlite(&db_path).await.expect("connect sqlite");
+
+        upsert_helpdesk_agent_presence(
+            &pool,
+            &HelpdeskAgentPresenceUpdateV1 {
+                agent_id: "agent-audit".to_string(),
+                display_name: Some("Agent Audit".to_string()),
+                status: HelpdeskAgentStatus::Available,
+            },
+        )
+        .await
+        .expect("upsert agent");
+
+        let ticket = create_helpdesk_ticket(
+            &pool,
+            &HelpdeskTicketCreateRequestV1 {
+                client_id: "client-audit".to_string(),
+                client_display_name: Some("Cliente Audit".to_string()),
+                device_id: Some("device-audit".to_string()),
+                requested_by: None,
+                summary: Some("Resumen".to_string()),
+            },
+        )
+        .await
+        .expect("create ticket");
+
+        start_helpdesk_ticket(&pool, "agent-audit", &ticket.ticket_id)
+            .await
+            .expect("start ticket");
+
+        let audit = list_helpdesk_ticket_audit_events(&pool, &ticket.ticket_id, 50)
+            .await
+            .expect("list audit");
+        assert!(!audit.is_empty());
+        assert!(audit.iter().any(|event| event.event_type == "help_request_created"));
+        assert!(audit.iter().any(|event| event.event_type == "remote_session_started"));
+
+        let summary = get_helpdesk_operational_summary(&pool)
+            .await
+            .expect("get summary");
+        assert_eq!(summary.tickets_in_progress, 1);
+        assert_eq!(summary.agents_busy, 1);
+    }
+
+    #[tokio::test]
+    async fn supervisor_can_requeue_opening_ticket() {
+        let temp = tempdir().expect("create temp dir");
+        let db_path = temp.path().join("helpdesk-requeue.db");
+        let pool = connect_sqlite(&db_path).await.expect("connect sqlite");
+
+        upsert_helpdesk_agent_presence(
+            &pool,
+            &HelpdeskAgentPresenceUpdateV1 {
+                agent_id: "agent-requeue".to_string(),
+                display_name: Some("Agent Requeue".to_string()),
+                status: HelpdeskAgentStatus::Available,
+            },
+        )
+        .await
+        .expect("upsert agent");
+
+        let ticket = create_helpdesk_ticket(
+            &pool,
+            &HelpdeskTicketCreateRequestV1 {
+                client_id: "client-requeue".to_string(),
+                client_display_name: Some("Cliente Requeue".to_string()),
+                device_id: None,
+                requested_by: None,
+                summary: Some("Supervisor requeue".to_string()),
+            },
+        )
+        .await
+        .expect("create ticket");
+
+        let (ticket_after, agent_after) = requeue_helpdesk_ticket(
+            &pool,
+            &ticket.ticket_id,
+            HelpdeskAgentStatus::Available,
+            Some("retry"),
+        )
+        .await
+        .expect("requeue ticket");
+
+        assert_eq!(ticket_after.status, HelpdeskTicketStatus::Queued);
+        assert!(ticket_after.assigned_agent_id.is_none());
+        let agent_after = agent_after.expect("agent after");
+        assert_eq!(agent_after.status, HelpdeskAgentStatus::Available);
+        assert!(agent_after.current_ticket_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn supervisor_can_cancel_in_progress_ticket() {
+        let temp = tempdir().expect("create temp dir");
+        let db_path = temp.path().join("helpdesk-cancel.db");
+        let pool = connect_sqlite(&db_path).await.expect("connect sqlite");
+
+        upsert_helpdesk_agent_presence(
+            &pool,
+            &HelpdeskAgentPresenceUpdateV1 {
+                agent_id: "agent-cancel".to_string(),
+                display_name: Some("Agent Cancel".to_string()),
+                status: HelpdeskAgentStatus::Available,
+            },
+        )
+        .await
+        .expect("upsert agent");
+
+        let ticket = create_helpdesk_ticket(
+            &pool,
+            &HelpdeskTicketCreateRequestV1 {
+                client_id: "client-cancel".to_string(),
+                client_display_name: Some("Cliente Cancel".to_string()),
+                device_id: None,
+                requested_by: None,
+                summary: Some("Supervisor cancel".to_string()),
+            },
+        )
+        .await
+        .expect("create ticket");
+
+        start_helpdesk_ticket(&pool, "agent-cancel", &ticket.ticket_id)
+            .await
+            .expect("start ticket");
+
+        let (ticket_after, agent_after) = cancel_helpdesk_ticket(
+            &pool,
+            &ticket.ticket_id,
+            HelpdeskAgentStatus::Away,
+            Some("operator unavailable"),
+        )
+        .await
+        .expect("cancel ticket");
+
+        assert_eq!(ticket_after.status, HelpdeskTicketStatus::Cancelled);
+        let agent_after = agent_after.expect("agent after");
+        assert_eq!(agent_after.status, HelpdeskAgentStatus::Away);
+        assert!(agent_after.current_ticket_id.is_none());
     }
 }

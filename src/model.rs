@@ -175,6 +175,161 @@ pub struct SessionReportRowV1 {
     pub users: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HelpdeskAgentStatus {
+    Offline,
+    Available,
+    Opening,
+    Busy,
+    Away,
+}
+
+impl HelpdeskAgentStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Offline => "offline",
+            Self::Available => "available",
+            Self::Opening => "opening",
+            Self::Busy => "busy",
+            Self::Away => "away",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HelpdeskTicketStatus {
+    New,
+    Queued,
+    Assigned,
+    Opening,
+    InProgress,
+    Resolved,
+    Cancelled,
+    Failed,
+}
+
+impl HelpdeskTicketStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::New => "new",
+            Self::Queued => "queued",
+            Self::Assigned => "assigned",
+            Self::Opening => "opening",
+            Self::InProgress => "in_progress",
+            Self::Resolved => "resolved",
+            Self::Cancelled => "cancelled",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HelpdeskAgentPresenceUpdateV1 {
+    pub agent_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    pub status: HelpdeskAgentStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HelpdeskAgentV1 {
+    pub agent_id: String,
+    pub display_name: String,
+    pub status: HelpdeskAgentStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_ticket_id: Option<String>,
+    pub last_heartbeat_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HelpdeskTicketCreateRequestV1 {
+    pub client_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_display_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HelpdeskTicketV1 {
+    pub ticket_id: String,
+    pub client_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_display_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    pub status: HelpdeskTicketStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assigned_agent_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub opening_deadline_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HelpdeskAssignmentV1 {
+    pub ticket: HelpdeskTicketV1,
+    pub agent: HelpdeskAgentV1,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HelpdeskAuditEventV1 {
+    pub entity_type: String,
+    pub entity_id: String,
+    pub event_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload: Option<Value>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HelpdeskOperationalSummaryV1 {
+    pub tickets_new: u64,
+    pub tickets_queued: u64,
+    pub tickets_opening: u64,
+    pub tickets_in_progress: u64,
+    pub tickets_resolved: u64,
+    pub tickets_cancelled: u64,
+    pub tickets_failed: u64,
+    pub agents_offline: u64,
+    pub agents_available: u64,
+    pub agents_opening: u64,
+    pub agents_busy: u64,
+    pub agents_away: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HelpdeskAssignmentStartRequestV1 {
+    pub ticket_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HelpdeskTicketResolveRequestV1 {
+    pub agent_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_agent_status: Option<HelpdeskAgentStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HelpdeskTicketSupervisorActionRequestV1 {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_agent_status: Option<HelpdeskAgentStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 impl SessionEventV1 {
     pub fn validate(&self) -> Result<(), EventValidationError> {
         if self.session_id.trim().is_empty() {
@@ -192,12 +347,66 @@ impl SessionEventV1 {
     }
 }
 
+impl HelpdeskAgentPresenceUpdateV1 {
+    pub fn validate(&self) -> Result<(), EventValidationError> {
+        if self.agent_id.trim().is_empty() {
+            return Err(EventValidationError::EmptyField("agent_id"));
+        }
+        Ok(())
+    }
+}
+
+impl HelpdeskTicketCreateRequestV1 {
+    pub fn validate(&self) -> Result<(), EventValidationError> {
+        if self.client_id.trim().is_empty() {
+            return Err(EventValidationError::EmptyField("client_id"));
+        }
+        Ok(())
+    }
+}
+
+impl HelpdeskAssignmentStartRequestV1 {
+    pub fn validate(&self) -> Result<(), EventValidationError> {
+        if self.ticket_id.trim().is_empty() {
+            return Err(EventValidationError::EmptyField("ticket_id"));
+        }
+        Ok(())
+    }
+}
+
+impl HelpdeskTicketResolveRequestV1 {
+    pub fn validate(&self) -> Result<(), EventValidationError> {
+        if self.agent_id.trim().is_empty() {
+            return Err(EventValidationError::EmptyField("agent_id"));
+        }
+        if let Some(status) = self.next_agent_status {
+            if !matches!(status, HelpdeskAgentStatus::Available | HelpdeskAgentStatus::Away) {
+                return Err(EventValidationError::InvalidHelpdeskAgentTerminalStatus);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl HelpdeskTicketSupervisorActionRequestV1 {
+    pub fn validate(&self) -> Result<(), EventValidationError> {
+        if let Some(status) = self.next_agent_status {
+            if !matches!(status, HelpdeskAgentStatus::Available | HelpdeskAgentStatus::Away) {
+                return Err(EventValidationError::InvalidHelpdeskAgentTerminalStatus);
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum EventValidationError {
     #[error("the field '{0}' cannot be empty")]
     EmptyField(&'static str),
     #[error("meta field must be a JSON object")]
     MetaMustBeObject,
+    #[error("next_agent_status must be either 'available' or 'away'")]
+    InvalidHelpdeskAgentTerminalStatus,
 }
 
 #[cfg(test)]
