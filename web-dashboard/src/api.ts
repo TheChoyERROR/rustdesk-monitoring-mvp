@@ -2,6 +2,10 @@ import type {
   AuthLoginRequest,
   AuthLoginResponse,
   DashboardSummary,
+  HelpdeskAuditEvent,
+  HelpdeskAgent,
+  HelpdeskOperationalSummary,
+  HelpdeskTicket,
   PaginatedResponse,
   PresenceSessionSummary,
   SessionPresence,
@@ -125,6 +129,78 @@ export async function apiSessionPresence(sessionId: string): Promise<SessionPres
 export async function apiPresenceSessions(): Promise<PresenceSessionSummary[]> {
   const response = await request<{ sessions: PresenceSessionSummary[] }>('/api/v1/sessions/presence');
   return response.sessions;
+}
+
+export async function apiHelpdeskSummary(): Promise<HelpdeskOperationalSummary> {
+  const response = await request<{ summary: HelpdeskOperationalSummary }>('/api/v1/helpdesk/summary');
+  return response.summary;
+}
+
+export async function apiHelpdeskAgents(): Promise<HelpdeskAgent[]> {
+  const response = await request<{ agents: HelpdeskAgent[] }>('/api/v1/helpdesk/agents');
+  return response.agents;
+}
+
+export async function apiHelpdeskTickets(): Promise<HelpdeskTicket[]> {
+  const response = await request<{ tickets: HelpdeskTicket[] }>('/api/v1/helpdesk/tickets');
+  return response.tickets;
+}
+
+export async function apiHelpdeskTicket(ticketId: string): Promise<HelpdeskTicket | null> {
+  try {
+    const response = await request<{ ticket: HelpdeskTicket }>(
+      `/api/v1/helpdesk/tickets/${encodeURIComponent(ticketId)}`,
+    );
+    return response.ticket;
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 404) {
+      return null;
+    }
+    throw error;
+  }
+}
+
+export async function apiHelpdeskTicketAudit(
+  ticketId: string,
+  limit = 100,
+): Promise<HelpdeskAuditEvent[]> {
+  const response = await request<{ events: HelpdeskAuditEvent[] }>(
+    `/api/v1/helpdesk/tickets/${encodeURIComponent(ticketId)}/audit${buildQuery({ limit })}`,
+  );
+  return response.events;
+}
+
+interface HelpdeskSupervisorActionBody {
+  next_agent_status?: 'available' | 'away';
+  reason?: string;
+}
+
+export async function apiHelpdeskTicketRequeue(
+  ticketId: string,
+  body: HelpdeskSupervisorActionBody,
+): Promise<HelpdeskTicket | null> {
+  const response = await request<{ ticket: HelpdeskTicket | null }>(
+    `/api/v1/helpdesk/tickets/${encodeURIComponent(ticketId)}/requeue`,
+    {
+      method: 'POST',
+      body: JSON.stringify(body),
+    },
+  );
+  return response.ticket;
+}
+
+export async function apiHelpdeskTicketCancel(
+  ticketId: string,
+  body: HelpdeskSupervisorActionBody,
+): Promise<HelpdeskTicket | null> {
+  const response = await request<{ ticket: HelpdeskTicket | null }>(
+    `/api/v1/helpdesk/tickets/${encodeURIComponent(ticketId)}/cancel`,
+    {
+      method: 'POST',
+      body: JSON.stringify(body),
+    },
+  );
+  return response.ticket;
 }
 
 export function sessionPresenceStreamUrl(sessionId: string): string {

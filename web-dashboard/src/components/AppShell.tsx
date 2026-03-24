@@ -28,6 +28,7 @@ export default function AppShell() {
 
       <nav className="app-nav">
         <Link to="/">Resumen</Link>
+        <Link to="/helpdesk">Helpdesk</Link>
         <Link to="/sessions">Sesiones</Link>
       </nav>
 

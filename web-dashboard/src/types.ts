@@ -81,3 +81,60 @@ export interface PresenceSessionSummary {
   active_participants: number;
   updated_at: string;
 }
+
+export type HelpdeskAgentStatus = 'offline' | 'available' | 'opening' | 'busy' | 'away';
+
+export type HelpdeskTicketStatus =
+  | 'new'
+  | 'queued'
+  | 'opening'
+  | 'in_progress'
+  | 'resolved'
+  | 'cancelled'
+  | 'failed';
+
+export interface HelpdeskAgent {
+  agent_id: string;
+  display_name: string;
+  status: HelpdeskAgentStatus;
+  current_ticket_id?: string | null;
+  last_heartbeat_at: string;
+  updated_at: string;
+}
+
+export interface HelpdeskTicket {
+  ticket_id: string;
+  client_id: string;
+  client_display_name?: string | null;
+  device_id?: string | null;
+  requested_by?: string | null;
+  summary?: string | null;
+  status: HelpdeskTicketStatus;
+  assigned_agent_id?: string | null;
+  opening_deadline_at?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface HelpdeskOperationalSummary {
+  tickets_new: number;
+  tickets_queued: number;
+  tickets_opening: number;
+  tickets_in_progress: number;
+  tickets_resolved: number;
+  tickets_cancelled: number;
+  tickets_failed: number;
+  agents_offline: number;
+  agents_available: number;
+  agents_opening: number;
+  agents_busy: number;
+  agents_away: number;
+}
+
+export interface HelpdeskAuditEvent {
+  entity_type: string;
+  entity_id: string;
+  event_type: string;
+  payload?: Record<string, unknown> | null;
+  created_at: string;
+}
