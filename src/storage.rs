@@ -2371,7 +2371,7 @@ pub async fn query_timeline_events(
     page: u64,
     page_size: u64,
 ) -> anyhow::Result<(Vec<SessionTimelineItemV1>, u64)> {
-    let page_size = page_size.clamp(1, 200);
+    let page_size = page_size.clamp(1, 500);
     let offset = page.saturating_sub(1).saturating_mul(page_size);
 
     let mut count_qb =

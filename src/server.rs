@@ -32,7 +32,7 @@ use crate::model::{
 };
 use crate::storage::{
     assign_helpdesk_ticket, claim_due_events, cleanup_expired_dashboard_sessions,
-    cleanup_failed_older_than, connect_sqlite, cancel_helpdesk_ticket, create_dashboard_session,
+    cleanup_failed_older_than, connect_sqlite, cancel_helpdesk_ticket,
     create_helpdesk_ticket, delete_dashboard_session, get_dashboard_session_by_token,
     get_dashboard_summary, get_dashboard_user_by_username, get_helpdesk_assignment_for_agent,
     get_helpdesk_operational_summary, get_helpdesk_ticket, get_session_presence, insert_event,
@@ -687,34 +687,30 @@ async fn auth_login_handler(
     }
 
     let now = Utc::now();
-    let ttl_minutes = i64::try_from(state.auth.session_ttl_minutes).unwrap_or(480);
-    let expires_at = now + ChronoDuration::minutes(ttl_minutes.max(1));
-    let session_token = auth::new_session_token();
+    let response_user = AuthUserV1 {
+        id: user_record.id,
+        username: user_record.username,
+        role: user_record.role,
+    };
+    let expires_at = now + ChronoDuration::minutes(session_ttl_minutes(&state.auth));
+    let session_token = match auth::issue_dashboard_session_token(&state.auth, &response_user, expires_at) {
+        Ok(token) => token,
+        Err(err) => {
+            error!(error = %err, username, "failed to issue dashboard session token");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                jar,
+                Json(json!({ "error": "internal_error" })),
+            )
+                .into_response();
+        }
+    };
 
-    if let Err(err) = create_dashboard_session(&state.pool, &session_token, user_record.id, expires_at).await {
-        error!(error = %err, username, "failed to create dashboard session");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            jar,
-            Json(json!({ "error": "internal_error" })),
-        )
-            .into_response();
-    }
-
-    let cookie = Cookie::build((DASHBOARD_SESSION_COOKIE, session_token.clone()))
-        .http_only(true)
-        .same_site(SameSite::Lax)
-        .secure(state.auth.cookie_secure)
-        .path("/")
-        .build();
+    let cookie = build_dashboard_session_cookie(&state.auth, session_token, expires_at);
     let jar = jar.add(cookie);
 
     let response = AuthLoginResponseV1 {
-        user: AuthUserV1 {
-            id: user_record.id,
-            username: user_record.username,
-            role: user_record.role,
-        },
+        user: response_user,
         expires_at,
     };
 
@@ -954,21 +950,43 @@ async fn require_dashboard_auth(
     };
 
     let now = Utc::now();
-    let session_record = match get_dashboard_session_by_token(&state.pool, &session_token, now).await {
-        Ok(Some(record)) => record,
-        Ok(None) => return unauthorized(),
-        Err(err) => {
-            error!(error = %err, "failed to validate dashboard session");
-            return internal_error();
+    let authenticated_user = if let Some(signed_session) =
+        auth::verify_dashboard_session_token(&state.auth, &session_token, now)
+    {
+        signed_session.user
+    } else {
+        match get_dashboard_session_by_token(&state.pool, &session_token, now).await {
+            Ok(Some(record)) => record.user,
+            Ok(None) => return unauthorized(),
+            Err(err) => {
+                error!(error = %err, "failed to validate dashboard session");
+                return internal_error();
+            }
         }
     };
 
+    let refreshed_expires_at = now + ChronoDuration::minutes(session_ttl_minutes(&state.auth));
+    let refreshed_token =
+        match auth::issue_dashboard_session_token(&state.auth, &authenticated_user, refreshed_expires_at) {
+            Ok(token) => token,
+            Err(err) => {
+                error!(error = %err, "failed to refresh dashboard session token");
+                return internal_error();
+            }
+        };
+
     request.extensions_mut().insert(AuthContext {
-        user: session_record.user,
-        expires_at: session_record.expires_at,
+        user: authenticated_user,
+        expires_at: refreshed_expires_at,
     });
 
-    next.run(request).await
+    let response = next.run(request).await;
+    let jar = CookieJar::new().add(build_dashboard_session_cookie(
+        &state.auth,
+        refreshed_token,
+        refreshed_expires_at,
+    ));
+    (jar, response).into_response()
 }
 
 async fn list_presence_sessions_handler(State(state): State<AppState>) -> impl IntoResponse {
@@ -1144,6 +1162,23 @@ fn find_cookie_value(cookie_header: &str, cookie_name: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn session_ttl_minutes(auth: &AuthSettings) -> i64 {
+    i64::try_from(auth.session_ttl_minutes).unwrap_or(480).max(1)
+}
+
+fn build_dashboard_session_cookie(
+    auth: &AuthSettings,
+    session_token: String,
+    _expires_at: DateTime<Utc>,
+) -> Cookie<'static> {
+    Cookie::build((DASHBOARD_SESSION_COOKIE, session_token))
+        .http_only(true)
+        .same_site(SameSite::Lax)
+        .secure(auth.cookie_secure)
+        .path("/")
+        .build()
 }
 
 fn parse_optional_datetime(raw: Option<&str>, default: DateTime<Utc>) -> Result<DateTime<Utc>, String> {

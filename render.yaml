@@ -12,6 +12,8 @@ services:
         value: supervisor
       - key: DASHBOARD_SUPERVISOR_PASSWORD
         sync: false
+      - key: DASHBOARD_SESSION_TTL_MINUTES
+        value: "1440"
       - key: DASHBOARD_COOKIE_SECURE
         value: "true"
       - key: RUST_LOG

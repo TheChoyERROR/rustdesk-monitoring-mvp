@@ -375,6 +375,34 @@ th {
   font-size: 0.85rem;
 }
 
+.session-timeline-chart {
+  width: 100%;
+  min-height: 460px;
+  margin-top: 1rem;
+}
+
+.user-summary-grid {
+  display: grid;
+  gap: 0.8rem;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+}
+
+.user-summary-card {
+  border: 1px solid var(--border);
+  border-radius: 0.9rem;
+  padding: 0.95rem;
+  background: linear-gradient(180deg, #fffdf8 0%, #f5f1e8 100%);
+  box-shadow: var(--shadow);
+  display: grid;
+  gap: 0.7rem;
+}
+
+.user-summary-header {
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+}
+
 .activity-sparkline-wrap {
   border: 1px solid var(--border);
   border-radius: 0.55rem;

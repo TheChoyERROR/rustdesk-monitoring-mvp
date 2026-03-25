@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 
+import SessionActivityChart from '../components/SessionActivityChart';
 import { apiEvents, sessionsCsvUrl } from '../api';
+import { buildSessionActivityTimeline } from '../lib/session-activity';
 import { formatDateTime, fromLocalInputValue, toLocalInputValue } from '../lib/time';
 import type { PaginatedResponse, SessionEventType, SessionTimelineItem } from '../types';
 
@@ -16,6 +18,9 @@ const EVENT_TYPES: SessionEventType[] = [
   'participant_activity',
 ];
 
+const EVENTS_PER_PAGE = 200;
+const RAW_TABLE_ROWS = 25;
+
 function initialRange() {
   const to = new Date();
   const from = new Date(to.getTime() - 24 * 60 * 60 * 1000);
@@ -25,7 +30,12 @@ function initialRange() {
   };
 }
 
+function hasAvatarUrl(value: string | null | undefined): value is string {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
 export default function SessionsPage() {
+  const navigate = useNavigate();
   const range = useMemo(initialRange, []);
   const [sessionId, setSessionId] = useState('');
   const [userId, setUserId] = useState('');
@@ -37,39 +47,47 @@ export default function SessionsPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  const load = useCallback(async (targetPage = page) => {
-    setLoading(true);
-    setError(null);
+  const load = useCallback(
+    async (targetPage = page) => {
+      setLoading(true);
+      setError(null);
 
-    try {
-      const payload = await apiEvents({
-        session_id: sessionId || undefined,
-        user_id: userId || undefined,
-        event_type: (eventType || undefined) as SessionEventType | undefined,
-        from: fromLocalInputValue(from),
-        to: fromLocalInputValue(to),
-        page: targetPage,
-        page_size: 25,
-      });
-      setResult(payload);
-      setPage(targetPage);
-    } catch {
-      setError('No se pudo cargar el listado de eventos.');
-    } finally {
-      setLoading(false);
-    }
-  }, [eventType, from, page, sessionId, to, userId]);
+      try {
+        const payload = await apiEvents({
+          session_id: sessionId || undefined,
+          user_id: userId || undefined,
+          event_type: (eventType || undefined) as SessionEventType | undefined,
+          from: fromLocalInputValue(from),
+          to: fromLocalInputValue(to),
+          page: targetPage,
+          page_size: EVENTS_PER_PAGE,
+        });
+        setResult(payload);
+        setPage(targetPage);
+      } catch {
+        setError('No se pudo cargar el listado de eventos.');
+      } finally {
+        setLoading(false);
+      }
+    },
+    [eventType, from, page, sessionId, to, userId],
+  );
 
   useEffect(() => {
     void load(1);
   }, [load]);
 
   const csvUrl = sessionsCsvUrl(fromLocalInputValue(from), fromLocalInputValue(to), userId || undefined);
+  const activityTimeline = useMemo(
+    () => buildSessionActivityTimeline(result?.items ?? [], result?.total ?? 0),
+    [result],
+  );
+  const latestEvents = result?.items.slice(0, RAW_TABLE_ROWS) ?? [];
 
   return (
     <section className="stack">
       <div className="panel">
-        <h2>Busqueda de sesiones/eventos</h2>
+        <h2>Busqueda de sesiones y actividad</h2>
         <div className="filter-grid">
           <div>
             <label htmlFor="session-id">Session ID</label>
@@ -112,8 +130,96 @@ export default function SessionsPage() {
       {loading && <div className="panel">Cargando...</div>}
       {error && <div className="panel error-text">{error}</div>}
 
+      {activityTimeline && (
+        <>
+          <div className="cards-grid">
+            <article className="card-accent">
+              <h3>Usuarios en timeline</h3>
+              <strong>{activityTimeline.users.length}</strong>
+            </article>
+            <article className="card-accent">
+              <h3>Sesiones visibles</h3>
+              <strong>{activityTimeline.totalSessions}</strong>
+            </article>
+            <article className="card-muted">
+              <h3>Eventos cargados</h3>
+              <strong>{activityTimeline.totalEventsLoaded}</strong>
+            </article>
+            <article className="card-muted">
+              <h3>Eventos totales filtro</h3>
+              <strong>{activityTimeline.totalEventsMatching}</strong>
+            </article>
+          </div>
+
+          <div className="panel">
+            <div className="dashboard-section-header">
+              <div>
+                <h3>Timeline visual por usuario</h3>
+                <p className="activity-summary-line">
+                  Cada barra representa un tramo de actividad por usuario y sesion. Haz clic en una barra para abrir
+                  el detalle completo.
+                </p>
+                <p className="activity-summary-line">
+                  Ventana: {formatDateTime(activityTimeline.rangeStartIso)} -{' '}
+                  {formatDateTime(activityTimeline.rangeEndIso)}
+                </p>
+                {activityTimeline.truncated ? (
+                  <p className="activity-summary-line">
+                    Se muestran los {activityTimeline.totalEventsLoaded} eventos mas recientes de esta pagina. Ajusta
+                    el rango para una lectura mas precisa.
+                  </p>
+                ) : null}
+              </div>
+            </div>
+            <SessionActivityChart
+              model={activityTimeline}
+              onSelectSession={(nextSessionId) => navigate(`/sessions/${encodeURIComponent(nextSessionId)}`)}
+            />
+          </div>
+
+          <div className="user-summary-grid">
+            {activityTimeline.users.map((user) => (
+              <article key={user.userId} className="user-summary-card">
+                <div className="user-summary-header">
+                  {hasAvatarUrl(user.avatarUrl) ? (
+                    <img
+                      src={user.avatarUrl}
+                      alt={`Avatar de ${user.displayName}`}
+                      className="participant-avatar"
+                      loading="lazy"
+                    />
+                  ) : (
+                    <div className="participant-avatar-fallback" aria-hidden="true">
+                      {(user.displayName.charAt(0) || user.userId.charAt(0) || '?').toUpperCase()}
+                    </div>
+                  )}
+                  <div>
+                    <h3>{user.displayName}</h3>
+                    <p className="table-subtle">{user.userId}</p>
+                  </div>
+                </div>
+                <div className="activity-user-stats">
+                  <p>Total eventos: {user.totalEvents}</p>
+                  <p>Sesiones: {user.sessionCount}</p>
+                  <p>Ultimo evento: {formatDateTime(user.lastEventAt)}</p>
+                </div>
+              </article>
+            ))}
+          </div>
+        </>
+      )}
+
       {result && (
         <div className="panel">
+          <div className="dashboard-section-header">
+            <div>
+              <h3>Eventos recientes</h3>
+              <p className="activity-summary-line">
+                Tabla reducida para auditoria puntual. La lectura principal ahora esta en el timeline visual.
+              </p>
+            </div>
+          </div>
+
           <table>
             <thead>
               <tr>
@@ -126,7 +232,7 @@ export default function SessionsPage() {
               </tr>
             </thead>
             <tbody>
-              {result.items.map((item) => (
+              {latestEvents.map((item) => (
                 <tr key={item.event_id}>
                   <td>{formatDateTime(item.timestamp)}</td>
                   <td>{item.event_type}</td>
@@ -151,7 +257,8 @@ export default function SessionsPage() {
               Anterior
             </button>
             <span>
-              Pagina {result.page} - Total {result.total}
+              Pagina {result.page} - Total {result.total} - Mostrando {latestEvents.length} de {result.items.length}{' '}
+              eventos cargados
             </span>
             <button
               type="button"
