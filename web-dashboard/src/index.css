@@ -476,6 +476,12 @@ th {
   margin-top: 0.18rem;
 }
 
+.table-identity {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+}
+
 .detail-grid {
   display: grid;
   gap: 1rem;

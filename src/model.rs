@@ -230,6 +230,8 @@ pub struct HelpdeskAgentPresenceUpdateV1 {
     pub agent_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avatar_url: Option<String>,
     pub status: HelpdeskAgentStatus,
 }
 
@@ -237,6 +239,8 @@ pub struct HelpdeskAgentPresenceUpdateV1 {
 pub struct HelpdeskAgentV1 {
     pub agent_id: String,
     pub display_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avatar_url: Option<String>,
     pub status: HelpdeskAgentStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_ticket_id: Option<String>,
@@ -380,7 +384,10 @@ impl HelpdeskTicketResolveRequestV1 {
             return Err(EventValidationError::EmptyField("agent_id"));
         }
         if let Some(status) = self.next_agent_status {
-            if !matches!(status, HelpdeskAgentStatus::Available | HelpdeskAgentStatus::Away) {
+            if !matches!(
+                status,
+                HelpdeskAgentStatus::Available | HelpdeskAgentStatus::Away
+            ) {
                 return Err(EventValidationError::InvalidHelpdeskAgentTerminalStatus);
             }
         }
@@ -391,7 +398,10 @@ impl HelpdeskTicketResolveRequestV1 {
 impl HelpdeskTicketSupervisorActionRequestV1 {
     pub fn validate(&self) -> Result<(), EventValidationError> {
         if let Some(status) = self.next_agent_status {
-            if !matches!(status, HelpdeskAgentStatus::Available | HelpdeskAgentStatus::Away) {
+            if !matches!(
+                status,
+                HelpdeskAgentStatus::Available | HelpdeskAgentStatus::Away
+            ) {
                 return Err(EventValidationError::InvalidHelpdeskAgentTerminalStatus);
             }
         }

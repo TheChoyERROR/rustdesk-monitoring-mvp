@@ -63,6 +63,22 @@ function statusClass(status: HelpdeskTicketStatus | HelpdeskAgentStatus) {
   }
 }
 
+function agentName(agent: HelpdeskAgent): string {
+  const displayName = agent.display_name?.trim();
+  if (displayName) {
+    return displayName;
+  }
+  return agent.agent_id;
+}
+
+function agentInitial(agent: HelpdeskAgent): string {
+  return agentName(agent).charAt(0).toUpperCase();
+}
+
+function hasAvatarUrl(agent: HelpdeskAgent): agent is HelpdeskAgent & { avatar_url: string } {
+  return typeof agent.avatar_url === 'string' && agent.avatar_url.trim().length > 0;
+}
+
 export default function HelpdeskPage() {
   const [summary, setSummary] = useState<HelpdeskOperationalSummary | null>(null);
   const [agents, setAgents] = useState<HelpdeskAgent[]>([]);
@@ -72,6 +88,7 @@ export default function HelpdeskPage() {
   const [error, setError] = useState<string | null>(null);
   const [ticketFilter, setTicketFilter] = useState<'all' | HelpdeskTicketStatus>('all');
   const [agentFilter, setAgentFilter] = useState<'all' | HelpdeskAgentStatus>('all');
+  const [failedAvatarIds, setFailedAvatarIds] = useState<Record<string, boolean>>({});
 
   const load = useCallback(async (background = false) => {
     if (background) {
@@ -89,6 +106,7 @@ export default function HelpdeskPage() {
       setSummary(summaryData);
       setAgents(agentsData);
       setTickets(ticketsData);
+      setFailedAvatarIds({});
     } catch {
       setError('No se pudo cargar el modulo helpdesk.');
     } finally {
@@ -232,8 +250,30 @@ export default function HelpdeskPage() {
               {filteredAgents.map((agent) => (
                 <tr key={agent.agent_id}>
                   <td>
-                    <strong>{agent.display_name || agent.agent_id}</strong>
-                    <div className="table-subtle">{agent.agent_id}</div>
+                    <div className="table-identity">
+                      {hasAvatarUrl(agent) && !failedAvatarIds[agent.agent_id] ? (
+                        <img
+                          src={agent.avatar_url}
+                          alt={`Avatar de ${agentName(agent)}`}
+                          className="participant-avatar"
+                          loading="lazy"
+                          onError={() => {
+                            setFailedAvatarIds((prev) => ({
+                              ...prev,
+                              [agent.agent_id]: true,
+                            }));
+                          }}
+                        />
+                      ) : (
+                        <div className="participant-avatar-fallback" aria-hidden="true">
+                          {agentInitial(agent)}
+                        </div>
+                      )}
+                      <div>
+                        <strong>{agentName(agent)}</strong>
+                        <div className="table-subtle">{agent.agent_id}</div>
+                      </div>
+                    </div>
                   </td>
                   <td>
                     <span className={`status-pill ${statusClass(agent.status)}`}>

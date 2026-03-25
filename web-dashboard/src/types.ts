@@ -96,6 +96,7 @@ export type HelpdeskTicketStatus =
 export interface HelpdeskAgent {
   agent_id: string;
   display_name: string;
+  avatar_url?: string | null;
   status: HelpdeskAgentStatus;
   current_ticket_id?: string | null;
   last_heartbeat_at: string;
