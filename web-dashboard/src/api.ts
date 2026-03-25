@@ -132,8 +132,7 @@ export async function apiPresenceSessions(): Promise<PresenceSessionSummary[]> {
 }
 
 export async function apiHelpdeskSummary(): Promise<HelpdeskOperationalSummary> {
-  const response = await request<{ summary: HelpdeskOperationalSummary }>('/api/v1/helpdesk/summary');
-  return response.summary;
+  return request<HelpdeskOperationalSummary>('/api/v1/helpdesk/summary');
 }
 
 export async function apiHelpdeskAgents(): Promise<HelpdeskAgent[]> {
@@ -144,6 +143,23 @@ export async function apiHelpdeskAgents(): Promise<HelpdeskAgent[]> {
 export async function apiHelpdeskTickets(): Promise<HelpdeskTicket[]> {
   const response = await request<{ tickets: HelpdeskTicket[] }>('/api/v1/helpdesk/tickets');
   return response.tickets;
+}
+
+export interface HelpdeskCreateTicketBody {
+  client_id: string;
+  client_display_name?: string;
+  device_id?: string;
+  requested_by?: string;
+  summary?: string;
+  preferred_agent_id?: string;
+}
+
+export async function apiHelpdeskCreateTicket(body: HelpdeskCreateTicketBody): Promise<HelpdeskTicket> {
+  const response = await request<{ ticket: HelpdeskTicket }>('/api/v1/helpdesk/tickets', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+  return response.ticket;
 }
 
 export async function apiHelpdeskTicket(ticketId: string): Promise<HelpdeskTicket | null> {
@@ -173,6 +189,25 @@ export async function apiHelpdeskTicketAudit(
 interface HelpdeskSupervisorActionBody {
   next_agent_status?: 'available' | 'away';
   reason?: string;
+}
+
+interface HelpdeskTicketAssignBody {
+  agent_id?: string;
+  reason?: string;
+}
+
+export async function apiHelpdeskTicketAssign(
+  ticketId: string,
+  body: HelpdeskTicketAssignBody,
+): Promise<HelpdeskTicket> {
+  const response = await request<{ ticket: HelpdeskTicket }>(
+    `/api/v1/helpdesk/tickets/${encodeURIComponent(ticketId)}/assign`,
+    {
+      method: 'POST',
+      body: JSON.stringify(body),
+    },
+  );
+  return response.ticket;
 }
 
 export async function apiHelpdeskTicketRequeue(

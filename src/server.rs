@@ -26,21 +26,22 @@ use crate::config::ServerConfig;
 use crate::metrics::Metrics;
 use crate::model::{
     AuthLoginRequestV1, AuthLoginResponseV1, AuthRoleV1, AuthUserV1, HelpdeskAgentPresenceUpdateV1,
-    HelpdeskAssignmentStartRequestV1, HelpdeskTicketCreateRequestV1, HelpdeskTicketResolveRequestV1,
-    HelpdeskTicketSupervisorActionRequestV1, HelpdeskAgentStatus, PaginatedResponseV1, SessionEventType,
-    SessionEventV1,
+    HelpdeskAssignmentStartRequestV1, HelpdeskTicketAssignRequestV1, HelpdeskTicketCreateRequestV1,
+    HelpdeskTicketResolveRequestV1, HelpdeskTicketSupervisorActionRequestV1, HelpdeskAgentStatus,
+    PaginatedResponseV1, SessionEventType, SessionEventV1,
 };
 use crate::storage::{
-    claim_due_events, cleanup_expired_dashboard_sessions, cleanup_failed_older_than, connect_sqlite,
-    cancel_helpdesk_ticket, create_dashboard_session, create_helpdesk_ticket, delete_dashboard_session,
-    get_dashboard_session_by_token, get_dashboard_summary, get_dashboard_user_by_username,
-    get_helpdesk_assignment_for_agent, get_helpdesk_operational_summary, get_helpdesk_ticket,
-    get_session_presence, insert_event, list_active_session_presence, list_helpdesk_agents,
-    list_helpdesk_ticket_audit_events, list_helpdesk_tickets, mark_delivered, mark_failed,
-    query_session_report_rows, query_session_timeline, query_timeline_events, reconcile_helpdesk_runtime,
-    requeue_helpdesk_ticket, reset_stuck_processing, resolve_helpdesk_ticket, schedule_retry,
-    start_helpdesk_ticket, unix_millis_now, upsert_dashboard_user, upsert_helpdesk_agent_presence,
-    EventQueryFilter, InsertOutcome, OutboxRecord, expire_stale_presence,
+    assign_helpdesk_ticket, claim_due_events, cleanup_expired_dashboard_sessions,
+    cleanup_failed_older_than, connect_sqlite, cancel_helpdesk_ticket, create_dashboard_session,
+    create_helpdesk_ticket, delete_dashboard_session, get_dashboard_session_by_token,
+    get_dashboard_summary, get_dashboard_user_by_username, get_helpdesk_assignment_for_agent,
+    get_helpdesk_operational_summary, get_helpdesk_ticket, get_session_presence, insert_event,
+    list_active_session_presence, list_helpdesk_agents, list_helpdesk_ticket_audit_events,
+    list_helpdesk_tickets, mark_delivered, mark_failed, query_session_report_rows,
+    query_session_timeline, query_timeline_events, reconcile_helpdesk_runtime, requeue_helpdesk_ticket,
+    reset_stuck_processing, resolve_helpdesk_ticket, schedule_retry, start_helpdesk_ticket,
+    unix_millis_now, upsert_dashboard_user, upsert_helpdesk_agent_presence, EventQueryFilter,
+    InsertOutcome, OutboxRecord, expire_stale_presence,
 };
 use crate::webhook::WebhookDispatcher;
 
@@ -177,6 +178,10 @@ pub async fn run(bind_addr: &str, database_path: &Path, config: ServerConfig) ->
         )
         .route("/api/v1/helpdesk/tickets", get(list_helpdesk_tickets_handler).post(create_helpdesk_ticket_handler))
         .route("/api/v1/helpdesk/tickets/:ticket_id", get(get_helpdesk_ticket_handler))
+        .route(
+            "/api/v1/helpdesk/tickets/:ticket_id/assign",
+            post(assign_helpdesk_ticket_handler),
+        )
         .route(
             "/api/v1/helpdesk/tickets/:ticket_id/audit",
             get(list_helpdesk_ticket_audit_handler),
@@ -478,6 +483,48 @@ async fn create_helpdesk_ticket_handler(
         Err(err) => {
             error!(error = %err, client_id = payload.client_id, "failed to create helpdesk ticket");
             internal_error()
+        }
+    }
+}
+
+async fn assign_helpdesk_ticket_handler(
+    State(state): State<AppState>,
+    AxumPath(ticket_id): AxumPath<String>,
+    Json(payload): Json<HelpdeskTicketAssignRequestV1>,
+) -> impl IntoResponse {
+    let ticket_id = ticket_id.trim().to_string();
+    if ticket_id.is_empty() {
+        return bad_request("ticket_id cannot be empty");
+    }
+
+    if let Err(validation_error) = payload.validate() {
+        return bad_request(validation_error.to_string());
+    }
+
+    match assign_helpdesk_ticket(
+        &state.pool,
+        &ticket_id,
+        payload.agent_id.as_deref(),
+        payload.reason.as_deref(),
+    )
+    .await
+    {
+        Ok((ticket, agent)) => (
+            StatusCode::OK,
+            Json(json!({
+                "ticket": ticket,
+                "agent": agent,
+            })),
+        )
+            .into_response(),
+        Err(err) => {
+            error!(
+                error = %err,
+                ticket_id,
+                agent_id = payload.agent_id,
+                "failed to assign helpdesk ticket"
+            );
+            bad_request(err.to_string())
         }
     }
 }

@@ -259,6 +259,8 @@ pub struct HelpdeskTicketCreateRequestV1 {
     pub requested_by: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preferred_agent_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -320,6 +322,14 @@ pub struct HelpdeskAssignmentStartRequestV1 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HelpdeskTicketAssignRequestV1 {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HelpdeskTicketResolveRequestV1 {
     pub agent_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -365,6 +375,11 @@ impl HelpdeskTicketCreateRequestV1 {
         if self.client_id.trim().is_empty() {
             return Err(EventValidationError::EmptyField("client_id"));
         }
+        if let Some(preferred_agent_id) = &self.preferred_agent_id {
+            if preferred_agent_id.trim().is_empty() {
+                return Err(EventValidationError::EmptyField("preferred_agent_id"));
+            }
+        }
         Ok(())
     }
 }
@@ -373,6 +388,17 @@ impl HelpdeskAssignmentStartRequestV1 {
     pub fn validate(&self) -> Result<(), EventValidationError> {
         if self.ticket_id.trim().is_empty() {
             return Err(EventValidationError::EmptyField("ticket_id"));
+        }
+        Ok(())
+    }
+}
+
+impl HelpdeskTicketAssignRequestV1 {
+    pub fn validate(&self) -> Result<(), EventValidationError> {
+        if let Some(agent_id) = &self.agent_id {
+            if agent_id.trim().is_empty() {
+                return Err(EventValidationError::EmptyField("agent_id"));
+            }
         }
         Ok(())
     }

@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState, type FormEvent } from 'react';
 import { Link } from 'react-router-dom';
 
-import { apiHelpdeskAgents, apiHelpdeskSummary, apiHelpdeskTickets } from '../api';
+import { apiHelpdeskAgents, apiHelpdeskCreateTicket, apiHelpdeskSummary, apiHelpdeskTickets } from '../api';
 import { formatDateTime } from '../lib/time';
 import type {
   HelpdeskAgent,
@@ -79,6 +79,13 @@ function hasAvatarUrl(agent: HelpdeskAgent): agent is HelpdeskAgent & { avatar_u
   return typeof agent.avatar_url === 'string' && agent.avatar_url.trim().length > 0;
 }
 
+type CreateFeedback =
+  | {
+      tone: 'success' | 'error';
+      message: string;
+    }
+  | null;
+
 export default function HelpdeskPage() {
   const [summary, setSummary] = useState<HelpdeskOperationalSummary | null>(null);
   const [agents, setAgents] = useState<HelpdeskAgent[]>([]);
@@ -89,6 +96,14 @@ export default function HelpdeskPage() {
   const [ticketFilter, setTicketFilter] = useState<'all' | HelpdeskTicketStatus>('all');
   const [agentFilter, setAgentFilter] = useState<'all' | HelpdeskAgentStatus>('all');
   const [failedAvatarIds, setFailedAvatarIds] = useState<Record<string, boolean>>({});
+  const [createBusy, setCreateBusy] = useState(false);
+  const [createFeedback, setCreateFeedback] = useState<CreateFeedback>(null);
+  const [createForm, setCreateForm] = useState({
+    clientId: '',
+    clientDisplayName: '',
+    summary: '',
+    preferredAgentId: 'auto',
+  });
 
   const load = useCallback(async (background = false) => {
     if (background) {
@@ -134,9 +149,89 @@ export default function HelpdeskPage() {
     return agents.filter((agent) => agentFilter === 'all' || agent.status === agentFilter);
   }, [agentFilter, agents]);
 
+  const availableAgents = useMemo(() => {
+    return agents.filter((agent) => agent.status === 'available');
+  }, [agents]);
+
+  useEffect(() => {
+    if (
+      createForm.preferredAgentId !== 'auto' &&
+      !availableAgents.some((agent) => agent.agent_id === createForm.preferredAgentId)
+    ) {
+      setCreateForm((current) => ({ ...current, preferredAgentId: 'auto' }));
+    }
+  }, [availableAgents, createForm.preferredAgentId]);
+
   const activeQueue = summary
     ? summary.tickets_new + summary.tickets_queued + summary.tickets_opening
     : 0;
+
+  const handleCreateTicket = useCallback(
+    async (event: FormEvent<HTMLFormElement>) => {
+      event.preventDefault();
+      setCreateBusy(true);
+      setCreateFeedback(null);
+      setError(null);
+
+      const preferredAgentId =
+        createForm.preferredAgentId !== 'auto' ? createForm.preferredAgentId : undefined;
+      const selectedAgent = preferredAgentId
+        ? agents.find((agent) => agent.agent_id === preferredAgentId) ?? null
+        : null;
+
+      try {
+        const ticket = await apiHelpdeskCreateTicket({
+          client_id: createForm.clientId.trim(),
+          client_display_name: createForm.clientDisplayName.trim() || undefined,
+          summary: createForm.summary.trim() || undefined,
+          preferred_agent_id: preferredAgentId,
+        });
+
+        const assignedAgentId = ticket.assigned_agent_id?.trim() || '';
+        const assignedAgent =
+          assignedAgentId !== ''
+            ? agents.find((agent) => agent.agent_id === assignedAgentId) ?? null
+            : null;
+
+        if (ticket.status === 'opening' && assignedAgentId !== '') {
+          setCreateFeedback({
+            tone: 'success',
+            message: `Ticket ${ticket.ticket_id} enviado a ${
+              assignedAgent ? agentName(assignedAgent) : assignedAgentId
+            }. La app del agente intentará conectarse automáticamente al equipo ${ticket.client_id}.`,
+          });
+        } else if (selectedAgent) {
+          setCreateFeedback({
+            tone: 'success',
+            message: `Ticket ${ticket.ticket_id} creado en cola. ${agentName(
+              selectedAgent,
+            )} ya no estaba disponible para recibirlo.`,
+          });
+        } else {
+          setCreateFeedback({
+            tone: 'success',
+            message: `Ticket ${ticket.ticket_id} creado en cola. Se despachará cuando haya un agente disponible.`,
+          });
+        }
+
+        setCreateForm((current) => ({
+          ...current,
+          clientId: '',
+          clientDisplayName: '',
+          summary: '',
+        }));
+        await load(true);
+      } catch (createError) {
+        setCreateFeedback({
+          tone: 'error',
+          message: createError instanceof Error ? createError.message : 'No se pudo crear el ticket.',
+        });
+      } finally {
+        setCreateBusy(false);
+      }
+    },
+    [agents, createForm, load],
+  );
 
   return (
     <section className="stack">
@@ -212,6 +307,97 @@ export default function HelpdeskPage() {
           </div>
         </>
       )}
+
+      <div className="panel">
+        <div>
+          <h2>Crear ticket</h2>
+          <p className="activity-summary-line">
+            Crea el ticket desde la web usando el RustDesk ID de la maquina. Si eliges un agente
+            disponible, el sistema se lo despacha de inmediato; si no, queda en cola.
+          </p>
+          <p className="activity-summary-line">
+            Agentes disponibles ahora: <strong>{availableAgents.length}</strong>
+          </p>
+        </div>
+
+        <form className="stack" onSubmit={(event) => void handleCreateTicket(event)}>
+          <div className="filter-grid">
+            <div>
+              <label htmlFor="helpdesk-client-id">RustDesk ID / Machine ID</label>
+              <input
+                id="helpdesk-client-id"
+                value={createForm.clientId}
+                onChange={(event) =>
+                  setCreateForm((current) => ({ ...current, clientId: event.target.value }))
+                }
+                placeholder="419797027"
+                required
+              />
+            </div>
+            <div>
+              <label htmlFor="helpdesk-client-display-name">Nombre visible</label>
+              <input
+                id="helpdesk-client-display-name"
+                value={createForm.clientDisplayName}
+                onChange={(event) =>
+                  setCreateForm((current) => ({
+                    ...current,
+                    clientDisplayName: event.target.value,
+                  }))
+                }
+                placeholder="PC Contabilidad"
+              />
+            </div>
+            <div>
+              <label htmlFor="helpdesk-preferred-agent">Despachar a</label>
+              <select
+                id="helpdesk-preferred-agent"
+                value={createForm.preferredAgentId}
+                onChange={(event) =>
+                  setCreateForm((current) => ({
+                    ...current,
+                    preferredAgentId: event.target.value,
+                  }))
+                }
+              >
+                <option value="auto">Primer agente disponible</option>
+                {availableAgents.map((agent) => (
+                  <option key={agent.agent_id} value={agent.agent_id}>
+                    {agentName(agent)} ({agent.agent_id})
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label htmlFor="helpdesk-summary">Resumen</label>
+              <input
+                id="helpdesk-summary"
+                value={createForm.summary}
+                onChange={(event) =>
+                  setCreateForm((current) => ({ ...current, summary: event.target.value }))
+                }
+                placeholder="No puede abrir el sistema contable"
+                required
+              />
+            </div>
+          </div>
+
+          <div className="filter-actions">
+            <button type="submit" className="btn primary" disabled={createBusy}>
+              {createBusy ? 'Creando...' : 'Crear y despachar'}
+            </button>
+            {createFeedback ? (
+              <p className={createFeedback.tone === 'error' ? 'error-text' : 'success-text'}>
+                {createFeedback.message}
+              </p>
+            ) : (
+              <p className="activity-summary-line">
+                El agente asignado intentará iniciar la conexión remota automáticamente desde su app.
+              </p>
+            )}
+          </div>
+        </form>
+      </div>
 
       <div className="panel">
         <div className="filter-row">

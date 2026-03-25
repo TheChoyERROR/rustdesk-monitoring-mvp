@@ -1107,6 +1107,7 @@ pub async fn create_helpdesk_ticket(
     let now_ms = unix_millis_now() as i64;
     let ticket_id = Uuid::new_v4().to_string();
     let client_id = payload.client_id.trim().to_string();
+    let preferred_agent_id = normalize_optional_text(payload.preferred_agent_id.as_deref());
 
     let mut tx = pool
         .begin()
@@ -1158,7 +1159,33 @@ pub async fn create_helpdesk_ticket(
     )
     .await?;
 
-    reconcile_helpdesk_queue_tx(&mut tx, now_ms).await?;
+    if let Some(preferred_agent_id) = preferred_agent_id.as_deref() {
+        let assigned = assign_helpdesk_ticket_to_agent_tx(
+            &mut tx,
+            &ticket_id,
+            preferred_agent_id,
+            now_ms,
+            "preferred_agent",
+            None,
+        )
+        .await?;
+
+        if !assigned {
+            insert_helpdesk_audit_event_tx(
+                &mut tx,
+                "ticket",
+                &ticket_id,
+                "preferred_agent_unavailable",
+                Some(serde_json::json!({
+                    "preferred_agent_id": preferred_agent_id,
+                })),
+                now_ms,
+            )
+            .await?;
+        }
+    } else {
+        reconcile_helpdesk_queue_tx(&mut tx, now_ms).await?;
+    }
 
     let ticket = get_helpdesk_ticket_tx(&mut tx, &ticket_id)
         .await?
@@ -1168,6 +1195,79 @@ pub async fn create_helpdesk_ticket(
         .await
         .context("failed to commit helpdesk ticket transaction")?;
     Ok(ticket)
+}
+
+pub async fn assign_helpdesk_ticket(
+    pool: &SqlitePool,
+    ticket_id: &str,
+    requested_agent_id: Option<&str>,
+    reason: Option<&str>,
+) -> anyhow::Result<(HelpdeskTicketV1, HelpdeskAgentV1)> {
+    let now_ms = unix_millis_now() as i64;
+    let ticket_id = ticket_id.trim();
+    let requested_agent_id = normalize_optional_text(requested_agent_id);
+
+    let mut tx = pool
+        .begin()
+        .await
+        .context("failed to open helpdesk assign transaction")?;
+
+    let current_ticket = get_helpdesk_ticket_tx(&mut tx, ticket_id)
+        .await?
+        .with_context(|| format!("helpdesk ticket '{}' not found before assign", ticket_id))?;
+
+    if current_ticket.status != HelpdeskTicketStatus::Queued {
+        anyhow::bail!("ticket must be queued before it can be assigned");
+    }
+
+    let selected_agent_id = if let Some(agent_id) = requested_agent_id {
+        agent_id.to_string()
+    } else {
+        let row = sqlx::query(
+            r#"
+            SELECT agent_id
+            FROM helpdesk_agents
+            WHERE status = 'available'
+            ORDER BY updated_at ASC, agent_id ASC
+            LIMIT 1
+            "#,
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .context("failed to select available helpdesk agent for manual assignment")?;
+
+        let Some(row) = row else {
+            anyhow::bail!("no available agents to assign this ticket");
+        };
+
+        row.get("agent_id")
+    };
+
+    let assigned = assign_helpdesk_ticket_to_agent_tx(
+        &mut tx,
+        ticket_id,
+        &selected_agent_id,
+        now_ms,
+        "supervisor_manual",
+        reason,
+    )
+    .await?;
+
+    if !assigned {
+        anyhow::bail!("the selected agent is no longer available for assignment");
+    }
+
+    let ticket = get_helpdesk_ticket_tx(&mut tx, ticket_id)
+        .await?
+        .with_context(|| format!("helpdesk ticket '{}' not found after assign", ticket_id))?;
+    let agent = get_helpdesk_agent_tx(&mut tx, &selected_agent_id)
+        .await?
+        .with_context(|| format!("helpdesk agent '{}' not found after assign", selected_agent_id))?;
+
+    tx.commit()
+        .await
+        .context("failed to commit helpdesk assign transaction")?;
+    Ok((ticket, agent))
 }
 
 pub async fn list_helpdesk_agents(pool: &SqlitePool) -> anyhow::Result<Vec<HelpdeskAgentV1>> {
@@ -2692,7 +2792,33 @@ async fn reconcile_helpdesk_queue_tx(
 
     let ticket_id: String = ticket_row.get("ticket_id");
     let agent_id: String = agent_row.get("agent_id");
+    let assigned = assign_helpdesk_ticket_to_agent_tx(
+        tx,
+        &ticket_id,
+        &agent_id,
+        now_ms,
+        "queue_reconcile",
+        None,
+    )
+    .await?;
+
+    if assigned {
+        Ok(Some((ticket_id, agent_id)))
+    } else {
+        Ok(None)
+    }
+}
+
+async fn assign_helpdesk_ticket_to_agent_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    ticket_id: &str,
+    agent_id: &str,
+    now_ms: i64,
+    dispatch_source: &str,
+    reason: Option<&str>,
+) -> anyhow::Result<bool> {
     let deadline_ms = now_ms + 10_000;
+    let reason = reason.map(str::trim).filter(|value| !value.is_empty());
 
     let ticket_update = sqlx::query(
         r#"
@@ -2704,8 +2830,8 @@ async fn reconcile_helpdesk_queue_tx(
         WHERE ticket_id = ?1 AND status = 'queued'
         "#,
     )
-    .bind(&ticket_id)
-    .bind(&agent_id)
+    .bind(ticket_id)
+    .bind(agent_id)
     .bind(deadline_ms)
     .bind(now_ms)
     .execute(&mut **tx)
@@ -2713,7 +2839,7 @@ async fn reconcile_helpdesk_queue_tx(
     .with_context(|| format!("failed to move ticket '{}' to opening", ticket_id))?;
 
     if ticket_update.rows_affected() == 0 {
-        return Ok(None);
+        return Ok(false);
     }
 
     let agent_update = sqlx::query(
@@ -2725,8 +2851,8 @@ async fn reconcile_helpdesk_queue_tx(
         WHERE agent_id = ?1 AND status = 'available'
         "#,
     )
-    .bind(&agent_id)
-    .bind(&ticket_id)
+    .bind(agent_id)
+    .bind(ticket_id)
     .bind(now_ms)
     .execute(&mut **tx)
     .await
@@ -2743,12 +2869,12 @@ async fn reconcile_helpdesk_queue_tx(
             WHERE ticket_id = ?1
             "#,
         )
-        .bind(&ticket_id)
+        .bind(ticket_id)
         .bind(now_ms)
         .execute(&mut **tx)
         .await
         .with_context(|| format!("failed to rollback ticket '{}' opening state", ticket_id))?;
-        return Ok(None);
+        return Ok(false);
     }
 
     sqlx::query(
@@ -2759,8 +2885,8 @@ async fn reconcile_helpdesk_queue_tx(
         VALUES (?1, ?2, 'opening', ?3, ?4)
         "#,
     )
-    .bind(&ticket_id)
-    .bind(&agent_id)
+    .bind(ticket_id)
+    .bind(agent_id)
     .bind(now_ms)
     .bind(now_ms)
     .execute(&mut **tx)
@@ -2770,11 +2896,13 @@ async fn reconcile_helpdesk_queue_tx(
     insert_helpdesk_audit_event_tx(
         tx,
         "ticket",
-        &ticket_id,
+        ticket_id,
         "ticket_assigned",
         Some(serde_json::json!({
             "agent_id": agent_id,
             "opening_deadline_at": millis_to_utc(deadline_ms).to_rfc3339(),
+            "dispatch_source": dispatch_source,
+            "reason": reason,
         })),
         now_ms,
     )
@@ -2783,17 +2911,19 @@ async fn reconcile_helpdesk_queue_tx(
     insert_helpdesk_audit_event_tx(
         tx,
         "agent",
-        &agent_id,
+        agent_id,
         "opening_countdown_started",
         Some(serde_json::json!({
             "ticket_id": ticket_id,
             "opening_deadline_at": millis_to_utc(deadline_ms).to_rfc3339(),
+            "dispatch_source": dispatch_source,
+            "reason": reason,
         })),
         now_ms,
     )
     .await?;
 
-    Ok(Some((ticket_id, agent_id)))
+    Ok(true)
 }
 
 async fn insert_helpdesk_audit_event_tx(
@@ -2998,12 +3128,12 @@ mod tests {
     };
 
     use super::{
-        cancel_helpdesk_ticket, connect_sqlite, create_helpdesk_ticket, expire_stale_presence,
-        get_helpdesk_agent, get_helpdesk_assignment_for_agent, get_helpdesk_operational_summary,
-        get_helpdesk_ticket, get_session_presence, insert_event, list_active_session_presence,
-        list_helpdesk_ticket_audit_events, list_helpdesk_tickets, reconcile_helpdesk_runtime,
-        requeue_helpdesk_ticket, resolve_helpdesk_ticket, start_helpdesk_ticket, unix_millis_now,
-        upsert_helpdesk_agent_presence, InsertOutcome,
+        assign_helpdesk_ticket, cancel_helpdesk_ticket, connect_sqlite, create_helpdesk_ticket,
+        expire_stale_presence, get_helpdesk_agent, get_helpdesk_assignment_for_agent,
+        get_helpdesk_operational_summary, get_helpdesk_ticket, get_session_presence, insert_event,
+        list_active_session_presence, list_helpdesk_ticket_audit_events, list_helpdesk_tickets,
+        reconcile_helpdesk_runtime, requeue_helpdesk_ticket, resolve_helpdesk_ticket,
+        start_helpdesk_ticket, unix_millis_now, upsert_helpdesk_agent_presence, InsertOutcome,
     };
 
     #[tokio::test]
@@ -3252,6 +3382,7 @@ mod tests {
                 device_id: Some("device-1".to_string()),
                 requested_by: Some("user@example.com".to_string()),
                 summary: Some("Necesito ayuda".to_string()),
+                preferred_agent_id: None,
             },
         )
         .await
@@ -3262,6 +3393,68 @@ mod tests {
         assert!(ticket.opening_deadline_at.is_some());
 
         let assignment = get_helpdesk_assignment_for_agent(&pool, "agent-1")
+            .await
+            .expect("get assignment")
+            .expect("assignment exists");
+        assert_eq!(assignment.ticket.ticket_id, ticket.ticket_id);
+        assert_eq!(assignment.agent.status, HelpdeskAgentStatus::Opening);
+    }
+
+    #[tokio::test]
+    async fn helpdesk_ticket_can_target_specific_available_agent_on_create() {
+        let temp = tempdir().expect("create temp dir");
+        let db_path = temp.path().join("helpdesk-preferred-agent.db");
+        let pool = connect_sqlite(&db_path).await.expect("connect sqlite");
+
+        upsert_helpdesk_agent_presence(
+            &pool,
+            &HelpdeskAgentPresenceUpdateV1 {
+                agent_id: "agent-1".to_string(),
+                display_name: Some("Agent One".to_string()),
+                avatar_url: None,
+                status: HelpdeskAgentStatus::Available,
+            },
+        )
+        .await
+        .expect("upsert agent 1");
+
+        upsert_helpdesk_agent_presence(
+            &pool,
+            &HelpdeskAgentPresenceUpdateV1 {
+                agent_id: "agent-2".to_string(),
+                display_name: Some("Agent Two".to_string()),
+                avatar_url: None,
+                status: HelpdeskAgentStatus::Available,
+            },
+        )
+        .await
+        .expect("upsert agent 2");
+
+        let ticket = create_helpdesk_ticket(
+            &pool,
+            &HelpdeskTicketCreateRequestV1 {
+                client_id: "client-preferred".to_string(),
+                client_display_name: Some("Cliente Preferred".to_string()),
+                device_id: None,
+                requested_by: Some("Supervisor".to_string()),
+                summary: Some("Dispatch to agent 2".to_string()),
+                preferred_agent_id: Some("agent-2".to_string()),
+            },
+        )
+        .await
+        .expect("create ticket");
+
+        assert_eq!(ticket.status, HelpdeskTicketStatus::Opening);
+        assert_eq!(ticket.assigned_agent_id.as_deref(), Some("agent-2"));
+
+        let agent_one = get_helpdesk_agent(&pool, "agent-1")
+            .await
+            .expect("get agent 1")
+            .expect("agent 1 exists");
+        assert_eq!(agent_one.status, HelpdeskAgentStatus::Available);
+        assert!(agent_one.current_ticket_id.is_none());
+
+        let assignment = get_helpdesk_assignment_for_agent(&pool, "agent-2")
             .await
             .expect("get assignment")
             .expect("assignment exists");
@@ -3283,6 +3476,7 @@ mod tests {
                 device_id: None,
                 requested_by: None,
                 summary: Some("En cola".to_string()),
+                preferred_agent_id: None,
             },
         )
         .await
@@ -3342,6 +3536,7 @@ mod tests {
                 device_id: None,
                 requested_by: None,
                 summary: Some("Lifecycle".to_string()),
+                preferred_agent_id: None,
             },
         )
         .await
@@ -3393,6 +3588,7 @@ mod tests {
                 device_id: None,
                 requested_by: None,
                 summary: Some("Opening timeout".to_string()),
+                preferred_agent_id: None,
             },
         )
         .await
@@ -3459,6 +3655,7 @@ mod tests {
                 device_id: None,
                 requested_by: None,
                 summary: Some("Busy stale".to_string()),
+                preferred_agent_id: None,
             },
         )
         .await
@@ -3526,6 +3723,7 @@ mod tests {
                 device_id: Some("device-audit".to_string()),
                 requested_by: None,
                 summary: Some("Resumen".to_string()),
+                preferred_agent_id: None,
             },
         )
         .await
@@ -3554,6 +3752,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn supervisor_can_assign_queued_ticket_to_specific_agent() {
+        let temp = tempdir().expect("create temp dir");
+        let db_path = temp.path().join("helpdesk-manual-assign.db");
+        let pool = connect_sqlite(&db_path).await.expect("connect sqlite");
+
+        upsert_helpdesk_agent_presence(
+            &pool,
+            &HelpdeskAgentPresenceUpdateV1 {
+                agent_id: "agent-queue-owner".to_string(),
+                display_name: Some("Agent Queue Owner".to_string()),
+                avatar_url: None,
+                status: HelpdeskAgentStatus::Available,
+            },
+        )
+        .await
+        .expect("upsert queue owner");
+
+        let ticket = create_helpdesk_ticket(
+            &pool,
+            &HelpdeskTicketCreateRequestV1 {
+                client_id: "client-manual".to_string(),
+                client_display_name: Some("Cliente Manual".to_string()),
+                device_id: None,
+                requested_by: Some("Supervisor".to_string()),
+                summary: Some("Manual dispatch".to_string()),
+                preferred_agent_id: None,
+            },
+        )
+        .await
+        .expect("create ticket");
+
+        upsert_helpdesk_agent_presence(
+            &pool,
+            &HelpdeskAgentPresenceUpdateV1 {
+                agent_id: "agent-2".to_string(),
+                display_name: Some("Agent Two".to_string()),
+                avatar_url: None,
+                status: HelpdeskAgentStatus::Available,
+            },
+        )
+        .await
+        .expect("upsert agent 2");
+
+        let (queued_ticket, released_agent) = requeue_helpdesk_ticket(
+            &pool,
+            &ticket.ticket_id,
+            HelpdeskAgentStatus::Away,
+            Some("dispatch to another agent"),
+        )
+        .await
+        .expect("requeue ticket");
+
+        assert_eq!(queued_ticket.status, HelpdeskTicketStatus::Queued);
+        let released_agent = released_agent.expect("released agent exists");
+        assert_eq!(released_agent.status, HelpdeskAgentStatus::Away);
+
+        let (assigned_ticket, assigned_agent) = assign_helpdesk_ticket(
+            &pool,
+            &ticket.ticket_id,
+            Some("agent-2"),
+            Some("manual dispatch"),
+        )
+        .await
+        .expect("assign queued ticket");
+
+        assert_eq!(assigned_ticket.status, HelpdeskTicketStatus::Opening);
+        assert_eq!(assigned_ticket.assigned_agent_id.as_deref(), Some("agent-2"));
+        assert_eq!(assigned_agent.status, HelpdeskAgentStatus::Opening);
+        assert_eq!(assigned_agent.current_ticket_id.as_deref(), Some(ticket.ticket_id.as_str()));
+    }
+
+    #[tokio::test]
     async fn supervisor_can_requeue_opening_ticket() {
         let temp = tempdir().expect("create temp dir");
         let db_path = temp.path().join("helpdesk-requeue.db");
@@ -3579,6 +3849,7 @@ mod tests {
                 device_id: None,
                 requested_by: None,
                 summary: Some("Supervisor requeue".to_string()),
+                preferred_agent_id: None,
             },
         )
         .await
@@ -3626,6 +3897,7 @@ mod tests {
                 device_id: None,
                 requested_by: None,
                 summary: Some("Supervisor cancel".to_string()),
+                preferred_agent_id: None,
             },
         )
         .await

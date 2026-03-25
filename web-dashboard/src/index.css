@@ -428,6 +428,10 @@ th {
   color: var(--danger);
 }
 
+.success-text {
+  color: #0f6a46;
+}
+
 .dashboard-section-header {
   display: flex;
   justify-content: space-between;

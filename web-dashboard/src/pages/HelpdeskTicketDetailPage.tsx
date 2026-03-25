@@ -1,9 +1,21 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 
-import { apiHelpdeskTicket, apiHelpdeskTicketAudit, apiHelpdeskTicketCancel, apiHelpdeskTicketRequeue } from '../api';
+import {
+  apiHelpdeskAgents,
+  apiHelpdeskTicket,
+  apiHelpdeskTicketAssign,
+  apiHelpdeskTicketAudit,
+  apiHelpdeskTicketCancel,
+  apiHelpdeskTicketRequeue,
+} from '../api';
 import { formatDateTime } from '../lib/time';
-import type { HelpdeskAuditEvent, HelpdeskTicket, HelpdeskTicketStatus } from '../types';
+import type {
+  HelpdeskAgent,
+  HelpdeskAuditEvent,
+  HelpdeskTicket,
+  HelpdeskTicketStatus,
+} from '../types';
 
 function statusLabel(status: HelpdeskTicketStatus) {
   switch (status) {
@@ -56,13 +68,15 @@ export default function HelpdeskTicketDetailPage() {
   const decodedTicketId = useMemo(() => decodeURIComponent(ticketId), [ticketId]);
 
   const [ticket, setTicket] = useState<HelpdeskTicket | null>(null);
+  const [agents, setAgents] = useState<HelpdeskAgent[]>([]);
   const [audit, setAudit] = useState<HelpdeskAuditEvent[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [actionReason, setActionReason] = useState('');
   const [nextAgentStatus, setNextAgentStatus] = useState<'available' | 'away'>('available');
-  const [actionBusy, setActionBusy] = useState<null | 'requeue' | 'cancel'>(null);
+  const [dispatchAgentId, setDispatchAgentId] = useState<'auto' | string>('auto');
+  const [actionBusy, setActionBusy] = useState<null | 'assign' | 'requeue' | 'cancel'>(null);
 
   const load = useCallback(async (background = false) => {
     if (background) {
@@ -72,12 +86,14 @@ export default function HelpdeskTicketDetailPage() {
     }
     setError(null);
     try {
-      const [ticketData, auditData] = await Promise.all([
+      const [ticketData, auditData, agentsData] = await Promise.all([
         apiHelpdeskTicket(decodedTicketId),
         apiHelpdeskTicketAudit(decodedTicketId, 200),
+        apiHelpdeskAgents(),
       ]);
       setTicket(ticketData);
       setAudit(auditData);
+      setAgents(agentsData);
     } catch {
       setError('No se pudo cargar el detalle del ticket.');
     } finally {
@@ -96,6 +112,19 @@ export default function HelpdeskTicketDetailPage() {
     }, 5000);
     return () => window.clearInterval(timer);
   }, [load]);
+
+  const availableAgents = useMemo(() => {
+    return agents.filter((agent) => agent.status === 'available');
+  }, [agents]);
+
+  useEffect(() => {
+    if (
+      dispatchAgentId !== 'auto' &&
+      !availableAgents.some((agent) => agent.agent_id === dispatchAgentId)
+    ) {
+      setDispatchAgentId('auto');
+    }
+  }, [availableAgents, dispatchAgentId]);
 
   return (
     <section className="stack">
@@ -122,6 +151,21 @@ export default function HelpdeskTicketDetailPage() {
             <div className="detail-actions">
               <div className="filter-grid">
                 <div>
+                  <label htmlFor="ticket-dispatch-agent">Despachar a</label>
+                  <select
+                    id="ticket-dispatch-agent"
+                    value={dispatchAgentId}
+                    onChange={(event) => setDispatchAgentId(event.target.value)}
+                  >
+                    <option value="auto">Primer agente disponible</option>
+                    {availableAgents.map((agent) => (
+                      <option key={agent.agent_id} value={agent.agent_id}>
+                        {agent.display_name || agent.agent_id} ({agent.agent_id})
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div>
                   <label htmlFor="ticket-next-agent-status">Estado del agente al liberar</label>
                   <select
                     id="ticket-next-agent-status"
@@ -143,6 +187,28 @@ export default function HelpdeskTicketDetailPage() {
                 </div>
               </div>
               <div className="filter-actions">
+                <button
+                  type="button"
+                  className="btn primary"
+                  disabled={actionBusy !== null || ticket.status !== 'queued' || availableAgents.length === 0}
+                  onClick={async () => {
+                    setActionBusy('assign');
+                    setError(null);
+                    try {
+                      await apiHelpdeskTicketAssign(decodedTicketId, {
+                        agent_id: dispatchAgentId === 'auto' ? undefined : dispatchAgentId,
+                        reason: actionReason.trim() || undefined,
+                      });
+                      await load();
+                    } catch {
+                      setError('No se pudo despachar el ticket.');
+                    } finally {
+                      setActionBusy(null);
+                    }
+                  }}
+                >
+                  {actionBusy === 'assign' ? 'Despachando...' : 'Despachar ahora'}
+                </button>
                 <button
                   type="button"
                   className="btn secondary"
