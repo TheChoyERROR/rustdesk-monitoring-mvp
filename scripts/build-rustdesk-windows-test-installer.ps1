@@ -3,6 +3,7 @@ param(
   [string]$CompanyName = "MyCompany",
   [string]$OutputDir = "",
   [switch]$SkipBuild,
+  [switch]$SkipApplyForkPatches,
   [switch]$SkipZip,
   [switch]$SkipNsis
 )
@@ -29,6 +30,10 @@ if (-not [string]::IsNullOrWhiteSpace($OutputDir)) {
 
 if (-not $SkipBuild) {
   $params.BuildRustDesk = $true
+}
+
+if ($SkipApplyForkPatches) {
+  $params.SkipApplyForkPatches = $true
 }
 
 if ($SkipZip) {

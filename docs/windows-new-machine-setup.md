@@ -1,6 +1,6 @@
 # Windows New Machine Setup
 
-Esta guia deja una maquina Windows lista para trabajar con:
+Esta guia deja una maquina Windows lista para:
 
 - backend `monitoring-server`
 - dashboard `web-dashboard`
@@ -8,83 +8,93 @@ Esta guia deja una maquina Windows lista para trabajar con:
 - build de `rustdesk.exe`
 - empaquetado `setup.exe`
 
-## 1. Clonar repos
+## 1. Camino corto: clone y bootstrap
 
 Desde una carpeta de trabajo:
 
 ```powershell
 git clone https://github.com/TheChoyERROR/rustdesk-monitoring-mvp.git
 cd rustdesk-monitoring-mvp
-git clone --branch feature/monitoring-events https://github.com/TheChoyERROR/rustdesk.git rustdesk-fork
+powershell -ExecutionPolicy Bypass -File .\scripts\bootstrap-windows-dev-machine.ps1 -Execute -BuildInstaller
 ```
 
-Validacion rapida:
+Ese bootstrap hace esto:
+
+- clona `rustdesk-fork` si no existe;
+- fija el fork en `a917fc630baf0ffa1eb0982b108571e8a9952be7`;
+- inicializa sus submodulos;
+- aplica el overlay versionado de `patches\rustdesk-fork\`;
+- descarga Flutter `3.24.5` dentro de `tools\flutter-3.24.5` si falta;
+- instala dependencias Windows;
+- valida el entorno;
+- compila backend;
+- genera el instalador de prueba.
+
+Salida esperada:
+
+- `artifacts\windows-installer\...\*-setup.exe`
+- `artifacts\windows-installer\...\*-portable.zip`
+
+## 2. Si solo quieres preparar la maquina
 
 ```powershell
-git rev-parse --short HEAD
-git -C .\rustdesk-fork rev-parse --short HEAD
+git clone https://github.com/TheChoyERROR/rustdesk-monitoring-mvp.git
+cd rustdesk-monitoring-mvp
+powershell -ExecutionPolicy Bypass -File .\scripts\bootstrap-windows-dev-machine.ps1 -Execute
 ```
 
-Valores esperados al momento de esta guia:
-
-- repo principal: `8940207`
-- fork: `a917fc630`
-
-## 1.5 Bootstrap de una sola pasada
-
-Si quieres una sola orden para preparar la maquina, usa:
+Luego, cuando quieras crear el instalador:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\bootstrap-windows-dev-machine.ps1 -Execute -BuildRustDesk -BuildInstaller
+powershell -ExecutionPolicy Bypass -File .\scripts\build-rustdesk-windows-test-installer.ps1 `
+  -MonitoringUrl "https://rustdesk-monitoring-mvp.onrender.com" `
+  -CompanyName "RustDesk Monitoring MVP"
 ```
 
-Si todavia no tienes `tools\flutter-3.24.5`, ejecuta primero sin `-BuildRustDesk` y sin `-BuildInstaller`,
-o pasa `-FlutterRoot "C:\ruta\flutter-3.24.5"`.
+## 3. Si quieres controlar cada paso
 
-## 2. Dependencias de Windows para el fork
+### 3.1 Dependencias Windows
 
-Recomendado ejecutar PowerShell como administrador:
+Recomendado abrir PowerShell como administrador:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\install-rustdesk-windows-build-deps.ps1 -Execute
 ```
 
-Esto instala/prepara:
+Esto instala o prepara:
 
 - Visual Studio 2022 Build Tools
 - CMake
 - NSIS
 - Rustup
 - `vcpkg`
+- Flutter `3.24.5` dentro del repo
 - paquetes nativos requeridos
 
-Luego valida el entorno:
+Validacion:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\check-rustdesk-windows-build-env.ps1
 ```
 
-## 3. Flutter correcto
+### 3.2 Fork reproducible
 
-El fork fue ajustado para usar Flutter `3.24.5`.
-
-Opcion recomendada:
-
-- copiar `tools\flutter-3.24.5` desde la maquina anterior al mismo path dentro de este repo
-
-Alternativa:
-
-- instalar Flutter `3.24.5` en otra ruta
-- definir `RUSTDESK_FLUTTER_ROOT` apuntando a ese SDK
-
-Ejemplo:
+Si no existe:
 
 ```powershell
-$env:RUSTDESK_FLUTTER_ROOT="C:\dev\flutter-3.24.5"
-$env:FLUTTER_ROOT=$env:RUSTDESK_FLUTTER_ROOT
+git clone --branch feature/monitoring-events https://github.com/TheChoyERROR/rustdesk.git rustdesk-fork
+git -C .\rustdesk-fork checkout a917fc630baf0ffa1eb0982b108571e8a9952be7
+git -C .\rustdesk-fork submodule update --init --recursive
+powershell -ExecutionPolicy Bypass -File .\scripts\apply-rustdesk-fork-patches.ps1 -Execute
 ```
 
-## 4. Backend y dashboard
+Si el fork ya existe, asegurate de que este limpio antes de reaplicar:
+
+```powershell
+git -C .\rustdesk-fork status --short
+```
+
+### 3.3 Backend y dashboard
 
 Backend:
 
@@ -98,7 +108,7 @@ Dashboard en dev:
 powershell -ExecutionPolicy Bypass -File .\scripts\run-dashboard-dev.ps1
 ```
 
-## 5. Compilar `rustdesk.exe`
+### 3.4 Compilar `rustdesk.exe`
 
 Desde `rustdesk-fork`:
 
@@ -117,7 +127,7 @@ Salida esperada:
 
 - `rustdesk-fork\flutter\build\windows\x64\runner\Release\rustdesk.exe`
 
-## 6. Crear instalador
+### 3.5 Crear instalador
 
 Desde el repo principal:
 
@@ -142,15 +152,16 @@ Salida esperada:
 - `artifacts\windows-installer\...\*-setup.exe`
 - `artifacts\windows-installer\...\*-portable.zip`
 
-## 7. Flujo recomendado para issues
+## 4. Como queda la reproducibilidad
 
-- cambios de backend/dashboard: repo principal
-- cambios del cliente RustDesk: `rustdesk-fork`
-- commitear y pushear ambos repos por separado
-- no usar `git add .` si hay artefactos locales o cambios de build
+El repo principal sigue sin versionar `tools\` ni `rustdesk-fork\`, pero ahora el flujo reproducible ya no depende de copiar carpetas a mano:
 
-## 8. Nota importante
+- el fork se clona desde una base fija;
+- sus submodulos se inicializan en bootstrap y en el build;
+- los cambios del fork viven como patch en `patches\rustdesk-fork\`;
+- Flutter `3.24.5` se descarga automaticamente;
+- el build del instalador reaplica los patches del fork antes de compilar.
 
-El repo principal no versiona `tools\` ni empaqueta automaticamente el SDK de Flutter.
-Si necesitas builds reproducibles en otra maquina, copia `tools\flutter-3.24.5`
-desde una maquina ya preparada o instala manualmente esa misma version.
+## 5. Nota operativa
+
+Si `rustdesk-fork` tiene cambios locales, el bootstrap no va a forzar `checkout` ni reaplicar patches por encima. En una maquina nueva lo correcto es partir de un clon limpio del repo principal y dejar que el bootstrap prepare el resto.

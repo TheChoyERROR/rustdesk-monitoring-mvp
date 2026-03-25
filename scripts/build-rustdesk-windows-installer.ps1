@@ -10,6 +10,7 @@ param(
   [string]$InstallDirName = "RustDeskMonitoringCorporate",
   [string]$UninstallKey = "RustDeskMonitoringCorporate",
   [switch]$BuildRustDesk,
+  [switch]$SkipApplyForkPatches,
   [switch]$SkipZip,
   [switch]$SkipNsis
 )
@@ -17,6 +18,7 @@ param(
 $ErrorActionPreference = "Stop"
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 . (Join-Path $scriptDir "rustdesk-flutter.ps1")
+$applyForkPatchesScript = Join-Path $scriptDir "apply-rustdesk-fork-patches.ps1"
 
 function Resolve-ExistingPath {
   param(
@@ -131,6 +133,35 @@ if ($BuildRustDesk) {
   if (-not [string]::IsNullOrWhiteSpace($flutterRoot)) {
     $flutterVersion = Get-RustDeskFlutterVersion -FlutterRoot $flutterRoot
     Write-Host "Usando Flutter: $flutterRoot$(if ($flutterVersion) { " (version $flutterVersion)" })"
+  }
+  Add-RustDeskGitSafeDirectory -Path $rustDeskRepoPath
+
+  Write-Host "Inicializando submodulos del fork RustDesk..."
+  & git -C $rustDeskRepoPath submodule sync --recursive
+  if ($LASTEXITCODE -ne 0) {
+    throw "Fallo git submodule sync"
+  }
+  & git -C $rustDeskRepoPath submodule update --init --recursive
+  if ($LASTEXITCODE -ne 0) {
+    throw "Fallo git submodule update"
+  }
+
+  if (-not $SkipApplyForkPatches -and (Test-Path $applyForkPatchesScript)) {
+    $gitStatus = & git -C $rustDeskRepoPath status --porcelain
+    if ($LASTEXITCODE -ne 0) {
+      throw "Fallo git status antes de aplicar patches"
+    }
+    $hasLocalChanges = -not [string]::IsNullOrWhiteSpace(($gitStatus | Out-String).Trim())
+
+    if ($hasLocalChanges) {
+      Write-Warning "rustdesk-fork ya tiene cambios locales; se omite la autoaplicacion de patches. Usa un checkout limpio si quieres reprovisionarlo desde cero."
+    } else {
+      Write-Host "Aplicando patches versionados del fork RustDesk..."
+      & powershell -NoProfile -ExecutionPolicy Bypass -File $applyForkPatchesScript -ForkPath $rustDeskRepoPath -Execute
+      if ($LASTEXITCODE -ne 0) {
+        throw "Fallo apply-rustdesk-fork-patches.ps1"
+      }
+    }
   }
 
   Write-Host "Compilando fork RustDesk (flutter windows release, sin pack portable)..."

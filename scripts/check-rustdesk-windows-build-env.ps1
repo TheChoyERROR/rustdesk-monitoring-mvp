@@ -98,7 +98,7 @@ $flutterDetails = $flutterPath
 if (-not [string]::IsNullOrWhiteSpace($flutterVersion)) {
   $flutterDetails = "$flutterPath (version $flutterVersion)"
 }
-Add-Result -List $results -Name "flutter_sdk" -Ok:($null -ne $flutterPath) -Details $flutterDetails -Recommendation "Usa el SDK vendorizado en tools\\flutter-3.24.5 o define RUSTDESK_FLUTTER_ROOT."
+Add-Result -List $results -Name "flutter_sdk" -Ok:($null -ne $flutterPath) -Details $flutterDetails -Recommendation "Ejecuta scripts\\install-rustdesk-flutter-sdk.ps1 -Execute o usa el bootstrap del repo."
 
 $pathFlutterPath = Find-CommandPath -Name "flutter"
 if ($pathFlutterPath) {

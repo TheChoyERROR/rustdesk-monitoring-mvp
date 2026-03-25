@@ -1,0 +1,8 @@
+{
+  "fork_repo_url": "https://github.com/TheChoyERROR/rustdesk.git",
+  "fork_branch": "feature/monitoring-events",
+  "fork_base_commit": "a917fc630baf0ffa1eb0982b108571e8a9952be7",
+  "patches": [
+    "0001-monitoring-mvp-helpdesk.patch"
+  ]
+}

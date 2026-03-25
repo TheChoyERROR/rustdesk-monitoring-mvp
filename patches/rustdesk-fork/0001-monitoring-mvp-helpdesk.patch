@@ -1,0 +1,1694 @@
+diff --git a/flutter/lib/desktop/pages/connection_page.dart b/flutter/lib/desktop/pages/connection_page.dart
+index bdf3829e1..f1769ee14 100644
+--- a/flutter/lib/desktop/pages/connection_page.dart
++++ b/flutter/lib/desktop/pages/connection_page.dart
+@@ -9,6 +9,7 @@ import 'package:flutter_hbb/common/widgets/connection_page_title.dart';
+ import 'package:flutter_hbb/consts.dart';
+ import 'package:flutter_hbb/desktop/widgets/popup_menu.dart';
+ import 'package:flutter_hbb/models/state_model.dart';
++import 'package:flutter_hbb/utils/http_service.dart' as http;
+ import 'package:get/get.dart';
+ import 'package:url_launcher/url_launcher_string.dart';
+ import 'package:window_manager/window_manager.dart';
+@@ -21,6 +22,13 @@ import '../../common/widgets/autocomplete.dart';
+ import '../../models/platform_model.dart';
+ import '../../desktop/widgets/material_mod_popup_menu.dart' as mod_menu;
+ 
++const _kHelpdeskServerUrlOption = 'helpdesk-server-url';
++const _kHelpdeskLastTicketIdOption = 'helpdesk-last-ticket-id';
++const _kHelpdeskLastTicketStatusOption = 'helpdesk-last-ticket-status';
++const _kMonitoringServerUrlOption = 'monitoring-server-url';
++const _kMonitoringServerLegacyOption = 'monitoring-server';
++const _kMonitoringDisplayNameOption = 'monitoring-display-name';
++
+ class OnlineStatusWidget extends StatefulWidget {
+   const OnlineStatusWidget({Key? key, this.onSvcStatusChanged})
+       : super(key: key);
+@@ -314,6 +322,8 @@ class _ConnectionPageState extends State<ConnectionPage>
+                 Flexible(child: _buildRemoteIDTextField(context)),
+               ],
+             ).marginOnly(top: 22),
++            const SizedBox(height: 12),
++            const _HelpdeskRequestCard(),
+             SizedBox(height: 12),
+             Divider().paddingOnly(right: 12),
+             Expanded(child: PeerTabPage()),
+@@ -613,3 +623,419 @@ class _ConnectionPageState extends State<ConnectionPage>
+         constraints: const BoxConstraints(maxWidth: 600), child: w);
+   }
+ }
++
++class _HelpdeskRequestCard extends StatefulWidget {
++  const _HelpdeskRequestCard();
++
++  @override
++  State<_HelpdeskRequestCard> createState() => _HelpdeskRequestCardState();
++}
++
++class _HelpdeskRequestCardState extends State<_HelpdeskRequestCard> {
++  late final TextEditingController _serverUrlController;
++  late final TextEditingController _displayNameController;
++  late final TextEditingController _summaryController;
++  final Future<String> _peerIdFuture = bind.mainGetMyId();
++  bool _submitting = false;
++  bool _polling = false;
++  String _statusMessage = '';
++  bool _isError = false;
++  HelpdeskTicketSnapshot? _trackedTicket;
++  Timer? _pollTimer;
++
++  @override
++  void initState() {
++    super.initState();
++    _serverUrlController =
++        TextEditingController(text: _resolveInitialHelpdeskServerUrl());
++    _displayNameController =
++        TextEditingController(text: _resolveInitialDisplayName());
++    _summaryController = TextEditingController();
++    Future.microtask(() async {
++      await _restoreTrackedTicket();
++      _startPolling();
++    });
++  }
++
++  @override
++  void dispose() {
++    _pollTimer?.cancel();
++    _serverUrlController.dispose();
++    _displayNameController.dispose();
++    _summaryController.dispose();
++    super.dispose();
++  }
++
++  String _resolveInitialHelpdeskServerUrl() {
++    for (final candidate in [
++      bind.mainGetLocalOption(key: _kHelpdeskServerUrlOption),
++      bind.mainGetEnv(key: 'RUSTDESK_MONITORING_URL'),
++      bind.mainGetLocalOption(key: _kMonitoringServerUrlOption),
++      bind.mainGetLocalOption(key: _kMonitoringServerLegacyOption),
++      'http://127.0.0.1:8080',
++    ]) {
++      final trimmed = candidate.trim();
++      if (trimmed.isNotEmpty) {
++        return trimmed.replaceAll(RegExp(r'\/+$'), '');
++      }
++    }
++    return 'http://127.0.0.1:8080';
++  }
++
++  String _resolveInitialDisplayName() {
++    final displayName =
++        bind.mainGetLocalOption(key: _kMonitoringDisplayNameOption).trim();
++    return displayName;
++  }
++
++  void _startPolling() {
++    _pollTimer?.cancel();
++    _pollTimer = periodic_immediate(const Duration(seconds: 3), () async {
++      await _refreshTrackedTicket();
++    });
++  }
++
++  Future<void> _restoreTrackedTicket() async {
++    final ticketId =
++        bind.mainGetLocalOption(key: _kHelpdeskLastTicketIdOption).trim();
++    if (ticketId.isEmpty) {
++      return;
++    }
++    setState(() {
++      _trackedTicket = HelpdeskTicketSnapshot(
++        ticketId: ticketId,
++        status: bind.mainGetLocalOption(key: _kHelpdeskLastTicketStatusOption),
++      );
++    });
++    await _refreshTrackedTicket(force: true);
++  }
++
++  Future<void> _refreshTrackedTicket({bool force = false}) async {
++    final trackedTicket = _trackedTicket;
++    if (trackedTicket == null || _polling) {
++      return;
++    }
++    if (!force && _isTicketTerminal(trackedTicket.status)) {
++      return;
++    }
++
++    final serverUrl =
++        _serverUrlController.text.trim().replaceAll(RegExp(r'\/+$'), '');
++    if (serverUrl.isEmpty) {
++      return;
++    }
++
++    _polling = true;
++    try {
++      final uri = Uri.parse(
++          '$serverUrl/api/v1/helpdesk/tickets/${Uri.encodeComponent(trackedTicket.ticketId)}');
++      final resp = await http.get(uri);
++      if (resp.statusCode == 404) {
++        return;
++      }
++      if (resp.statusCode < 200 || resp.statusCode >= 300) {
++        throw Exception('ticket status HTTP ${resp.statusCode}: ${resp.body}');
++      }
++
++      final json = jsonDecode(resp.body) as Map<String, dynamic>;
++      final ticketJson = json['ticket'] as Map<String, dynamic>? ?? {};
++      final nextTicket = HelpdeskTicketSnapshot.fromJson(ticketJson);
++      await bind.mainSetLocalOption(
++          key: _kHelpdeskLastTicketStatusOption, value: nextTicket.status);
++
++      if (!mounted) {
++        return;
++      }
++      setState(() {
++        _trackedTicket = nextTicket;
++      });
++    } catch (e) {
++      if (!mounted) {
++        return;
++      }
++      setState(() {
++        _isError = true;
++        _statusMessage = e.toString();
++      });
++    } finally {
++      _polling = false;
++    }
++  }
++
++  bool _isTicketTerminal(String status) {
++    return status == 'resolved' || status == 'cancelled' || status == 'failed';
++  }
++
++  String _statusLabel(String status) {
++    switch (status) {
++      case 'new':
++        return 'Solicitado';
++      case 'queued':
++        return 'En cola';
++      case 'opening':
++        return 'Asignado';
++      case 'in_progress':
++        return 'Conectando';
++      case 'resolved':
++        return 'Finalizado';
++      case 'cancelled':
++        return 'Cancelado';
++      case 'failed':
++        return 'Fallido';
++      default:
++        return status.isEmpty ? 'Sin estado' : status;
++    }
++  }
++
++  Color _statusColor(BuildContext context, String status) {
++    switch (status) {
++      case 'new':
++      case 'queued':
++        return Colors.orange;
++      case 'opening':
++        return Colors.blueAccent;
++      case 'in_progress':
++        return Colors.green;
++      case 'resolved':
++        return Colors.teal;
++      case 'cancelled':
++      case 'failed':
++        return Colors.redAccent;
++      default:
++        return Theme.of(context).textTheme.bodyMedium?.color ?? Colors.grey;
++    }
++  }
++
++  Future<void> _submitHelpdeskRequest() async {
++    if (_submitting) {
++      return;
++    }
++
++    final serverUrl =
++        _serverUrlController.text.trim().replaceAll(RegExp(r'\/+$'), '');
++    if (serverUrl.isEmpty) {
++      setState(() {
++        _isError = true;
++        _statusMessage = 'Falta URL del backend helpdesk';
++      });
++      return;
++    }
++
++    setState(() {
++      _submitting = true;
++      _isError = false;
++      _statusMessage = '';
++    });
++
++    try {
++      final clientId = (await bind.mainGetMyId()).trim();
++      if (clientId.isEmpty) {
++        throw Exception('No se pudo obtener el peer id local');
++      }
++
++      final displayName = _displayNameController.text.trim();
++      await bind.mainSetLocalOption(
++          key: _kHelpdeskServerUrlOption, value: serverUrl);
++      await bind.mainSetLocalOption(
++          key: _kMonitoringDisplayNameOption, value: displayName);
++
++      final uri = Uri.parse('$serverUrl/api/v1/helpdesk/tickets');
++      final resp = await http.post(
++        uri,
++        headers: {'Content-Type': 'application/json'},
++        body: jsonEncode({
++          'client_id': clientId,
++          if (displayName.isNotEmpty) 'client_display_name': displayName,
++          if (_summaryController.text.trim().isNotEmpty)
++            'summary': _summaryController.text.trim(),
++        }),
++      );
++
++      if (resp.statusCode < 200 || resp.statusCode >= 300) {
++        throw Exception(
++            'ticket helpdesk HTTP ${resp.statusCode}: ${resp.body}');
++      }
++
++      final json = jsonDecode(resp.body) as Map<String, dynamic>;
++      final ticket = json['ticket'] as Map<String, dynamic>? ?? {};
++      final ticketId = (ticket['ticket_id'] ?? '').toString();
++      final trackedTicket = HelpdeskTicketSnapshot.fromJson(ticket);
++      await bind.mainSetLocalOption(
++          key: _kHelpdeskLastTicketIdOption, value: ticketId);
++      await bind.mainSetLocalOption(
++          key: _kHelpdeskLastTicketStatusOption, value: trackedTicket.status);
++
++      setState(() {
++        _trackedTicket = trackedTicket;
++        _isError = false;
++        _statusMessage = ticketId.isEmpty
++            ? 'Solicitud enviada'
++            : 'Solicitud enviada. Ticket $ticketId';
++        _summaryController.clear();
++      });
++    } catch (e) {
++      setState(() {
++        _isError = true;
++        _statusMessage = e.toString();
++      });
++    } finally {
++      if (mounted) {
++        setState(() {
++          _submitting = false;
++        });
++      }
++    }
++  }
++
++  @override
++  Widget build(BuildContext context) {
++    return Container(
++      constraints: const BoxConstraints(maxWidth: 600),
++      padding: const EdgeInsets.fromLTRB(20, 16, 20, 16),
++      decoration: BoxDecoration(
++        color: Theme.of(context).cardColor,
++        borderRadius: const BorderRadius.all(Radius.circular(13)),
++        border: Border.all(color: Theme.of(context).dividerColor),
++      ),
++      child: Column(
++        crossAxisAlignment: CrossAxisAlignment.start,
++        children: [
++          Row(
++            children: [
++              const Icon(Icons.support_agent_rounded, size: 18),
++              const SizedBox(width: 8),
++              Text(
++                'Solicitar helpdesk',
++                style: Theme.of(context).textTheme.titleMedium,
++              ),
++            ],
++          ),
++          const SizedBox(height: 12),
++          TextField(
++            controller: _serverUrlController,
++            decoration: const InputDecoration(
++              isDense: true,
++              labelText: 'Backend URL',
++              hintText: 'https://tu-backend-helpdesk',
++            ),
++          ),
++          const SizedBox(height: 10),
++          TextField(
++            controller: _displayNameController,
++            decoration: const InputDecoration(
++              isDense: true,
++              labelText: 'Nombre visible',
++            ),
++          ),
++          const SizedBox(height: 10),
++          TextField(
++            controller: _summaryController,
++            maxLines: 2,
++            decoration: const InputDecoration(
++              isDense: true,
++              labelText: 'Describe el problema',
++              hintText: 'Sin red, impresora, acceso, etc.',
++            ),
++          ),
++          const SizedBox(height: 12),
++          Wrap(
++            spacing: 8,
++            runSpacing: 8,
++            crossAxisAlignment: WrapCrossAlignment.center,
++            children: [
++              ElevatedButton(
++                onPressed: _submitting ? null : _submitHelpdeskRequest,
++                child: Text(_submitting ? 'Enviando...' : 'Solicitar helpdesk'),
++              ),
++              FutureBuilder<String>(
++                future: _peerIdFuture,
++                builder: (context, snapshot) {
++                  final peerId = (snapshot.data ?? '').trim();
++                  if (peerId.isEmpty) {
++                    return const SizedBox.shrink();
++                  }
++                  return Text('Peer ID local: $peerId');
++                },
++              ),
++              if (_trackedTicket != null)
++                OutlinedButton(
++                  onPressed: _polling
++                      ? null
++                      : () => _refreshTrackedTicket(force: true),
++                  child:
++                      Text(_polling ? 'Actualizando...' : 'Actualizar estado'),
++                ),
++            ],
++          ),
++          if (_trackedTicket != null) ...[
++            const SizedBox(height: 12),
++            Container(
++              width: double.infinity,
++              padding: const EdgeInsets.all(12),
++              decoration: BoxDecoration(
++                color: Theme.of(context).scaffoldBackgroundColor,
++                borderRadius: BorderRadius.circular(10),
++              ),
++              child: Column(
++                crossAxisAlignment: CrossAxisAlignment.start,
++                children: [
++                  Text(
++                    'Estado de tu solicitud',
++                    style: Theme.of(context).textTheme.titleSmall,
++                  ),
++                  const SizedBox(height: 6),
++                  Text('Ticket: ${_trackedTicket!.ticketId}'),
++                  Text(
++                    _statusLabel(_trackedTicket!.status),
++                    style: TextStyle(
++                      color: _statusColor(context, _trackedTicket!.status),
++                      fontWeight: FontWeight.w700,
++                    ),
++                  ),
++                  if ((_trackedTicket!.summary ?? '').trim().isNotEmpty)
++                    Text('Resumen: ${_trackedTicket!.summary}'),
++                  if ((_trackedTicket!.assignedAgentId ?? '').trim().isNotEmpty)
++                    Text('Operador: ${_trackedTicket!.assignedAgentId}'),
++                ],
++              ),
++            ),
++          ],
++          if (_statusMessage.isNotEmpty) ...[
++            const SizedBox(height: 10),
++            Text(
++              _statusMessage,
++              style: TextStyle(
++                color: _isError ? Colors.redAccent : Colors.green,
++                fontSize: 12,
++                fontWeight: FontWeight.w600,
++              ),
++            ),
++          ],
++        ],
++      ),
++    );
++  }
++}
++
++class HelpdeskTicketSnapshot {
++  final String ticketId;
++  final String status;
++  final String? summary;
++  final String? assignedAgentId;
++
++  HelpdeskTicketSnapshot({
++    required this.ticketId,
++    required this.status,
++    this.summary,
++    this.assignedAgentId,
++  });
++
++  factory HelpdeskTicketSnapshot.fromJson(Map<String, dynamic> json) {
++    return HelpdeskTicketSnapshot(
++      ticketId: (json['ticket_id'] ?? '').toString(),
++      status: (json['status'] ?? '').toString(),
++      summary: json['summary']?.toString(),
++      assignedAgentId: json['assigned_agent_id']?.toString(),
++    );
++  }
++}
+diff --git a/flutter/lib/desktop/pages/server_page.dart b/flutter/lib/desktop/pages/server_page.dart
+index 4ee29756f..c04464b9e 100644
+--- a/flutter/lib/desktop/pages/server_page.dart
++++ b/flutter/lib/desktop/pages/server_page.dart
+@@ -172,16 +172,9 @@ class ConnectionManagerState extends State<ConnectionManager>
+       }
+     }
+ 
+-    return serverModel.clients.isEmpty
+-        ? Column(
+-            children: [
+-              buildTitleBar(),
+-              Expanded(
+-                child: Center(
+-                  child: Text(translate("Waiting")),
+-                ),
+-              ),
+-            ],
++    final body = serverModel.clients.isEmpty
++        ? Center(
++            child: Text(translate("Waiting")),
+           )
+         : Listener(
+             onPointerDown: pointerHandler,
+@@ -195,7 +188,7 @@ class ConnectionManagerState extends State<ConnectionManager>
+               controller: serverModel.tabController,
+               selectedBorderColor: MyTheme.accent,
+               maxLabelWidth: 100,
+-              tail: null, //buildScrollJumper(),
++              tail: null,
+               tabBuilder: (key, icon, label, themeConf) {
+                 final client = serverModel.clients
+                     .firstWhereOrNull((client) => client.id.toString() == key);
+@@ -204,7 +197,7 @@ class ConnectionManagerState extends State<ConnectionManager>
+                   children: [
+                     Tooltip(
+                         message: key,
+-                        waitDuration: Duration(seconds: 1),
++                        waitDuration: const Duration(seconds: 1),
+                         child: label),
+                     unreadMessageCountBuilder(client?.unreadChatMessageCount)
+                         .marginOnly(left: 4),
+@@ -263,6 +256,14 @@ class ConnectionManagerState extends State<ConnectionManager>
+               ),
+             ),
+           );
++
++    return Column(
++      children: [
++        buildTitleBar(),
++        const _HelpdeskOperatorPanel(),
++        Expanded(child: body),
++      ],
++    );
+   }
+ 
+   Widget buildSidePage() {
+@@ -345,6 +346,257 @@ class ConnectionManagerState extends State<ConnectionManager>
+   }
+ }
+ 
++class _HelpdeskOperatorPanel extends StatefulWidget {
++  const _HelpdeskOperatorPanel();
++
++  @override
++  State<_HelpdeskOperatorPanel> createState() => _HelpdeskOperatorPanelState();
++}
++
++class _HelpdeskOperatorPanelState extends State<_HelpdeskOperatorPanel> {
++  late final TextEditingController _serverUrlController;
++  late final TextEditingController _displayNameController;
++
++  @override
++  void initState() {
++    super.initState();
++    final model = gFFI.serverModel;
++    _serverUrlController = TextEditingController(text: model.helpdeskServerUrl);
++    _displayNameController =
++        TextEditingController(text: model.helpdeskAgentDisplayName);
++  }
++
++  @override
++  void dispose() {
++    _serverUrlController.dispose();
++    _displayNameController.dispose();
++    super.dispose();
++  }
++
++  Future<void> _runAction(Future<void> Function() action) async {
++    try {
++      await action();
++    } catch (e) {
++      if (!mounted) return;
++      showToast(e.toString());
++    }
++  }
++
++  @override
++  Widget build(BuildContext context) {
++    return Consumer<ServerModel>(builder: (context, serverModel, child) {
++      if (_serverUrlController.text != serverModel.helpdeskServerUrl) {
++        _serverUrlController.text = serverModel.helpdeskServerUrl;
++      }
++      if (_displayNameController.text != serverModel.helpdeskAgentDisplayName) {
++        _displayNameController.text = serverModel.helpdeskAgentDisplayName;
++      }
++
++      final assignment = serverModel.helpdeskAssignment;
++      final openingCountdown = serverModel.helpdeskOpeningCountdownSeconds;
++      final statusColor = switch (serverModel.helpdeskRemoteStatus) {
++        'available' => Colors.green,
++        'opening' => Colors.orange,
++        'busy' => Colors.redAccent,
++        'away' => Colors.blueGrey,
++        _ => Colors.grey,
++      };
++
++      return Container(
++        width: double.infinity,
++        padding: const EdgeInsets.fromLTRB(12, 8, 12, 10),
++        decoration: BoxDecoration(
++          color: Theme.of(context).cardColor,
++          border: Border(
++            bottom: BorderSide(color: MyTheme.color(context).border!),
++          ),
++        ),
++        child: Column(
++          crossAxisAlignment: CrossAxisAlignment.start,
++          children: [
++            Row(
++              children: [
++                const Icon(Icons.support_agent_rounded, size: 18),
++                const SizedBox(width: 8),
++                Text(
++                  'Modo Helpdesk',
++                  style: Theme.of(context).textTheme.titleMedium,
++                ),
++                const SizedBox(width: 12),
++                Container(
++                  padding:
++                      const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
++                  decoration: BoxDecoration(
++                    color: statusColor.withOpacity(0.14),
++                    borderRadius: BorderRadius.circular(999),
++                  ),
++                  child: Text(
++                    serverModel.helpdeskRemoteStatus.isEmpty
++                        ? 'offline'
++                        : serverModel.helpdeskRemoteStatus,
++                    style: TextStyle(
++                      color: statusColor,
++                      fontWeight: FontWeight.w600,
++                      fontSize: 12,
++                    ),
++                  ),
++                ),
++                const Spacer(),
++                Switch(
++                  value: serverModel.helpdeskAvailable,
++                  onChanged: serverModel.helpdeskSyncInFlight
++                      ? null
++                      : (value) => _runAction(
++                          () => serverModel.setHelpdeskAvailability(value)),
++                ),
++                Text(serverModel.helpdeskAvailable ? 'Disponible' : 'Ausente'),
++              ],
++            ),
++            const SizedBox(height: 8),
++            Row(
++              children: [
++                Expanded(
++                  child: TextField(
++                    controller: _serverUrlController,
++                    decoration: const InputDecoration(
++                      isDense: true,
++                      labelText: 'Backend URL',
++                      hintText: 'http://127.0.0.1:8080',
++                    ),
++                    onSubmitted: (value) => _runAction(
++                        () => serverModel.setHelpdeskServerUrl(value)),
++                  ),
++                ),
++                const SizedBox(width: 8),
++                SizedBox(
++                  width: 200,
++                  child: TextField(
++                    controller: _displayNameController,
++                    decoration: const InputDecoration(
++                      isDense: true,
++                      labelText: 'Nombre operador',
++                    ),
++                    onSubmitted: (value) => _runAction(
++                        () => serverModel.setHelpdeskAgentDisplayName(value)),
++                  ),
++                ),
++                const SizedBox(width: 8),
++                OutlinedButton(
++                  onPressed: serverModel.helpdeskSyncInFlight
++                      ? null
++                      : () => _runAction(() async {
++                            await serverModel.setHelpdeskServerUrl(
++                                _serverUrlController.text);
++                            await serverModel.setHelpdeskAgentDisplayName(
++                                _displayNameController.text);
++                            await serverModel.refreshHelpdeskOperatorState(
++                                force: true);
++                          }),
++                  child: const Text('Aplicar'),
++                ),
++              ],
++            ),
++            const SizedBox(height: 6),
++            Wrap(
++              spacing: 12,
++              runSpacing: 4,
++              children: [
++                Text('Agent ID: ${serverModel.helpdeskAgentId}'),
++                Text(
++                  serverModel.helpdeskLastHeartbeatAt == null
++                      ? 'Sin heartbeat'
++                      : 'Heartbeat: ${serverModel.helpdeskLastHeartbeatAt!.toLocal().toString().substring(0, 19)}',
++                ),
++                if (serverModel.helpdeskSyncInFlight)
++                  const Text('Sincronizando...'),
++              ],
++            ),
++            if (serverModel.helpdeskLastError.trim().isNotEmpty) ...[
++              const SizedBox(height: 6),
++              Text(
++                serverModel.helpdeskLastError,
++                style: const TextStyle(color: Colors.redAccent, fontSize: 12),
++              ),
++            ],
++            if (assignment != null) ...[
++              const SizedBox(height: 8),
++              Container(
++                width: double.infinity,
++                padding: const EdgeInsets.all(10),
++                decoration: BoxDecoration(
++                  color: Theme.of(context).scaffoldBackgroundColor,
++                  borderRadius: BorderRadius.circular(10),
++                ),
++                child: Column(
++                  crossAxisAlignment: CrossAxisAlignment.start,
++                  children: [
++                    Text(
++                      'Asignacion activa',
++                      style: Theme.of(context).textTheme.titleSmall,
++                    ),
++                    const SizedBox(height: 4),
++                    Text(
++                        'Ticket: ${assignment.ticket.ticketId} | Cliente: ${assignment.ticket.clientDisplayName?.isNotEmpty == true ? assignment.ticket.clientDisplayName : assignment.ticket.clientId}'),
++                    if ((assignment.ticket.summary ?? '').trim().isNotEmpty)
++                      Text('Resumen: ${assignment.ticket.summary}'),
++                    Text('Estado ticket: ${assignment.ticket.status}'),
++                    if (assignment.ticket.remotePeerId.isNotEmpty)
++                      Text('Peer remoto: ${assignment.ticket.remotePeerId}'),
++                    if (assignment.ticket.status == 'opening' &&
++                        openingCountdown != null)
++                      Text(
++                        openingCountdown > 0
++                            ? 'Apertura automatica en ${openingCountdown}s'
++                            : 'Abriendo sesion...',
++                        style: TextStyle(
++                          color: openingCountdown > 0
++                              ? Colors.orangeAccent
++                              : Colors.green,
++                          fontWeight: FontWeight.w600,
++                        ),
++                      ),
++                    const SizedBox(height: 8),
++                    Wrap(
++                      spacing: 8,
++                      runSpacing: 8,
++                      children: [
++                        if (assignment.ticket.status == 'opening')
++                          ElevatedButton(
++                            onPressed: () => _runAction(
++                                () => serverModel.startHelpdeskAssignment()),
++                            child: const Text('Iniciar atencion'),
++                          ),
++                        if (assignment.ticket.remotePeerId.isNotEmpty)
++                          OutlinedButton(
++                            onPressed: () => _runAction(() =>
++                                serverModel.openHelpdeskAssignmentSession()),
++                            child: const Text('Abrir sesion'),
++                          ),
++                        if (assignment.ticket.status == 'in_progress')
++                          ElevatedButton(
++                            onPressed: () => _runAction(
++                                () => serverModel.resolveHelpdeskAssignment()),
++                            child: const Text('Finalizar'),
++                          ),
++                        if (assignment.ticket.status == 'in_progress')
++                          OutlinedButton(
++                            onPressed: () => _runAction(() => serverModel
++                                .resolveHelpdeskAssignment(goAway: true)),
++                            child: const Text('Finalizar y pausar'),
++                          ),
++                      ],
++                    ),
++                  ],
++                ),
++              ),
++            ],
++          ],
++        ),
++      );
++    });
++  }
++}
++
+ Widget buildConnectionCard(Client client) {
+   return Consumer<ServerModel>(
+     builder: (context, value, child) => Column(
+diff --git a/flutter/lib/models/server_model.dart b/flutter/lib/models/server_model.dart
+index 8ead158ac..8928d279c 100644
+--- a/flutter/lib/models/server_model.dart
++++ b/flutter/lib/models/server_model.dart
+@@ -7,6 +7,7 @@ import 'package:flutter_hbb/main.dart';
+ import 'package:flutter_hbb/mobile/pages/settings_page.dart';
+ import 'package:flutter_hbb/models/chat_model.dart';
+ import 'package:flutter_hbb/models/platform_model.dart';
++import 'package:flutter_hbb/utils/http_service.dart' as http;
+ import 'package:get/get.dart';
+ import 'package:window_manager/window_manager.dart';
+ 
+@@ -22,6 +23,12 @@ const kLoginDialogTag = "LOGIN";
+ const kUseTemporaryPassword = "use-temporary-password";
+ const kUsePermanentPassword = "use-permanent-password";
+ const kUseBothPasswords = "use-both-passwords";
++const kHelpdeskServerUrlOption = "helpdesk-server-url";
++const kHelpdeskAgentDisplayNameOption = "helpdesk-agent-display-name";
++const kHelpdeskAgentAvailableOption = "helpdesk-agent-available";
++const kMonitoringDisplayNameOption = 'monitoring-display-name';
++const kMonitoringServerUrlOption = 'monitoring-server-url';
++const kMonitoringServerLegacyOption = 'monitoring-server';
+ 
+ class ServerModel with ChangeNotifier {
+   bool _isStart = false; // Android MainService status
+@@ -38,6 +45,21 @@ class ServerModel with ChangeNotifier {
+   bool _allowNumericOneTimePassword = false;
+   String _approveMode = "";
+   int _zeroClientLengthCounter = 0;
++  bool _helpdeskConfigLoaded = false;
++  bool _helpdeskAvailable = false;
++  bool _helpdeskSyncInFlight = false;
++  String _helpdeskServerUrl = '';
++  String _helpdeskAgentId = '';
++  String _helpdeskAgentDisplayName = '';
++  String _helpdeskRemoteStatus = 'offline';
++  String _helpdeskLastError = '';
++  DateTime? _helpdeskLastHeartbeatAt;
++  HelpdeskAssignment? _helpdeskAssignment;
++  int _helpdeskLastSyncAtMs = 0;
++  String _helpdeskAutoOpeningTicketId = '';
++  String _helpdeskAutoResolvingTicketId = '';
++  String _helpdeskLastOpenedTicketId = '';
++  String _helpdeskObservedActiveTicketId = '';
+ 
+   late String _emptyIdShow;
+   late final IDTextEditingController _serverId;
+@@ -66,6 +88,43 @@ class ServerModel with ChangeNotifier {
+ 
+   bool get showElevation => _showElevation;
+ 
++  bool get helpdeskConfigLoaded => _helpdeskConfigLoaded;
++
++  bool get helpdeskAvailable => _helpdeskAvailable;
++
++  bool get helpdeskSyncInFlight => _helpdeskSyncInFlight;
++
++  String get helpdeskServerUrl => _helpdeskServerUrl;
++
++  String get helpdeskAgentId => _helpdeskAgentId;
++
++  String get helpdeskAgentDisplayName => _helpdeskAgentDisplayName;
++
++  String get helpdeskRemoteStatus => _helpdeskRemoteStatus;
++
++  String get helpdeskLastError => _helpdeskLastError;
++
++  DateTime? get helpdeskLastHeartbeatAt => _helpdeskLastHeartbeatAt;
++
++  HelpdeskAssignment? get helpdeskAssignment => _helpdeskAssignment;
++
++  int? get helpdeskOpeningCountdownSeconds {
++    final assignment = _helpdeskAssignment;
++    if (assignment == null || assignment.ticket.status != 'opening') {
++      return null;
++    }
++    final deadline = assignment.ticket.openingDeadlineAt;
++    if (deadline == null) {
++      return null;
++    }
++    final remainingMs =
++        deadline.millisecondsSinceEpoch - DateTime.now().millisecondsSinceEpoch;
++    if (remainingMs <= 0) {
++      return 0;
++    }
++    return (remainingMs / 1000).ceil();
++  }
++
+   int get connectStatus => _connectStatus;
+ 
+   String get verificationMethod {
+@@ -176,10 +235,12 @@ class ServerModel with ChangeNotifier {
+       }
+ 
+       updatePasswordModel();
++      await _tickHelpdeskOperator();
+     }
+ 
+     if (!isTest) {
+       Future.delayed(Duration.zero, () async {
++        await _loadHelpdeskConfig();
+         if (await bind.optionSynced()) {
+           await timerCallback();
+         }
+@@ -227,6 +288,326 @@ class ServerModel with ChangeNotifier {
+     notifyListeners();
+   }
+ 
++  Future<void> _loadHelpdeskConfig() async {
++    _helpdeskServerUrl =
++        bind.mainGetLocalOption(key: kHelpdeskServerUrlOption).trim();
++    if (_helpdeskServerUrl.isEmpty) {
++      _helpdeskServerUrl =
++          bind.mainGetEnv(key: 'RUSTDESK_MONITORING_URL').trim();
++    }
++    if (_helpdeskServerUrl.isEmpty) {
++      _helpdeskServerUrl =
++          bind.mainGetLocalOption(key: kMonitoringServerUrlOption).trim();
++    }
++    if (_helpdeskServerUrl.isEmpty) {
++      _helpdeskServerUrl =
++          bind.mainGetLocalOption(key: kMonitoringServerLegacyOption).trim();
++    }
++    if (_helpdeskServerUrl.isEmpty) {
++      _helpdeskServerUrl = 'http://127.0.0.1:8080';
++    }
++
++    final displayName =
++        bind.mainGetLocalOption(key: kHelpdeskAgentDisplayNameOption).trim();
++    final monitoringDisplayName =
++        bind.mainGetLocalOption(key: kMonitoringDisplayNameOption).trim();
++    _helpdeskAgentDisplayName =
++        displayName.isNotEmpty ? displayName : monitoringDisplayName;
++    _helpdeskAvailable =
++        bind.mainGetLocalOption(key: kHelpdeskAgentAvailableOption) == 'Y';
++    _helpdeskAgentId = (await bind.mainGetMyId()).trim();
++    _helpdeskConfigLoaded = true;
++    notifyListeners();
++  }
++
++  Future<void> setHelpdeskServerUrl(String value) async {
++    _helpdeskServerUrl = value.trim();
++    await bind.mainSetLocalOption(
++        key: kHelpdeskServerUrlOption, value: _helpdeskServerUrl);
++    notifyListeners();
++    await refreshHelpdeskOperatorState(force: true);
++  }
++
++  Future<void> setHelpdeskAgentDisplayName(String value) async {
++    _helpdeskAgentDisplayName = value.trim();
++    await bind.mainSetLocalOption(
++        key: kHelpdeskAgentDisplayNameOption, value: _helpdeskAgentDisplayName);
++    notifyListeners();
++    await refreshHelpdeskOperatorState(force: true);
++  }
++
++  Future<void> setHelpdeskAvailability(bool available) async {
++    _helpdeskAvailable = available;
++    await bind.mainSetLocalOption(
++        key: kHelpdeskAgentAvailableOption, value: available ? 'Y' : 'N');
++    notifyListeners();
++    await refreshHelpdeskOperatorState(force: true);
++  }
++
++  Future<void> refreshHelpdeskOperatorState({bool force = false}) async {
++    await _tickHelpdeskOperator(force: force);
++  }
++
++  Future<void> startHelpdeskAssignment() async {
++    final assignment = _helpdeskAssignment;
++    if (assignment == null) return;
++    final serverUrl = _normalizeHelpdeskServerUrl(_helpdeskServerUrl);
++    final uri = Uri.parse(
++        '$serverUrl/api/v1/helpdesk/agents/${Uri.encodeComponent(_helpdeskAgentId)}/assignment/start');
++    final resp = await http.post(
++      uri,
++      headers: {'Content-Type': 'application/json'},
++      body: jsonEncode({'ticket_id': assignment.ticket.ticketId}),
++    );
++    if (resp.statusCode < 200 || resp.statusCode >= 300) {
++      throw Exception(
++          'start helpdesk assignment HTTP ${resp.statusCode}: ${resp.body}');
++    }
++    await refreshHelpdeskOperatorState(force: true);
++  }
++
++  Future<void> resolveHelpdeskAssignment({bool goAway = false}) async {
++    final assignment = _helpdeskAssignment;
++    if (assignment == null) return;
++    final serverUrl = _normalizeHelpdeskServerUrl(_helpdeskServerUrl);
++    final uri = Uri.parse(
++        '$serverUrl/api/v1/helpdesk/tickets/${Uri.encodeComponent(assignment.ticket.ticketId)}/resolve');
++    final resp = await http.post(
++      uri,
++      headers: {'Content-Type': 'application/json'},
++      body: jsonEncode({
++        'agent_id': _helpdeskAgentId,
++        'next_agent_status': goAway ? 'away' : 'available',
++      }),
++    );
++    if (resp.statusCode < 200 || resp.statusCode >= 300) {
++      throw Exception(
++          'resolve helpdesk assignment HTTP ${resp.statusCode}: ${resp.body}');
++    }
++    await refreshHelpdeskOperatorState(force: true);
++  }
++
++  Future<void> openHelpdeskAssignmentSession() async {
++    final assignment = _helpdeskAssignment;
++    if (assignment == null) return;
++    final peerId = assignment.ticket.remotePeerId;
++    if (peerId.isEmpty) {
++      throw Exception('La asignacion no trae peer id remoto utilizable');
++    }
++    final context = Get.context;
++    if (context == null) {
++      throw Exception(
++          'No hay contexto Flutter disponible para abrir la sesion');
++    }
++    _helpdeskLastOpenedTicketId = assignment.ticket.ticketId;
++    await connect(context, peerId);
++  }
++
++  Future<void> _tickHelpdeskOperator({bool force = false}) async {
++    if (!_helpdeskConfigLoaded || _helpdeskSyncInFlight) {
++      return;
++    }
++    final nowMs = DateTime.now().millisecondsSinceEpoch;
++    if (!force && nowMs - _helpdeskLastSyncAtMs < 3000) {
++      return;
++    }
++    _helpdeskLastSyncAtMs = nowMs;
++    _helpdeskSyncInFlight = true;
++    notifyListeners();
++
++    try {
++      final serverUrl = _normalizeHelpdeskServerUrl(_helpdeskServerUrl);
++      if (serverUrl.isEmpty) {
++        _helpdeskLastError = 'Falta URL del backend helpdesk';
++        _helpdeskRemoteStatus = 'offline';
++        return;
++      }
++
++      if (_helpdeskAgentId.isEmpty) {
++        _helpdeskAgentId = (await bind.mainGetMyId()).trim();
++      }
++
++      final desiredStatus = _desiredHelpdeskStatus();
++      final presenceUri =
++          Uri.parse('$serverUrl/api/v1/helpdesk/agents/presence');
++      final presenceResp = await http.post(
++        presenceUri,
++        headers: {'Content-Type': 'application/json'},
++        body: jsonEncode({
++          'agent_id': _helpdeskAgentId,
++          'display_name': _effectiveHelpdeskDisplayName(),
++          'status': desiredStatus,
++        }),
++      );
++
++      if (presenceResp.statusCode < 200 || presenceResp.statusCode >= 300) {
++        throw Exception(
++            'heartbeat helpdesk HTTP ${presenceResp.statusCode}: ${presenceResp.body}');
++      }
++
++      final presenceJson =
++          jsonDecode(presenceResp.body) as Map<String, dynamic>;
++      final agentJson = (presenceJson['agent'] as Map<String, dynamic>? ??
++          <String, dynamic>{});
++      _helpdeskRemoteStatus =
++          (agentJson['status'] ?? desiredStatus).toString().trim();
++      _helpdeskLastHeartbeatAt = DateTime.now();
++
++      final assignmentUri = Uri.parse(
++          '$serverUrl/api/v1/helpdesk/agents/${Uri.encodeComponent(_helpdeskAgentId)}/assignment');
++      final assignmentResp = await http.get(assignmentUri);
++      if (assignmentResp.statusCode < 200 || assignmentResp.statusCode >= 300) {
++        throw Exception(
++            'assignment helpdesk HTTP ${assignmentResp.statusCode}: ${assignmentResp.body}');
++      }
++
++      final assignmentJson =
++          jsonDecode(assignmentResp.body) as Map<String, dynamic>;
++      final assignmentData = assignmentJson['assignment'];
++      if (assignmentData is Map<String, dynamic>) {
++        _helpdeskAssignment = HelpdeskAssignment.fromJson(assignmentData);
++        _helpdeskRemoteStatus = _helpdeskAssignment!.agent.status;
++      } else {
++        _helpdeskAssignment = null;
++      }
++
++      if (_helpdeskAssignment == null) {
++        _helpdeskAutoOpeningTicketId = '';
++        _helpdeskAutoResolvingTicketId = '';
++        _helpdeskObservedActiveTicketId = '';
++      } else {
++        await _syncHelpdeskAssignmentWithSession(serverUrl);
++        await _handleHelpdeskAutoConnect();
++      }
++
++      _helpdeskLastError = '';
++    } catch (e) {
++      _helpdeskLastError = e.toString();
++    } finally {
++      _helpdeskSyncInFlight = false;
++      notifyListeners();
++    }
++  }
++
++  String _normalizeHelpdeskServerUrl(String value) {
++    return value.trim().replaceAll(RegExp(r'\/+$'), '');
++  }
++
++  String _effectiveHelpdeskDisplayName() {
++    if (_helpdeskAgentDisplayName.trim().isNotEmpty) {
++      return _helpdeskAgentDisplayName.trim();
++    }
++    if (_serverId.id.trim().isNotEmpty) {
++      return 'Operador ${_serverId.id.trim()}';
++    }
++    return 'Operador';
++  }
++
++  String _desiredHelpdeskStatus() {
++    final assignment = _helpdeskAssignment;
++    if (assignment != null) {
++      if (assignment.ticket.status == 'opening') {
++        return 'opening';
++      }
++      if (assignment.ticket.status == 'in_progress') {
++        return 'busy';
++      }
++    }
++    return _helpdeskAvailable ? 'available' : 'away';
++  }
++
++  Future<void> _handleHelpdeskAutoConnect() async {
++    final assignment = _helpdeskAssignment;
++    if (assignment == null) {
++      return;
++    }
++    final ticket = assignment.ticket;
++    if (ticket.remotePeerId.isEmpty) {
++      return;
++    }
++    if (ticket.status == 'opening') {
++      final countdown = helpdeskOpeningCountdownSeconds;
++      if (countdown != null && countdown > 0) {
++        return;
++      }
++      if (_helpdeskAutoOpeningTicketId == ticket.ticketId ||
++          _helpdeskLastOpenedTicketId == ticket.ticketId) {
++        return;
++      }
++      _helpdeskAutoOpeningTicketId = ticket.ticketId;
++      try {
++        await openHelpdeskAssignmentSession();
++      } finally {
++        _helpdeskAutoOpeningTicketId = '';
++      }
++      return;
++    }
++    if (ticket.status == 'in_progress' &&
++        _helpdeskAutoOpeningTicketId != ticket.ticketId &&
++        _helpdeskLastOpenedTicketId != ticket.ticketId) {
++      await openHelpdeskAssignmentSession();
++    }
++  }
++
++  Future<void> _syncHelpdeskAssignmentWithSession(String serverUrl) async {
++    final assignment = _helpdeskAssignment;
++    if (assignment == null) {
++      return;
++    }
++    final ticket = assignment.ticket;
++    final peerId = ticket.remotePeerId;
++    if (peerId.isEmpty) {
++      return;
++    }
++
++    final presence = await _getRemoteSessionPresence(serverUrl, peerId);
++    final isSessionActive = presence?.hasActiveParticipants ?? false;
++
++    if (isSessionActive) {
++      _helpdeskObservedActiveTicketId = ticket.ticketId;
++      if (ticket.status == 'opening' &&
++          _helpdeskAutoOpeningTicketId != ticket.ticketId) {
++        _helpdeskAutoOpeningTicketId = ticket.ticketId;
++        try {
++          await startHelpdeskAssignment();
++        } finally {
++          _helpdeskAutoOpeningTicketId = '';
++        }
++      }
++      return;
++    }
++
++    if (ticket.status == 'in_progress' &&
++        _helpdeskObservedActiveTicketId == ticket.ticketId &&
++        _helpdeskAutoResolvingTicketId != ticket.ticketId) {
++      _helpdeskAutoResolvingTicketId = ticket.ticketId;
++      try {
++        await resolveHelpdeskAssignment();
++        _helpdeskObservedActiveTicketId = '';
++      } finally {
++        _helpdeskAutoResolvingTicketId = '';
++      }
++    }
++  }
++
++  Future<SessionPresenceSnapshot?> _getRemoteSessionPresence(
++      String serverUrl, String sessionId) async {
++    final uri = Uri.parse(
++        '$serverUrl/api/v1/sessions/${Uri.encodeComponent(sessionId)}/presence');
++    final resp = await http.get(uri);
++    if (resp.statusCode == 404) {
++      return null;
++    }
++    if (resp.statusCode < 200 || resp.statusCode >= 300) {
++      throw Exception('session presence HTTP ${resp.statusCode}: ${resp.body}');
++    }
++
++    final json = jsonDecode(resp.body) as Map<String, dynamic>;
++    final presenceJson =
++        json['presence'] as Map<String, dynamic>? ?? <String, dynamic>{};
++    return SessionPresenceSnapshot.fromJson(presenceJson);
++  }
++
+   updatePasswordModel() async {
+     var update = false;
+     final temporaryPassword = await bind.mainGetTemporaryPassword();
+@@ -900,6 +1281,114 @@ class Client {
+   }
+ }
+ 
++class HelpdeskAssignment {
++  final HelpdeskTicket ticket;
++  final HelpdeskAgent agent;
++
++  HelpdeskAssignment({required this.ticket, required this.agent});
++
++  factory HelpdeskAssignment.fromJson(Map<String, dynamic> json) {
++    return HelpdeskAssignment(
++      ticket: HelpdeskTicket.fromJson(
++          json['ticket'] as Map<String, dynamic>? ?? <String, dynamic>{}),
++      agent: HelpdeskAgent.fromJson(
++          json['agent'] as Map<String, dynamic>? ?? <String, dynamic>{}),
++    );
++  }
++}
++
++class HelpdeskTicket {
++  final String ticketId;
++  final String clientId;
++  final String? clientDisplayName;
++  final String? summary;
++  final String status;
++  final DateTime? openingDeadlineAt;
++
++  HelpdeskTicket({
++    required this.ticketId,
++    required this.clientId,
++    this.clientDisplayName,
++    this.summary,
++    required this.status,
++    this.openingDeadlineAt,
++  });
++
++  String get remotePeerId => clientId.trim();
++
++  factory HelpdeskTicket.fromJson(Map<String, dynamic> json) {
++    return HelpdeskTicket(
++      ticketId: (json['ticket_id'] ?? '').toString(),
++      clientId: (json['client_id'] ?? '').toString(),
++      clientDisplayName: json['client_display_name']?.toString(),
++      summary: json['summary']?.toString(),
++      status: (json['status'] ?? '').toString(),
++      openingDeadlineAt:
++          DateTime.tryParse((json['opening_deadline_at'] ?? '').toString()),
++    );
++  }
++}
++
++class HelpdeskAgent {
++  final String agentId;
++  final String displayName;
++  final String status;
++
++  HelpdeskAgent({
++    required this.agentId,
++    required this.displayName,
++    required this.status,
++  });
++
++  factory HelpdeskAgent.fromJson(Map<String, dynamic> json) {
++    return HelpdeskAgent(
++      agentId: (json['agent_id'] ?? '').toString(),
++      displayName: (json['display_name'] ?? '').toString(),
++      status: (json['status'] ?? '').toString(),
++    );
++  }
++}
++
++class SessionPresenceSnapshot {
++  final String sessionId;
++  final List<SessionPresenceParticipant> participants;
++
++  SessionPresenceSnapshot({
++    required this.sessionId,
++    required this.participants,
++  });
++
++  bool get hasActiveParticipants => participants.any((p) => p.isActive);
++
++  factory SessionPresenceSnapshot.fromJson(Map<String, dynamic> json) {
++    final rawParticipants = json['participants'] as List<dynamic>? ?? const [];
++    return SessionPresenceSnapshot(
++      sessionId: (json['session_id'] ?? '').toString(),
++      participants: rawParticipants
++          .whereType<Map<String, dynamic>>()
++          .map(SessionPresenceParticipant.fromJson)
++          .toList(),
++    );
++  }
++}
++
++class SessionPresenceParticipant {
++  final String participantId;
++  final bool isActive;
++
++  SessionPresenceParticipant({
++    required this.participantId,
++    required this.isActive,
++  });
++
++  factory SessionPresenceParticipant.fromJson(Map<String, dynamic> json) {
++    return SessionPresenceParticipant(
++      participantId: (json['participant_id'] ?? '').toString(),
++      isActive: json['is_active'] == true,
++    );
++  }
++}
++
+ String getLoginDialogTag(int id) {
+   return kLoginDialogTag + id.toString();
+ }
+diff --git a/flutter/pubspec.lock b/flutter/pubspec.lock
+index c6f8aa1c2..7f63ba85f 100644
+--- a/flutter/pubspec.lock
++++ b/flutter/pubspec.lock
+@@ -1473,7 +1473,7 @@ packages:
+     source: hosted
+     version: "1.1.16"
+   vector_math:
+-    dependency: transitive
++    dependency: "direct main"
+     description:
+       name: vector_math
+       sha256: "80b3257d1492ce4d091729e3a67a60407d227c27241d6927be0130c98e741803"
+diff --git a/libs/scrap/src/common/aom.rs b/libs/scrap/src/common/aom.rs
+index e5093e54b..7c5a486a6 100644
+--- a/libs/scrap/src/common/aom.rs
++++ b/libs/scrap/src/common/aom.rs
+@@ -19,6 +19,114 @@ use hbb_common::{
+ };
+ use std::{ptr, slice};
+ 
++#[repr(C)]
++#[derive(Copy, Clone)]
++struct AomCfgOptions {
++    init_by_cfg_file: u32,
++    super_block_size: u32,
++    max_partition_size: u32,
++    min_partition_size: u32,
++    disable_ab_partition_type: u32,
++    disable_rect_partition_type: u32,
++    disable_1to4_partition_type: u32,
++    disable_flip_idtx: u32,
++    disable_cdef: u32,
++    disable_lr: u32,
++    disable_obmc: u32,
++    disable_warp_motion: u32,
++    disable_global_motion: u32,
++    disable_dist_wtd_comp: u32,
++    disable_diff_wtd_comp: u32,
++    disable_inter_intra_comp: u32,
++    disable_masked_comp: u32,
++    disable_one_sided_comp: u32,
++    disable_palette: u32,
++    disable_intrabc: u32,
++    disable_cfl: u32,
++    disable_smooth_intra: u32,
++    disable_filter_intra: u32,
++    disable_dual_filter: u32,
++    disable_intra_angle_delta: u32,
++    disable_intra_edge_filter: u32,
++    disable_tx_64x64: u32,
++    disable_smooth_inter_intra: u32,
++    disable_inter_inter_wedge: u32,
++    disable_inter_intra_wedge: u32,
++    disable_paeth_intra: u32,
++    disable_trellis_quant: u32,
++    disable_ref_frame_mv: u32,
++    reduced_reference_set: u32,
++    reduced_tx_type_set: u32,
++}
++
++#[repr(C)]
++#[derive(Copy, Clone)]
++struct AomCodecEncCfg {
++    g_usage: u32,
++    g_threads: u32,
++    g_profile: u32,
++    g_w: u32,
++    g_h: u32,
++    g_limit: u32,
++    g_forced_max_frame_width: u32,
++    g_forced_max_frame_height: u32,
++    g_bit_depth: aom_bit_depth_t,
++    g_input_bit_depth: u32,
++    g_timebase: aom_rational_t,
++    g_error_resilient: aom_codec_er_flags_t,
++    g_pass: aom_enc_pass,
++    g_lag_in_frames: u32,
++    rc_dropframe_thresh: u32,
++    rc_resize_mode: u32,
++    rc_resize_denominator: u32,
++    rc_resize_kf_denominator: u32,
++    rc_superres_mode: aom_superres_mode,
++    rc_superres_denominator: u32,
++    rc_superres_kf_denominator: u32,
++    rc_superres_qthresh: u32,
++    rc_superres_kf_qthresh: u32,
++    rc_end_usage: aom_rc_mode,
++    rc_twopass_stats_in: aom_fixed_buf_t,
++    rc_firstpass_mb_stats_in: aom_fixed_buf_t,
++    rc_target_bitrate: u32,
++    rc_min_quantizer: u32,
++    rc_max_quantizer: u32,
++    rc_undershoot_pct: u32,
++    rc_overshoot_pct: u32,
++    rc_buf_sz: u32,
++    rc_buf_initial_sz: u32,
++    rc_buf_optimal_sz: u32,
++    rc_2pass_vbr_bias_pct: u32,
++    rc_2pass_vbr_minsection_pct: u32,
++    rc_2pass_vbr_maxsection_pct: u32,
++    fwd_kf_enabled: i32,
++    kf_mode: aom_kf_mode,
++    kf_min_dist: u32,
++    kf_max_dist: u32,
++    sframe_dist: u32,
++    sframe_mode: u32,
++    large_scale_tile: u32,
++    monochrome: u32,
++    full_still_picture_hdr: u32,
++    save_as_annexb: u32,
++    tile_width_count: i32,
++    tile_height_count: i32,
++    tile_widths: [i32; 64],
++    tile_heights: [i32; 64],
++    use_fixed_qp_offsets: u32,
++    fixed_qp_offsets: [i32; 5],
++    encoder_cfg: AomCfgOptions,
++}
++
++#[repr(C)]
++#[derive(Copy, Clone)]
++struct AomCodecDecCfg {
++    threads: u32,
++    w: u32,
++    h: u32,
++    allow_lowbitdepth: u32,
++}
++
+ generate_call_macro!(call_aom, false);
+ generate_call_macro!(call_aom_allow_err, true);
+ generate_call_ptr_macro!(call_aom_ptr);
+@@ -93,9 +201,13 @@ mod webrtc {
+         i: *const aom_codec_iface,
+         cfg: AomEncoderConfig,
+         i444: bool,
+-    ) -> ResultType<aom_codec_enc_cfg> {
+-        let mut c = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
+-        call_aom!(aom_codec_enc_config_default(i, &mut c, kUsageProfile));
++    ) -> ResultType<AomCodecEncCfg> {
++        let mut c: AomCodecEncCfg = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
++        call_aom!(aom_codec_enc_config_default(
++            i,
++            &mut c as *mut _ as *mut aom_codec_enc_cfg_t,
++            kUsageProfile
++        ));
+ 
+         // Overwrite default config with input encoder settings & RTC-relevant values.
+         c.g_w = cfg.width;
+@@ -132,7 +244,7 @@ mod webrtc {
+         Ok(c)
+     }
+ 
+-    pub fn set_controls(ctx: *mut aom_codec_ctx_t, cfg: &aom_codec_enc_cfg) -> ResultType<()> {
++    pub fn set_controls(ctx: *mut aom_codec_ctx_t, cfg: &AomCodecEncCfg) -> ResultType<()> {
+         use aom_tune_content::*;
+         use aome_enc_control_id::*;
+         macro_rules! call_ctl {
+@@ -215,7 +327,7 @@ impl EncoderApi for AomEncoder {
+                 call_aom!(aom_codec_enc_init_ver(
+                     &mut ctx,
+                     i,
+-                    &c,
++                    &c as *const _ as *const aom_codec_enc_cfg_t,
+                     flags,
+                     AOM_ENCODER_ABI_VERSION as _
+                 ));
+@@ -257,17 +369,20 @@ impl EncoderApi for AomEncoder {
+     }
+ 
+     fn set_quality(&mut self, ratio: f32) -> ResultType<()> {
+-        let mut c = unsafe { *self.ctx.config.enc.to_owned() };
++        let mut c = unsafe { *(self.ctx.config.enc as *const AomCodecEncCfg) };
+         let (q_min, q_max) = Self::calc_q_values(ratio);
+         c.rc_min_quantizer = q_min;
+         c.rc_max_quantizer = q_max;
+         c.rc_target_bitrate = Self::bitrate(self.width as _, self.height as _, ratio);
+-        call_aom!(aom_codec_enc_config_set(&mut self.ctx, &c));
++        call_aom!(aom_codec_enc_config_set(
++            &mut self.ctx,
++            &c as *const _ as *const aom_codec_enc_cfg_t
++        ));
+         Ok(())
+     }
+ 
+     fn bitrate(&self) -> u32 {
+-        let c = unsafe { *self.ctx.config.enc.to_owned() };
++        let c = unsafe { *(self.ctx.config.enc as *const AomCodecEncCfg) };
+         c.rc_target_bitrate
+     }
+ 
+@@ -445,7 +560,7 @@ impl AomDecoder {
+     pub fn new() -> Result<Self> {
+         let i = call_aom_ptr!(aom_codec_av1_dx());
+         let mut ctx = Default::default();
+-        let cfg = aom_codec_dec_cfg_t {
++        let cfg = AomCodecDecCfg {
+             threads: codec_thread_num(64) as _,
+             w: 0,
+             h: 0,
+@@ -454,7 +569,7 @@ impl AomDecoder {
+         call_aom!(aom_codec_dec_init_ver(
+             &mut ctx,
+             i,
+-            &cfg,
++            &cfg as *const _ as *const aom_codec_dec_cfg_t,
+             0,
+             AOM_DECODER_ABI_VERSION as _,
+         ));
+diff --git a/libs/scrap/src/common/vpxcodec.rs b/libs/scrap/src/common/vpxcodec.rs
+index f41dfb134..a37fb2016 100644
+--- a/libs/scrap/src/common/vpxcodec.rs
++++ b/libs/scrap/src/common/vpxcodec.rs
+@@ -17,6 +17,80 @@ use hbb_common::bytes::Bytes;
+ use std::os::raw::{c_int, c_uint};
+ use std::{ptr, slice};
+ 
++#[repr(C)]
++#[derive(Copy, Clone)]
++struct VpxCodecEncCfg {
++    g_usage: c_uint,
++    g_threads: c_uint,
++    g_profile: c_uint,
++    g_w: c_uint,
++    g_h: c_uint,
++    g_bit_depth: vpx_bit_depth_t,
++    g_input_bit_depth: c_uint,
++    g_timebase: vpx_rational_t,
++    g_error_resilient: vpx_codec_er_flags_t,
++    g_pass: vpx_enc_pass,
++    g_lag_in_frames: c_uint,
++    rc_dropframe_thresh: c_uint,
++    rc_resize_allowed: c_uint,
++    rc_scaled_width: c_uint,
++    rc_scaled_height: c_uint,
++    rc_resize_up_thresh: c_uint,
++    rc_resize_down_thresh: c_uint,
++    rc_end_usage: vpx_rc_mode,
++    rc_twopass_stats_in: vpx_fixed_buf_t,
++    rc_firstpass_mb_stats_in: vpx_fixed_buf_t,
++    rc_target_bitrate: c_uint,
++    rc_min_quantizer: c_uint,
++    rc_max_quantizer: c_uint,
++    rc_undershoot_pct: c_uint,
++    rc_overshoot_pct: c_uint,
++    rc_buf_sz: c_uint,
++    rc_buf_initial_sz: c_uint,
++    rc_buf_optimal_sz: c_uint,
++    rc_2pass_vbr_bias_pct: c_uint,
++    rc_2pass_vbr_minsection_pct: c_uint,
++    rc_2pass_vbr_maxsection_pct: c_uint,
++    rc_2pass_vbr_corpus_complexity: c_uint,
++    kf_mode: vpx_kf_mode,
++    kf_min_dist: c_uint,
++    kf_max_dist: c_uint,
++    ss_number_layers: c_uint,
++    ss_enable_auto_alt_ref: [c_int; 5],
++    ss_target_bitrate: [c_uint; 5],
++    ts_number_layers: c_uint,
++    ts_target_bitrate: [c_uint; 5],
++    ts_rate_decimator: [c_uint; 5],
++    ts_periodicity: c_uint,
++    ts_layer_id: [c_uint; 16],
++    layer_target_bitrate: [c_uint; 12],
++    temporal_layering_mode: c_int,
++    use_vizier_rc_params: c_int,
++    active_wq_factor: vpx_rational_t,
++    err_per_mb_factor: vpx_rational_t,
++    sr_default_decay_limit: vpx_rational_t,
++    sr_diff_factor: vpx_rational_t,
++    kf_err_per_mb_factor: vpx_rational_t,
++    kf_frame_min_boost_factor: vpx_rational_t,
++    kf_frame_max_boost_first_factor: vpx_rational_t,
++    kf_frame_max_boost_subs_factor: vpx_rational_t,
++    kf_max_total_boost_factor: vpx_rational_t,
++    gf_max_total_boost_factor: vpx_rational_t,
++    gf_frame_max_boost_factor: vpx_rational_t,
++    zm_factor: vpx_rational_t,
++    rd_mult_inter_qp_fac: vpx_rational_t,
++    rd_mult_arf_qp_fac: vpx_rational_t,
++    rd_mult_key_qp_fac: vpx_rational_t,
++}
++
++#[repr(C)]
++#[derive(Copy, Clone)]
++struct VpxCodecDecCfg {
++    threads: c_uint,
++    w: c_uint,
++    h: c_uint,
++}
++
+ generate_call_macro!(call_vpx, false);
+ generate_call_ptr_macro!(call_vpx_ptr);
+ 
+@@ -56,8 +130,12 @@ impl EncoderApi for VpxEncoder {
+                     VpxVideoCodecId::VP8 => call_vpx_ptr!(vpx_codec_vp8_cx()),
+                     VpxVideoCodecId::VP9 => call_vpx_ptr!(vpx_codec_vp9_cx()),
+                 };
+-                let mut c = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
+-                call_vpx!(vpx_codec_enc_config_default(i, &mut c, 0));
++                let mut c: VpxCodecEncCfg = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
++                call_vpx!(vpx_codec_enc_config_default(
++                    i,
++                    &mut c as *mut _ as *mut vpx_codec_enc_cfg_t,
++                    0
++                ));
+ 
+                 // https://www.webmproject.org/docs/encoder-parameters/
+                 // default: c.rc_min_quantizer = 0, c.rc_max_quantizer = 63
+@@ -108,7 +186,7 @@ impl EncoderApi for VpxEncoder {
+                 call_vpx!(vpx_codec_enc_init_ver(
+                     &mut ctx,
+                     i,
+-                    &c,
++                    &c as *const _ as *const vpx_codec_enc_cfg_t,
+                     0,
+                     VPX_ENCODER_ABI_VERSION as _
+                 ));
+@@ -201,17 +279,20 @@ impl EncoderApi for VpxEncoder {
+     }
+ 
+     fn set_quality(&mut self, ratio: f32) -> ResultType<()> {
+-        let mut c = unsafe { *self.ctx.config.enc.to_owned() };
++        let mut c = unsafe { *(self.ctx.config.enc as *const VpxCodecEncCfg) };
+         let (q_min, q_max) = Self::calc_q_values(ratio);
+         c.rc_min_quantizer = q_min;
+         c.rc_max_quantizer = q_max;
+         c.rc_target_bitrate = Self::bitrate(self.width as _, self.height as _, ratio);
+-        call_vpx!(vpx_codec_enc_config_set(&mut self.ctx, &c));
++        call_vpx!(vpx_codec_enc_config_set(
++            &mut self.ctx,
++            &c as *const _ as *const vpx_codec_enc_cfg_t
++        ));
+         Ok(())
+     }
+ 
+     fn bitrate(&self) -> u32 {
+-        let c = unsafe { *self.ctx.config.enc.to_owned() };
++        let c = unsafe { *(self.ctx.config.enc as *const VpxCodecEncCfg) };
+         c.rc_target_bitrate
+     }
+ 
+@@ -448,7 +529,7 @@ impl VpxDecoder {
+             VpxVideoCodecId::VP9 => call_vpx_ptr!(vpx_codec_vp9_dx()),
+         };
+         let mut ctx = Default::default();
+-        let cfg = vpx_codec_dec_cfg_t {
++        let cfg = VpxCodecDecCfg {
+             threads: codec_thread_num(64) as _,
+             w: 0,
+             h: 0,
+@@ -461,7 +542,7 @@ impl VpxDecoder {
+         call_vpx!(vpx_codec_dec_init_ver(
+             &mut ctx,
+             i,
+-            &cfg,
++            &cfg as *const _ as *const vpx_codec_dec_cfg_t,
+             0,
+             VPX_DECODER_ABI_VERSION as _,
+         ));
+diff --git a/res/vcpkg/aom/portfile.cmake b/res/vcpkg/aom/portfile.cmake
+index f7b1e3c43..986fa5301 100644
+--- a/res/vcpkg/aom/portfile.cmake
++++ b/res/vcpkg/aom/portfile.cmake
+@@ -32,9 +32,10 @@ else()
+ endif()
+ 
+ set(aom_target_cpu "")
+-if(VCPKG_TARGET_IS_UWP OR (VCPKG_TARGET_IS_WINDOWS AND VCPKG_TARGET_ARCHITECTURE MATCHES "^arm"))
+-    # UWP + aom's assembler files result in weirdness and build failures
+-    # Also, disable assembly on ARM and ARM64 Windows to fix compilation issues.
++if(VCPKG_TARGET_IS_WINDOWS)
++    # The fork's AOM overlay currently trips over the NASM toolchain shipped in
++    # our vcpkg bootstrap. Use the generic CPU path on Windows to avoid the
++    # unsupported assembler optimization check and keep the manifest versions.
+     set(aom_target_cpu "-DAOM_TARGET_CPU=generic")
+ endif()
+ 

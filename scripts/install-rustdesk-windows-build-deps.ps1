@@ -14,6 +14,8 @@ param(
 $ErrorActionPreference = "Stop"
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 . (Join-Path $scriptDir "rustdesk-flutter.ps1")
+$flutterInstallerScript = Join-Path $scriptDir "install-rustdesk-flutter-sdk.ps1"
+$recommendedFlutterVersion = "3.24.5"
 
 function Test-Admin {
   $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -109,11 +111,17 @@ if ($InstallFlutter) {
     $cmd = "& `"$flutterBat`" --suppress-analytics precache --windows"
     Invoke-Step -Description "Preparar Flutter vendorizado para Windows" -Command $cmd
   } else {
-    Write-Warning "No se encontro el SDK vendorizado esperado en tools\\flutter-3.24.5."
-    Write-Warning "El fallback con winget puede instalar una version mas nueva que no coincida con este repo."
-    $cmd = "winget install --id Flutter.Flutter -e --accept-package-agreements --accept-source-agreements"
-    Invoke-Step -Description "Instalar Flutter global (fallback; revisar version)" -Command $cmd -RequiresAdmin -ContinueOnError
-    Write-Host "Si necesitas una version exacta, coloca el SDK correcto en tools\\flutter-3.24.5."
+    if (-not (Test-Path $flutterInstallerScript)) {
+      throw "No se encontro el instalador de Flutter esperado en $flutterInstallerScript"
+    }
+
+    $cmd = "& `"$flutterInstallerScript`" -Version $recommendedFlutterVersion -Execute"
+    Invoke-Step -Description "Descargar Flutter $recommendedFlutterVersion dentro del repo" -Command $cmd
+
+    $downloadedFlutterRoot = Join-Path $repoRoot "tools\flutter-$recommendedFlutterVersion"
+    $flutterBat = Join-Path $downloadedFlutterRoot "bin\flutter.bat"
+    $cmd = "& `"$flutterBat`" --suppress-analytics precache --windows"
+    Invoke-Step -Description "Preparar Flutter $recommendedFlutterVersion para Windows" -Command $cmd
   }
 }
 

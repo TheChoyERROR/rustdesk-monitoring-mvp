@@ -109,6 +109,21 @@ function Get-RustDeskGitCommandDir {
   return $null
 }
 
+function Get-RustDeskWindowsShimDir {
+  param([string]$RepoRoot = "")
+
+  if ([string]::IsNullOrWhiteSpace($RepoRoot)) {
+    $RepoRoot = Split-Path -Parent $PSScriptRoot
+  }
+
+  $shimDir = Join-Path $RepoRoot "scripts\windows-shims"
+  if (Test-Path (Join-Path $shimDir "ver.bat")) {
+    return (Resolve-Path $shimDir).Path
+  }
+
+  return $null
+}
+
 function Add-RustDeskGitSafeDirectory {
   param([Parameter(Mandatory = $true)][string]$Path)
 
@@ -150,8 +165,24 @@ function Use-RustDeskFlutter {
 
   $env:RUSTDESK_FLUTTER_ROOT = $flutterRoot
   $env:FLUTTER_ROOT = $flutterRoot
+  $env:FLUTTER_SUPPRESS_ANALYTICS = "true"
+  $env:CI = "true"
+  if (Test-Path "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools") {
+    $env:RUSTDESK_VS_INSTALL_PATH = "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools"
+  }
+  $localCmakeShim = Join-Path $RepoRoot "scripts\windows-shims\cmake.bat"
+  if (Test-Path $localCmakeShim) {
+    $env:RUSTDESK_CMAKE_PATH = (Resolve-Path $localCmakeShim).Path
+  } elseif (Test-Path "C:\Program Files\CMake\bin\cmake.exe") {
+    $env:RUSTDESK_CMAKE_PATH = "C:\Program Files\CMake\bin\cmake.exe"
+  }
 
   $pathEntries = $env:Path -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+  $shimDir = Get-RustDeskWindowsShimDir -RepoRoot $RepoRoot
+  if (-not [string]::IsNullOrWhiteSpace($shimDir) -and $pathEntries -notcontains $shimDir) {
+    $env:Path = "$shimDir;$env:Path"
+    $pathEntries = $env:Path -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+  }
   if ($pathEntries -notcontains $flutterBin) {
     $env:Path = "$flutterBin;$env:Path"
     $pathEntries = $env:Path -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
