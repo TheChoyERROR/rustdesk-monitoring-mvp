@@ -5,3 +5,8 @@
 **/.DS_Store
 web-dashboard/node_modules/
 web-dashboard/dist/
+
+# Local build artifacts and tools
+artifacts/
+tools/
+rustdesk-fork/
