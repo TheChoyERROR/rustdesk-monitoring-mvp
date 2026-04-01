@@ -1,4 +1,4 @@
-import { Link, Outlet, useNavigate } from 'react-router-dom';
+import { NavLink, Outlet, useNavigate } from 'react-router-dom';
 
 import { useAuth } from '../useAuth';
 
@@ -27,9 +27,21 @@ export default function AppShell() {
       </header>
 
       <nav className="app-nav">
-        <Link to="/">Resumen</Link>
-        <Link to="/helpdesk">Helpdesk</Link>
-        <Link to="/sessions">Sesiones</Link>
+        <NavLink to="/" end className={({ isActive }) => (isActive ? 'nav-link active' : 'nav-link')}>
+          Resumen
+        </NavLink>
+        <NavLink
+          to="/helpdesk"
+          className={({ isActive }) => (isActive ? 'nav-link active' : 'nav-link')}
+        >
+          Helpdesk
+        </NavLink>
+        <NavLink
+          to="/sessions"
+          className={({ isActive }) => (isActive ? 'nav-link active' : 'nav-link')}
+        >
+          Sesiones
+        </NavLink>
       </nav>
 
       <main className="app-main">

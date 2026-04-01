@@ -4,10 +4,13 @@
   --ink: #1f2e2d;
   --ink-soft: #56605f;
   --accent: #0f766e;
+  --accent-strong: #0b5b56;
   --accent-soft: #b9efe8;
+  --accent-ink: #053b37;
   --danger: #b42318;
   --border: #d6d2c8;
   --shadow: 0 14px 28px rgba(20, 40, 42, 0.12);
+  --shadow-soft: 0 24px 56px rgba(13, 36, 37, 0.12);
   font-family: 'IBM Plex Sans', 'Segoe UI', 'Helvetica Neue', sans-serif;
   line-height: 1.4;
 }
@@ -59,9 +62,24 @@ label {
 input,
 select {
   width: 100%;
-  padding: 0.58rem 0.72rem;
+  padding: 0.72rem 0.82rem;
   border: 1px solid var(--border);
-  border-radius: 0.6rem;
+  border-radius: 0.8rem;
+  background: rgba(255, 255, 255, 0.94);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.75);
+  transition:
+    border-color 160ms ease,
+    box-shadow 160ms ease,
+    background-color 160ms ease;
+}
+
+input:focus,
+select:focus {
+  outline: none;
+  border-color: rgba(15, 118, 110, 0.55);
+  box-shadow:
+    0 0 0 4px rgba(15, 118, 110, 0.12),
+    inset 0 1px 0 rgba(255, 255, 255, 0.8);
   background: #fff;
 }
 
@@ -90,7 +108,7 @@ select {
 }
 
 .app-shell {
-  padding: 1rem;
+  padding: 1.25rem 1rem 2rem;
   max-width: 1320px;
   margin: 0 auto;
 }
@@ -101,6 +119,12 @@ select {
   align-items: end;
   gap: 1rem;
   margin-bottom: 1rem;
+  padding: 1.15rem 1.2rem;
+  border: 1px solid rgba(214, 210, 200, 0.72);
+  border-radius: 1.25rem;
+  background: linear-gradient(135deg, rgba(255, 253, 248, 0.9) 0%, rgba(241, 250, 248, 0.78) 100%);
+  box-shadow: var(--shadow-soft);
+  backdrop-filter: blur(10px);
 }
 
 .app-header h1 {
@@ -128,16 +152,36 @@ select {
 
 .app-nav {
   display: flex;
-  gap: 0.8rem;
+  gap: 0.7rem;
   margin-bottom: 1rem;
+  flex-wrap: wrap;
 }
 
-.app-nav a {
-  background: #fff;
-  border: 1px solid var(--border);
+.nav-link {
+  background: rgba(255, 255, 255, 0.82);
+  border: 1px solid rgba(214, 210, 200, 0.9);
   border-radius: 999px;
-  padding: 0.45rem 0.9rem;
+  padding: 0.52rem 0.95rem;
   font-weight: 600;
+  transition:
+    transform 160ms ease,
+    box-shadow 160ms ease,
+    border-color 160ms ease,
+    background-color 160ms ease;
+}
+
+.nav-link:hover {
+  text-decoration: none;
+  transform: translateY(-1px);
+  box-shadow: 0 10px 20px rgba(15, 44, 45, 0.08);
+  border-color: rgba(15, 118, 110, 0.28);
+}
+
+.nav-link.active {
+  background: linear-gradient(135deg, var(--accent-strong) 0%, var(--accent) 100%);
+  border-color: transparent;
+  color: #fff;
+  box-shadow: 0 14px 24px rgba(15, 118, 110, 0.22);
 }
 
 .btn {
@@ -146,6 +190,10 @@ select {
   border-radius: 0.65rem;
   cursor: pointer;
   font-weight: 700;
+  transition:
+    transform 160ms ease,
+    box-shadow 160ms ease,
+    opacity 160ms ease;
 }
 
 .btn:disabled {
@@ -154,14 +202,19 @@ select {
 }
 
 .btn.primary {
-  background: var(--accent);
+  background: linear-gradient(135deg, var(--accent-strong) 0%, var(--accent) 100%);
   color: #fff;
+  box-shadow: 0 16px 28px rgba(15, 118, 110, 0.2);
 }
 
 .btn.secondary {
   border-color: var(--border);
-  background: #fff;
+  background: rgba(255, 255, 255, 0.9);
   color: var(--ink);
+}
+
+.btn:hover:not(:disabled) {
+  transform: translateY(-1px);
 }
 
 .filter-row,
@@ -456,6 +509,131 @@ th {
   color: var(--danger);
 }
 
+.login-layout {
+  width: min(1120px, 100%);
+  display: grid;
+  grid-template-columns: minmax(0, 1.25fr) minmax(340px, 420px);
+  gap: 1.4rem;
+  align-items: stretch;
+}
+
+.login-hero {
+  position: relative;
+  overflow: hidden;
+  padding: 1.6rem;
+  border-radius: 1.5rem;
+  border: 1px solid rgba(214, 210, 200, 0.7);
+  background:
+    radial-gradient(circle at top left, rgba(183, 239, 232, 0.8) 0%, transparent 34%),
+    radial-gradient(circle at right center, rgba(255, 231, 200, 0.7) 0%, transparent 30%),
+    linear-gradient(145deg, rgba(255, 253, 248, 0.96) 0%, rgba(239, 245, 241, 0.92) 100%);
+  box-shadow: var(--shadow-soft);
+  display: grid;
+  align-content: start;
+  gap: 1rem;
+}
+
+.login-hero::after {
+  content: '';
+  position: absolute;
+  inset: auto -10% -24% auto;
+  width: 260px;
+  height: 260px;
+  border-radius: 999px;
+  background: radial-gradient(circle, rgba(15, 118, 110, 0.14) 0%, transparent 68%);
+  pointer-events: none;
+}
+
+.login-badge {
+  display: inline-flex;
+  width: fit-content;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.38rem 0.72rem;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.84);
+  border: 1px solid rgba(15, 118, 110, 0.14);
+  color: var(--accent-ink);
+  font-size: 0.8rem;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+}
+
+.login-hero h1 {
+  max-width: 12ch;
+  font-size: clamp(2rem, 3vw, 3.3rem);
+  line-height: 0.95;
+  letter-spacing: -0.04em;
+}
+
+.login-hero p {
+  max-width: 44rem;
+  color: var(--ink-soft);
+  font-size: 1rem;
+}
+
+.login-hero-grid {
+  display: grid;
+  gap: 0.85rem;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+}
+
+.login-hero-card {
+  display: grid;
+  gap: 0.25rem;
+  padding: 0.95rem 1rem;
+  border-radius: 1rem;
+  background: rgba(255, 255, 255, 0.76);
+  border: 1px solid rgba(214, 210, 200, 0.7);
+  backdrop-filter: blur(10px);
+}
+
+.login-hero-card strong {
+  color: var(--accent-ink);
+}
+
+.login-hero-card span {
+  color: var(--ink-soft);
+  font-size: 0.9rem;
+}
+
+.login-card {
+  display: grid;
+  align-content: center;
+  gap: 1rem;
+  padding: 1.3rem;
+  border-radius: 1.4rem;
+  background: linear-gradient(180deg, rgba(255, 253, 248, 0.96) 0%, rgba(250, 248, 243, 0.95) 100%);
+  box-shadow: var(--shadow-soft);
+}
+
+.login-card-header {
+  display: grid;
+  gap: 0.3rem;
+}
+
+.login-card-header h2 {
+  font-size: 1.55rem;
+}
+
+.login-card-header p {
+  color: var(--ink-soft);
+}
+
+.field-group {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.login-error {
+  margin-top: -0.2rem;
+}
+
+.login-submit {
+  width: 100%;
+  padding: 0.78rem 1rem;
+}
+
 .success-text {
   color: #0f6a46;
 }
@@ -562,6 +740,18 @@ th {
 }
 
 @media (max-width: 720px) {
+  .login-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .login-hero {
+    padding: 1.2rem;
+  }
+
+  .login-hero h1 {
+    max-width: none;
+  }
+
   .app-header {
     align-items: start;
     flex-direction: column;

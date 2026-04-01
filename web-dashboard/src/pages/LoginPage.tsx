@@ -16,7 +16,7 @@ export default function LoginPage() {
   const state = location.state as LocationState | null;
   const redirectTo = state?.from ?? '/';
 
-  const [username, setUsername] = useState('supervisor');
+  const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -46,35 +46,70 @@ export default function LoginPage() {
 
   return (
     <div className="centered-screen">
-      <form className="panel login-panel" onSubmit={onSubmit}>
-        <h1>Ingreso Supervisor</h1>
-        <p>Acceso al panel de monitoreo de sesiones RustDesk.</p>
+      <div className="login-layout">
+        <section className="login-hero">
+          <span className="login-badge">RustDesk Monitoring</span>
+          <h1>Centro de supervision y helpdesk operativo</h1>
+          <p>
+            Accede al tablero para coordinar tickets, agentes autorizados y actividad remota
+            desde una sola vista.
+          </p>
 
-        <label htmlFor="username">Usuario</label>
-        <input
-          id="username"
-          autoComplete="username"
-          value={username}
-          onChange={(event) => setUsername(event.target.value)}
-          required
-        />
+          <div className="login-hero-grid">
+            <article className="login-hero-card">
+              <strong>Helpdesk</strong>
+              <span>Despacho manual, auditoria y control supervisor.</span>
+            </article>
+            <article className="login-hero-card">
+              <strong>Monitoreo</strong>
+              <span>Timeline de sesiones, presencia y eventos en vivo.</span>
+            </article>
+            <article className="login-hero-card">
+              <strong>Operacion</strong>
+              <span>Tickets, agentes y persistencia inicial con Turso.</span>
+            </article>
+          </div>
+        </section>
 
-        <label htmlFor="password">Clave</label>
-        <input
-          id="password"
-          type="password"
-          autoComplete="current-password"
-          value={password}
-          onChange={(event) => setPassword(event.target.value)}
-          required
-        />
+        <form className="panel login-panel login-card" onSubmit={onSubmit}>
+          <div className="login-card-header">
+            <h2>Ingreso supervisor</h2>
+            <p>Usa tu usuario y clave del dashboard.</p>
+          </div>
 
-        {error && <p className="error-text">{error}</p>}
+          <div className="field-group">
+            <label htmlFor="username">Usuario</label>
+            <input
+              id="username"
+              autoComplete="username"
+              value={username}
+              placeholder="supervisor"
+              onChange={(event) => setUsername(event.target.value)}
+              required
+              autoFocus
+            />
+          </div>
 
-        <button type="submit" className="btn primary" disabled={submitting}>
-          {submitting ? 'Ingresando...' : 'Ingresar'}
-        </button>
-      </form>
+          <div className="field-group">
+            <label htmlFor="password">Clave</label>
+            <input
+              id="password"
+              type="password"
+              autoComplete="current-password"
+              value={password}
+              placeholder="Ingresa tu clave"
+              onChange={(event) => setPassword(event.target.value)}
+              required
+            />
+          </div>
+
+          {error && <p className="error-text login-error">{error}</p>}
+
+          <button type="submit" className="btn primary login-submit" disabled={submitting}>
+            {submitting ? 'Ingresando...' : 'Ingresar al panel'}
+          </button>
+        </form>
+      </div>
     </div>
   );
 }
