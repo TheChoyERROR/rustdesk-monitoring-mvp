@@ -45,13 +45,16 @@ use crate::storage::{
     unix_millis_now, upsert_dashboard_user, upsert_helpdesk_agent_presence,
     upsert_helpdesk_authorized_agent, EventQueryFilter, InsertOutcome, OutboxRecord,
 };
-use crate::turso::{initialize_helpdesk_turso_bridge, sync_helpdesk_snapshot_to_turso, TursoSyncConfig};
+use crate::turso::{
+    initialize_helpdesk_turso_bridge, initialize_monitoring_turso_bridge,
+    sync_helpdesk_snapshot_to_turso, sync_monitoring_snapshot_to_turso, TursoSyncConfig,
+};
 use crate::webhook::WebhookDispatcher;
 
 const MAX_SESSION_EVENT_BODY_BYTES: usize = 4 * 1024 * 1024;
 const HELPDESK_RECONCILE_INTERVAL_MS: u64 = 5_000;
 const HELPDESK_AGENT_STALE_AFTER_MS: i64 = 30_000;
-const HELPDESK_TURSO_SYNC_INTERVAL_MS: u64 = 5_000;
+const TURSO_SYNC_INTERVAL_MS: u64 = 5_000;
 
 #[derive(Clone)]
 struct AppState {
@@ -144,8 +147,25 @@ pub async fn run(
             remote_tickets = summary.remote_counts.tickets,
             "helpdesk Turso bridge initialized"
         );
+
+        let monitoring_summary =
+            initialize_monitoring_turso_bridge(&pool, &sync_cfg.url, &sync_cfg.auth_token)
+                .await
+                .context("failed to initialize Turso monitoring bridge")?;
+        info!(
+            mode = monitoring_summary.mode,
+            local_rows = monitoring_summary.local_counts.total_rows(),
+            remote_rows = monitoring_summary.remote_counts.total_rows(),
+            local_session_events = monitoring_summary.local_counts.session_events,
+            remote_session_events = monitoring_summary.remote_counts.session_events,
+            local_presence_rows = monitoring_summary.local_counts.session_presence,
+            remote_presence_rows = monitoring_summary.remote_counts.session_presence,
+            local_outbox_rows = monitoring_summary.local_counts.outbox_events,
+            remote_outbox_rows = monitoring_summary.remote_counts.outbox_events,
+            "monitoring Turso bridge initialized"
+        );
     } else {
-        info!("helpdesk Turso bridge disabled; TURSO_DATABASE_URL/TURSO_AUTH_TOKEN not set");
+        info!("Turso bridges disabled; TURSO_DATABASE_URL/TURSO_AUTH_TOKEN not set");
     }
 
     let metrics = Arc::new(Metrics::default());
@@ -300,7 +320,7 @@ pub async fn run(
     background_jobs.push(tokio::spawn(presence_cleanup_worker(state.clone())));
     background_jobs.push(tokio::spawn(helpdesk_reconcile_worker(state.clone())));
     if state.helpdesk_turso.is_some() {
-        background_jobs.push(tokio::spawn(helpdesk_turso_sync_worker(state.clone())));
+        background_jobs.push(tokio::spawn(turso_sync_worker(state.clone())));
     }
     background_jobs.push(tokio::spawn(cleanup_worker(state.clone())));
 
@@ -1721,12 +1741,12 @@ async fn helpdesk_reconcile_worker(state: AppState) {
     }
 }
 
-async fn helpdesk_turso_sync_worker(state: AppState) {
+async fn turso_sync_worker(state: AppState) {
     let Some(sync_cfg) = state.helpdesk_turso.clone() else {
         return;
     };
 
-    let interval = Duration::from_millis(HELPDESK_TURSO_SYNC_INTERVAL_MS);
+    let interval = Duration::from_millis(TURSO_SYNC_INTERVAL_MS);
 
     loop {
         tokio::time::sleep(interval).await;
@@ -1744,6 +1764,21 @@ async fn helpdesk_turso_sync_worker(state: AppState) {
                 );
             }
             Err(err) => error!(error = %err, "failed to sync helpdesk snapshot to Turso"),
+        }
+
+        match sync_monitoring_snapshot_to_turso(&state.pool, &sync_cfg.url, &sync_cfg.auth_token)
+            .await
+        {
+            Ok(counts) => {
+                debug!(
+                    rows = counts.total_rows(),
+                    session_events = counts.session_events,
+                    session_presence = counts.session_presence,
+                    outbox_events = counts.outbox_events,
+                    "monitoring snapshot synced to Turso"
+                );
+            }
+            Err(err) => error!(error = %err, "failed to sync monitoring snapshot to Turso"),
         }
     }
 }

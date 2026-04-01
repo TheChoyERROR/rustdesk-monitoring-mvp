@@ -60,6 +60,26 @@ pub struct HelpdeskTursoBridgeSummary {
     pub remote_counts: HelpdeskSnapshotCounts,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct MonitoringSnapshotCounts {
+    pub outbox_events: usize,
+    pub session_events: usize,
+    pub session_presence: usize,
+}
+
+impl MonitoringSnapshotCounts {
+    pub fn total_rows(&self) -> usize {
+        self.outbox_events + self.session_events + self.session_presence
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MonitoringTursoBridgeSummary {
+    pub mode: &'static str,
+    pub local_counts: MonitoringSnapshotCounts,
+    pub remote_counts: MonitoringSnapshotCounts,
+}
+
 pub async fn connect_turso_remote(url: &str, auth_token: &str) -> anyhow::Result<Database> {
     Builder::new_remote(url.to_string(), auth_token.to_string())
         .build()
@@ -144,6 +164,68 @@ pub async fn sync_helpdesk_snapshot_to_turso(
         .context("failed to open Turso connection for helpdesk snapshot sync")?;
     init_libsql_schema(&conn).await?;
     apply_helpdesk_snapshot_to_turso(&conn, &snapshot).await?;
+    Ok(snapshot.counts())
+}
+
+pub async fn initialize_monitoring_turso_bridge(
+    pool: &SqlitePool,
+    url: &str,
+    auth_token: &str,
+) -> anyhow::Result<MonitoringTursoBridgeSummary> {
+    init_sqlite_schema(pool).await?;
+
+    let db = connect_turso_remote(url, auth_token).await?;
+    let conn = db
+        .connect()
+        .context("failed to open Turso connection for monitoring bridge bootstrap")?;
+    init_libsql_schema(&conn).await?;
+
+    let local_counts = count_monitoring_rows_sqlite(pool).await?;
+    let remote_snapshot = fetch_monitoring_snapshot_from_turso(&conn).await?;
+    let remote_counts = remote_snapshot.counts();
+
+    if remote_counts.total_rows() > 0 {
+        apply_monitoring_snapshot_to_sqlite(pool, &remote_snapshot).await?;
+        let local_counts = count_monitoring_rows_sqlite(pool).await?;
+        return Ok(MonitoringTursoBridgeSummary {
+            mode: "restored_from_turso",
+            local_counts,
+            remote_counts,
+        });
+    }
+
+    if local_counts.total_rows() > 0 {
+        let local_snapshot = fetch_monitoring_snapshot_from_sqlite(pool).await?;
+        apply_monitoring_snapshot_to_turso(&conn, &local_snapshot).await?;
+        let remote_counts = count_monitoring_rows_turso(&conn).await?;
+        return Ok(MonitoringTursoBridgeSummary {
+            mode: "seeded_turso_from_sqlite",
+            local_counts,
+            remote_counts,
+        });
+    }
+
+    Ok(MonitoringTursoBridgeSummary {
+        mode: "empty",
+        local_counts,
+        remote_counts,
+    })
+}
+
+pub async fn sync_monitoring_snapshot_to_turso(
+    pool: &SqlitePool,
+    url: &str,
+    auth_token: &str,
+) -> anyhow::Result<MonitoringSnapshotCounts> {
+    init_sqlite_schema(pool).await?;
+
+    let snapshot = fetch_monitoring_snapshot_from_sqlite(pool).await?;
+    let db = connect_turso_remote(url, auth_token).await?;
+    let conn = db
+        .connect()
+        .context("failed to open Turso connection for monitoring snapshot sync")?;
+    init_libsql_schema(&conn).await?;
+    apply_monitoring_snapshot_to_turso(&conn, &snapshot).await?;
     Ok(snapshot.counts())
 }
 
@@ -1403,6 +1485,466 @@ async fn fetch_turso_audit_events(conn: &Connection) -> anyhow::Result<Vec<Audit
             event_type: row.get(3)?,
             payload: row.get(4)?,
             created_at: row.get(5)?,
+        });
+    }
+    Ok(values)
+}
+
+#[derive(Debug, Clone, Default)]
+struct MonitoringSnapshot {
+    outbox_events: Vec<OutboxEventRow>,
+    session_events: Vec<SessionEventRow>,
+    session_presence: Vec<SessionPresenceRow>,
+}
+
+impl MonitoringSnapshot {
+    fn counts(&self) -> MonitoringSnapshotCounts {
+        MonitoringSnapshotCounts {
+            outbox_events: self.outbox_events.len(),
+            session_events: self.session_events.len(),
+            session_presence: self.session_presence.len(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct OutboxEventRow {
+    event_id: String,
+    payload: String,
+    status: String,
+    attempts: i64,
+    next_attempt_at: i64,
+    created_at: i64,
+    updated_at: i64,
+    last_error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct SessionEventRow {
+    event_id: String,
+    event_type: String,
+    session_id: String,
+    user_id: String,
+    direction: String,
+    timestamp: String,
+    payload: String,
+    created_at: i64,
+}
+
+#[derive(Debug, Clone)]
+struct SessionPresenceRow {
+    session_id: String,
+    participant_id: String,
+    display_name: String,
+    avatar_url: Option<String>,
+    is_active: i64,
+    is_control_active: i64,
+    last_activity_at: i64,
+    updated_at: i64,
+}
+
+async fn count_monitoring_rows_sqlite(
+    pool: &SqlitePool,
+) -> anyhow::Result<MonitoringSnapshotCounts> {
+    Ok(MonitoringSnapshotCounts {
+        outbox_events: count_sqlite_table(pool, "outbox_events").await?,
+        session_events: count_sqlite_table(pool, "session_events").await?,
+        session_presence: count_sqlite_table(pool, "session_presence").await?,
+    })
+}
+
+async fn count_monitoring_rows_turso(
+    conn: &Connection,
+) -> anyhow::Result<MonitoringSnapshotCounts> {
+    Ok(MonitoringSnapshotCounts {
+        outbox_events: count_turso_table(conn, "outbox_events").await?,
+        session_events: count_turso_table(conn, "session_events").await?,
+        session_presence: count_turso_table(conn, "session_presence").await?,
+    })
+}
+
+async fn fetch_monitoring_snapshot_from_sqlite(
+    pool: &SqlitePool,
+) -> anyhow::Result<MonitoringSnapshot> {
+    Ok(MonitoringSnapshot {
+        outbox_events: fetch_sqlite_outbox_events(pool).await?,
+        session_events: fetch_sqlite_session_events(pool).await?,
+        session_presence: fetch_sqlite_session_presence(pool).await?,
+    })
+}
+
+async fn fetch_monitoring_snapshot_from_turso(
+    conn: &Connection,
+) -> anyhow::Result<MonitoringSnapshot> {
+    Ok(MonitoringSnapshot {
+        outbox_events: fetch_turso_outbox_events(conn).await?,
+        session_events: fetch_turso_session_events(conn).await?,
+        session_presence: fetch_turso_session_presence(conn).await?,
+    })
+}
+
+async fn apply_monitoring_snapshot_to_sqlite(
+    pool: &SqlitePool,
+    snapshot: &MonitoringSnapshot,
+) -> anyhow::Result<()> {
+    init_sqlite_schema(pool).await?;
+    let mut tx = pool
+        .begin()
+        .await
+        .context("failed to open SQLite transaction for monitoring Turso restore")?;
+
+    for table in ["session_presence", "session_events", "outbox_events"] {
+        sqlx::query(&format!("DELETE FROM {table}"))
+            .execute(&mut *tx)
+            .await
+            .with_context(|| {
+                format!("failed to clear SQLite table '{table}' during monitoring restore")
+            })?;
+    }
+
+    for row in &snapshot.outbox_events {
+        sqlx::query(
+            r#"
+            INSERT INTO outbox_events (
+                event_id, payload, status, attempts, next_attempt_at, created_at, updated_at, last_error
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "#,
+        )
+        .bind(&row.event_id)
+        .bind(&row.payload)
+        .bind(&row.status)
+        .bind(row.attempts)
+        .bind(row.next_attempt_at)
+        .bind(row.created_at)
+        .bind(row.updated_at)
+        .bind(&row.last_error)
+        .execute(&mut *tx)
+        .await
+        .with_context(|| format!("failed to restore outbox event '{}' into SQLite", row.event_id))?;
+    }
+
+    for row in &snapshot.session_events {
+        sqlx::query(
+            r#"
+            INSERT INTO session_events (
+                event_id, event_type, session_id, user_id, direction, timestamp, payload, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "#,
+        )
+        .bind(&row.event_id)
+        .bind(&row.event_type)
+        .bind(&row.session_id)
+        .bind(&row.user_id)
+        .bind(&row.direction)
+        .bind(&row.timestamp)
+        .bind(&row.payload)
+        .bind(row.created_at)
+        .execute(&mut *tx)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to restore session event '{}' into SQLite",
+                row.event_id
+            )
+        })?;
+    }
+
+    for row in &snapshot.session_presence {
+        sqlx::query(
+            r#"
+            INSERT INTO session_presence (
+                session_id, participant_id, display_name, avatar_url, is_active,
+                is_control_active, last_activity_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "#,
+        )
+        .bind(&row.session_id)
+        .bind(&row.participant_id)
+        .bind(&row.display_name)
+        .bind(&row.avatar_url)
+        .bind(row.is_active)
+        .bind(row.is_control_active)
+        .bind(row.last_activity_at)
+        .bind(row.updated_at)
+        .execute(&mut *tx)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to restore session presence '{}:{}' into SQLite",
+                row.session_id, row.participant_id
+            )
+        })?;
+    }
+
+    tx.commit()
+        .await
+        .context("failed to commit SQLite monitoring Turso restore transaction")?;
+    Ok(())
+}
+
+async fn apply_monitoring_snapshot_to_turso(
+    conn: &Connection,
+    snapshot: &MonitoringSnapshot,
+) -> anyhow::Result<()> {
+    init_libsql_schema(conn).await?;
+    let tx = conn
+        .transaction()
+        .await
+        .context("failed to open Turso transaction for monitoring sync")?;
+
+    for table in ["session_presence", "session_events", "outbox_events"] {
+        tx.execute(&format!("DELETE FROM {table}"), ())
+            .await
+            .with_context(|| {
+                format!("failed to clear Turso table '{table}' during monitoring sync")
+            })?;
+    }
+
+    for row in &snapshot.outbox_events {
+        tx.execute(
+            r#"
+            INSERT INTO outbox_events (
+                event_id, payload, status, attempts, next_attempt_at, created_at, updated_at, last_error
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "#,
+            (
+                row.event_id.as_str(),
+                row.payload.as_str(),
+                row.status.as_str(),
+                row.attempts,
+                row.next_attempt_at,
+                row.created_at,
+                row.updated_at,
+                row.last_error.as_deref(),
+            ),
+        )
+        .await
+        .with_context(|| format!("failed to sync outbox event '{}' to Turso", row.event_id))?;
+    }
+
+    for row in &snapshot.session_events {
+        tx.execute(
+            r#"
+            INSERT INTO session_events (
+                event_id, event_type, session_id, user_id, direction, timestamp, payload, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "#,
+            (
+                row.event_id.as_str(),
+                row.event_type.as_str(),
+                row.session_id.as_str(),
+                row.user_id.as_str(),
+                row.direction.as_str(),
+                row.timestamp.as_str(),
+                row.payload.as_str(),
+                row.created_at,
+            ),
+        )
+        .await
+        .with_context(|| format!("failed to sync session event '{}' to Turso", row.event_id))?;
+    }
+
+    for row in &snapshot.session_presence {
+        tx.execute(
+            r#"
+            INSERT INTO session_presence (
+                session_id, participant_id, display_name, avatar_url, is_active,
+                is_control_active, last_activity_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "#,
+            (
+                row.session_id.as_str(),
+                row.participant_id.as_str(),
+                row.display_name.as_str(),
+                row.avatar_url.as_deref(),
+                row.is_active,
+                row.is_control_active,
+                row.last_activity_at,
+                row.updated_at,
+            ),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "failed to sync session presence '{}:{}' to Turso",
+                row.session_id, row.participant_id
+            )
+        })?;
+    }
+
+    tx.commit()
+        .await
+        .context("failed to commit Turso monitoring sync transaction")?;
+    Ok(())
+}
+
+async fn fetch_sqlite_outbox_events(pool: &SqlitePool) -> anyhow::Result<Vec<OutboxEventRow>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT event_id, payload, status, attempts, next_attempt_at, created_at, updated_at, last_error
+        FROM outbox_events
+        ORDER BY created_at ASC, event_id ASC
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .context("failed to read SQLite outbox events")?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| OutboxEventRow {
+            event_id: row.get("event_id"),
+            payload: row.get("payload"),
+            status: row.get("status"),
+            attempts: row.get("attempts"),
+            next_attempt_at: row.get("next_attempt_at"),
+            created_at: row.get("created_at"),
+            updated_at: row.get("updated_at"),
+            last_error: row.get("last_error"),
+        })
+        .collect())
+}
+
+async fn fetch_sqlite_session_events(pool: &SqlitePool) -> anyhow::Result<Vec<SessionEventRow>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT event_id, event_type, session_id, user_id, direction, timestamp, payload, created_at
+        FROM session_events
+        ORDER BY created_at ASC, event_id ASC
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .context("failed to read SQLite session events")?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| SessionEventRow {
+            event_id: row.get("event_id"),
+            event_type: row.get("event_type"),
+            session_id: row.get("session_id"),
+            user_id: row.get("user_id"),
+            direction: row.get("direction"),
+            timestamp: row.get("timestamp"),
+            payload: row.get("payload"),
+            created_at: row.get("created_at"),
+        })
+        .collect())
+}
+
+async fn fetch_sqlite_session_presence(
+    pool: &SqlitePool,
+) -> anyhow::Result<Vec<SessionPresenceRow>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT session_id, participant_id, display_name, avatar_url, is_active,
+               is_control_active, last_activity_at, updated_at
+        FROM session_presence
+        ORDER BY session_id ASC, participant_id ASC
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .context("failed to read SQLite session presence")?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| SessionPresenceRow {
+            session_id: row.get("session_id"),
+            participant_id: row.get("participant_id"),
+            display_name: row.get("display_name"),
+            avatar_url: row.get("avatar_url"),
+            is_active: row.get("is_active"),
+            is_control_active: row.get("is_control_active"),
+            last_activity_at: row.get("last_activity_at"),
+            updated_at: row.get("updated_at"),
+        })
+        .collect())
+}
+
+async fn fetch_turso_outbox_events(conn: &Connection) -> anyhow::Result<Vec<OutboxEventRow>> {
+    let mut rows = conn
+        .query(
+            r#"
+            SELECT event_id, payload, status, attempts, next_attempt_at, created_at, updated_at, last_error
+            FROM outbox_events
+            ORDER BY created_at ASC, event_id ASC
+            "#,
+            (),
+        )
+        .await
+        .context("failed to read Turso outbox events")?;
+
+    let mut values = Vec::new();
+    while let Some(row) = rows.next().await? {
+        values.push(OutboxEventRow {
+            event_id: row.get(0)?,
+            payload: row.get(1)?,
+            status: row.get(2)?,
+            attempts: row.get(3)?,
+            next_attempt_at: row.get(4)?,
+            created_at: row.get(5)?,
+            updated_at: row.get(6)?,
+            last_error: row.get(7)?,
+        });
+    }
+    Ok(values)
+}
+
+async fn fetch_turso_session_events(conn: &Connection) -> anyhow::Result<Vec<SessionEventRow>> {
+    let mut rows = conn
+        .query(
+            r#"
+            SELECT event_id, event_type, session_id, user_id, direction, timestamp, payload, created_at
+            FROM session_events
+            ORDER BY created_at ASC, event_id ASC
+            "#,
+            (),
+        )
+        .await
+        .context("failed to read Turso session events")?;
+
+    let mut values = Vec::new();
+    while let Some(row) = rows.next().await? {
+        values.push(SessionEventRow {
+            event_id: row.get(0)?,
+            event_type: row.get(1)?,
+            session_id: row.get(2)?,
+            user_id: row.get(3)?,
+            direction: row.get(4)?,
+            timestamp: row.get(5)?,
+            payload: row.get(6)?,
+            created_at: row.get(7)?,
+        });
+    }
+    Ok(values)
+}
+
+async fn fetch_turso_session_presence(conn: &Connection) -> anyhow::Result<Vec<SessionPresenceRow>> {
+    let mut rows = conn
+        .query(
+            r#"
+            SELECT session_id, participant_id, display_name, avatar_url, is_active,
+                   is_control_active, last_activity_at, updated_at
+            FROM session_presence
+            ORDER BY session_id ASC, participant_id ASC
+            "#,
+            (),
+        )
+        .await
+        .context("failed to read Turso session presence")?;
+
+    let mut values = Vec::new();
+    while let Some(row) = rows.next().await? {
+        values.push(SessionPresenceRow {
+            session_id: row.get(0)?,
+            participant_id: row.get(1)?,
+            display_name: row.get(2)?,
+            avatar_url: row.get(3)?,
+            is_active: row.get(4)?,
+            is_control_active: row.get(5)?,
+            last_activity_at: row.get(6)?,
+            updated_at: row.get(7)?,
         });
     }
     Ok(values)
