@@ -3,6 +3,8 @@ pub mod client;
 pub mod config;
 pub mod metrics;
 pub mod model;
+pub mod schema;
 pub mod server;
 pub mod storage;
+pub mod turso;
 pub mod webhook;

@@ -19,7 +19,7 @@ use serde_json::json;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tower_http::services::{ServeDir, ServeFile};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::auth::{self, AuthSettings, DASHBOARD_SESSION_COOKIE};
 use crate::config::ServerConfig;
@@ -45,15 +45,18 @@ use crate::storage::{
     unix_millis_now, upsert_dashboard_user, upsert_helpdesk_agent_presence,
     upsert_helpdesk_authorized_agent, EventQueryFilter, InsertOutcome, OutboxRecord,
 };
+use crate::turso::{initialize_helpdesk_turso_bridge, sync_helpdesk_snapshot_to_turso, TursoSyncConfig};
 use crate::webhook::WebhookDispatcher;
 
 const MAX_SESSION_EVENT_BODY_BYTES: usize = 4 * 1024 * 1024;
 const HELPDESK_RECONCILE_INTERVAL_MS: u64 = 5_000;
 const HELPDESK_AGENT_STALE_AFTER_MS: i64 = 30_000;
+const HELPDESK_TURSO_SYNC_INTERVAL_MS: u64 = 5_000;
 
 #[derive(Clone)]
 struct AppState {
     pool: sqlx::SqlitePool,
+    helpdesk_turso: Option<TursoSyncConfig>,
     metrics: Arc<Metrics>,
     dispatcher: WebhookDispatcher,
     config: Arc<ServerConfig>,
@@ -128,6 +131,23 @@ pub async fn run(
     .await
     .context("failed to seed dashboard supervisor user")?;
 
+    let helpdesk_turso = TursoSyncConfig::from_env();
+    if let Some(sync_cfg) = helpdesk_turso.as_ref() {
+        let summary = initialize_helpdesk_turso_bridge(&pool, &sync_cfg.url, &sync_cfg.auth_token)
+            .await
+            .context("failed to initialize Turso helpdesk bridge")?;
+        info!(
+            mode = summary.mode,
+            local_rows = summary.local_counts.total_rows(),
+            remote_rows = summary.remote_counts.total_rows(),
+            local_tickets = summary.local_counts.tickets,
+            remote_tickets = summary.remote_counts.tickets,
+            "helpdesk Turso bridge initialized"
+        );
+    } else {
+        info!("helpdesk Turso bridge disabled; TURSO_DATABASE_URL/TURSO_AUTH_TOKEN not set");
+    }
+
     let metrics = Arc::new(Metrics::default());
     let dispatcher = WebhookDispatcher::new(config.webhook.clone())?;
 
@@ -139,6 +159,7 @@ pub async fn run(
 
     let state = AppState {
         pool,
+        helpdesk_turso,
         metrics,
         dispatcher,
         config: Arc::new(config),
@@ -278,6 +299,9 @@ pub async fn run(
 
     background_jobs.push(tokio::spawn(presence_cleanup_worker(state.clone())));
     background_jobs.push(tokio::spawn(helpdesk_reconcile_worker(state.clone())));
+    if state.helpdesk_turso.is_some() {
+        background_jobs.push(tokio::spawn(helpdesk_turso_sync_worker(state.clone())));
+    }
     background_jobs.push(tokio::spawn(cleanup_worker(state.clone())));
 
     let listener = tokio::net::TcpListener::bind(bind_addr)
@@ -1693,6 +1717,33 @@ async fn helpdesk_reconcile_worker(state: AppState) {
             }
             Ok(_) => {}
             Err(err) => error!(error = %err, "failed to reconcile helpdesk runtime"),
+        }
+    }
+}
+
+async fn helpdesk_turso_sync_worker(state: AppState) {
+    let Some(sync_cfg) = state.helpdesk_turso.clone() else {
+        return;
+    };
+
+    let interval = Duration::from_millis(HELPDESK_TURSO_SYNC_INTERVAL_MS);
+
+    loop {
+        tokio::time::sleep(interval).await;
+
+        match sync_helpdesk_snapshot_to_turso(&state.pool, &sync_cfg.url, &sync_cfg.auth_token)
+            .await
+        {
+            Ok(counts) => {
+                debug!(
+                    rows = counts.total_rows(),
+                    tickets = counts.tickets,
+                    agents = counts.agents,
+                    authorized_agents = counts.authorized_agents,
+                    "helpdesk snapshot synced to Turso"
+                );
+            }
+            Err(err) => error!(error = %err, "failed to sync helpdesk snapshot to Turso"),
         }
     }
 }
