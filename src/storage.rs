@@ -8,11 +8,12 @@ use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool, Transaction};
 use uuid::Uuid;
 
 use crate::model::{
-    AuthRoleV1, AuthUserV1, DashboardSummaryV1, HelpdeskAgentPresenceUpdateV1, HelpdeskAgentStatus,
-    HelpdeskAgentV1, HelpdeskAssignmentV1, HelpdeskAuditEventV1, HelpdeskOperationalSummaryV1,
-    HelpdeskTicketCreateRequestV1, HelpdeskTicketStatus, HelpdeskTicketV1, PresenceParticipantV1,
-    PresenceSessionSummaryV1, SessionEventType, SessionEventV1, SessionPresenceV1,
-    SessionReportRowV1, SessionTimelineItemV1,
+    AuthRoleV1, AuthUserV1, DashboardSummaryV1, HelpdeskAgentAuthorizationStatusV1,
+    HelpdeskAgentPresenceUpdateV1, HelpdeskAgentStatus, HelpdeskAgentV1, HelpdeskAssignmentV1,
+    HelpdeskAuditEventV1, HelpdeskAuthorizedAgentUpsertRequestV1, HelpdeskAuthorizedAgentV1,
+    HelpdeskOperationalSummaryV1, HelpdeskTicketCreateRequestV1, HelpdeskTicketStatus,
+    HelpdeskTicketV1, PresenceParticipantV1, PresenceSessionSummaryV1, SessionEventType,
+    SessionEventV1, SessionPresenceV1, SessionReportRowV1, SessionTimelineItemV1,
 };
 
 #[derive(Debug, Clone)]
@@ -298,6 +299,20 @@ pub async fn init_schema(pool: &SqlitePool) -> anyhow::Result<()> {
     .execute(pool)
     .await
     .context("failed to create helpdesk_agents status index")?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS helpdesk_authorized_agents (
+            agent_id TEXT PRIMARY KEY,
+            display_name TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .context("failed to create helpdesk_authorized_agents table")?;
 
     sqlx::query(
         r#"
@@ -1016,6 +1031,12 @@ pub async fn upsert_helpdesk_agent_presence(
     payload: &HelpdeskAgentPresenceUpdateV1,
 ) -> anyhow::Result<HelpdeskAgentV1> {
     let now_ms = unix_millis_now() as i64;
+    if !is_helpdesk_agent_authorized(pool, payload.agent_id.trim()).await? {
+        anyhow::bail!(
+            "agent '{}' is not authorized for helpdesk operator mode",
+            payload.agent_id.trim()
+        );
+    }
     let display_name = payload
         .display_name
         .as_deref()
@@ -1107,6 +1128,198 @@ pub async fn upsert_helpdesk_agent_presence(
         .await
         .context("failed to commit helpdesk agent transaction")?;
     Ok(agent)
+}
+
+pub async fn upsert_helpdesk_authorized_agent(
+    pool: &SqlitePool,
+    payload: &HelpdeskAuthorizedAgentUpsertRequestV1,
+) -> anyhow::Result<HelpdeskAuthorizedAgentV1> {
+    let now_ms = unix_millis_now() as i64;
+    let agent_id = payload.agent_id.trim().to_string();
+    let display_name = normalize_optional_text(payload.display_name.as_deref());
+
+    sqlx::query(
+        r#"
+        INSERT INTO helpdesk_authorized_agents (agent_id, display_name, created_at, updated_at)
+        VALUES (?1, ?2, ?3, ?4)
+        ON CONFLICT(agent_id) DO UPDATE SET
+            display_name = COALESCE(?2, helpdesk_authorized_agents.display_name),
+            updated_at = ?4
+        "#,
+    )
+    .bind(&agent_id)
+    .bind(display_name.as_deref())
+    .bind(now_ms)
+    .bind(now_ms)
+    .execute(pool)
+    .await
+    .with_context(|| format!("failed to upsert authorized helpdesk agent '{}'", agent_id))?;
+
+    get_helpdesk_authorized_agent(pool, &agent_id)
+        .await?
+        .with_context(|| {
+            format!(
+                "authorized helpdesk agent '{}' not found after upsert",
+                agent_id
+            )
+        })
+}
+
+pub async fn list_helpdesk_authorized_agents(
+    pool: &SqlitePool,
+) -> anyhow::Result<Vec<HelpdeskAuthorizedAgentV1>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT agent_id, display_name, created_at, updated_at
+        FROM helpdesk_authorized_agents
+        ORDER BY updated_at DESC, agent_id ASC
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .context("failed to list authorized helpdesk agents")?;
+
+    rows.into_iter()
+        .map(row_to_helpdesk_authorized_agent)
+        .collect()
+}
+
+pub async fn get_helpdesk_authorized_agent(
+    pool: &SqlitePool,
+    agent_id: &str,
+) -> anyhow::Result<Option<HelpdeskAuthorizedAgentV1>> {
+    let row = sqlx::query(
+        r#"
+        SELECT agent_id, display_name, created_at, updated_at
+        FROM helpdesk_authorized_agents
+        WHERE agent_id = ?1
+        "#,
+    )
+    .bind(agent_id)
+    .fetch_optional(pool)
+    .await
+    .with_context(|| format!("failed to query authorized helpdesk agent '{}'", agent_id))?;
+
+    row.map(row_to_helpdesk_authorized_agent).transpose()
+}
+
+pub async fn get_helpdesk_agent_authorization_status(
+    pool: &SqlitePool,
+    agent_id: &str,
+) -> anyhow::Result<HelpdeskAgentAuthorizationStatusV1> {
+    let authorized_agent = get_helpdesk_authorized_agent(pool, agent_id).await?;
+    Ok(HelpdeskAgentAuthorizationStatusV1 {
+        agent_id: agent_id.to_string(),
+        authorized: authorized_agent.is_some(),
+        display_name: authorized_agent.and_then(|agent| agent.display_name),
+    })
+}
+
+pub async fn delete_helpdesk_authorized_agent(
+    pool: &SqlitePool,
+    agent_id: &str,
+) -> anyhow::Result<bool> {
+    let mut tx = pool
+        .begin()
+        .await
+        .context("failed to open delete authorized helpdesk agent transaction")?;
+    let agent_id = agent_id.trim().to_string();
+    let now_ms = unix_millis_now() as i64;
+
+    let current_ticket_id = sqlx::query_scalar::<_, Option<String>>(
+        r#"
+        SELECT current_ticket_id
+        FROM helpdesk_agents
+        WHERE agent_id = ?1
+        "#,
+    )
+    .bind(&agent_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .with_context(|| {
+        format!(
+            "failed to query current ticket before deleting authorized helpdesk agent '{}'",
+            agent_id
+        )
+    })?
+    .flatten();
+
+    let result = sqlx::query(
+        r#"
+        DELETE FROM helpdesk_authorized_agents
+        WHERE agent_id = ?1
+        "#,
+    )
+    .bind(&agent_id)
+    .execute(&mut *tx)
+    .await
+    .with_context(|| format!("failed to delete authorized helpdesk agent '{}'", agent_id))?;
+
+    sqlx::query(
+        r#"
+        UPDATE helpdesk_agents
+        SET status = 'offline',
+            current_ticket_id = NULL,
+            updated_at = ?2
+        WHERE agent_id = ?1
+        "#,
+    )
+    .bind(&agent_id)
+    .bind(now_ms)
+    .execute(&mut *tx)
+    .await
+    .with_context(|| format!("failed to offboard live helpdesk agent '{}'", agent_id))?;
+
+    if let Some(ticket_id) = current_ticket_id {
+        sqlx::query(
+            r#"
+            UPDATE helpdesk_tickets
+            SET status = 'queued',
+                assigned_agent_id = NULL,
+                opening_deadline_at = NULL,
+                updated_at = ?2
+            WHERE ticket_id = ?1
+              AND assigned_agent_id = ?3
+              AND status IN ('opening', 'in_progress')
+            "#,
+        )
+        .bind(&ticket_id)
+        .bind(now_ms)
+        .bind(&agent_id)
+        .execute(&mut *tx)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to requeue ticket '{}' while deleting authorized helpdesk agent '{}'",
+                ticket_id, agent_id
+            )
+        })?;
+    }
+
+    tx.commit()
+        .await
+        .context("failed to commit authorized helpdesk agent deletion")?;
+
+    Ok(result.rows_affected() > 0)
+}
+
+pub async fn is_helpdesk_agent_authorized(
+    pool: &SqlitePool,
+    agent_id: &str,
+) -> anyhow::Result<bool> {
+    let row = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)
+        FROM helpdesk_authorized_agents
+        WHERE agent_id = ?1
+        "#,
+    )
+    .bind(agent_id)
+    .fetch_one(pool)
+    .await
+    .with_context(|| format!("failed to verify authorized helpdesk agent '{}'", agent_id))?;
+
+    Ok(row > 0)
 }
 
 pub async fn create_helpdesk_ticket(
@@ -3092,6 +3305,17 @@ fn row_to_helpdesk_agent(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<Helpdes
     })
 }
 
+fn row_to_helpdesk_authorized_agent(
+    row: sqlx::sqlite::SqliteRow,
+) -> anyhow::Result<HelpdeskAuthorizedAgentV1> {
+    Ok(HelpdeskAuthorizedAgentV1 {
+        agent_id: row.get("agent_id"),
+        display_name: row.get("display_name"),
+        created_at: millis_to_utc(row.get("created_at")),
+        updated_at: millis_to_utc(row.get("updated_at")),
+    })
+}
+
 fn row_to_helpdesk_ticket(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<HelpdeskTicketV1> {
     let status: String = row.get("status");
     let opening_deadline_at: Option<i64> = row.get("opening_deadline_at");
@@ -3193,18 +3417,32 @@ mod tests {
     use uuid::Uuid;
 
     use crate::model::{
-        HelpdeskAgentPresenceUpdateV1, HelpdeskAgentStatus, HelpdeskTicketCreateRequestV1,
-        HelpdeskTicketStatus, SessionDirection, SessionEventType, SessionEventV1,
+        HelpdeskAgentPresenceUpdateV1, HelpdeskAgentStatus, HelpdeskAuthorizedAgentUpsertRequestV1,
+        HelpdeskTicketCreateRequestV1, HelpdeskTicketStatus, SessionDirection, SessionEventType,
+        SessionEventV1,
     };
 
     use super::{
         assign_helpdesk_ticket, cancel_helpdesk_ticket, connect_sqlite, create_helpdesk_ticket,
-        expire_stale_presence, get_helpdesk_agent, get_helpdesk_assignment_for_agent,
-        get_helpdesk_operational_summary, get_helpdesk_ticket, get_session_presence, insert_event,
-        list_active_session_presence, list_helpdesk_ticket_audit_events, list_helpdesk_tickets,
-        reconcile_helpdesk_runtime, requeue_helpdesk_ticket, resolve_helpdesk_ticket,
-        start_helpdesk_ticket, unix_millis_now, upsert_helpdesk_agent_presence, InsertOutcome,
+        expire_stale_presence, get_helpdesk_agent, get_helpdesk_agent_authorization_status,
+        get_helpdesk_assignment_for_agent, get_helpdesk_operational_summary, get_helpdesk_ticket,
+        get_session_presence, insert_event, list_active_session_presence,
+        list_helpdesk_ticket_audit_events, list_helpdesk_tickets, reconcile_helpdesk_runtime,
+        requeue_helpdesk_ticket, resolve_helpdesk_ticket, start_helpdesk_ticket, unix_millis_now,
+        upsert_helpdesk_agent_presence, upsert_helpdesk_authorized_agent, InsertOutcome,
     };
+
+    async fn authorize_agent(pool: &sqlx::SqlitePool, agent_id: &str, display_name: &str) {
+        upsert_helpdesk_authorized_agent(
+            pool,
+            &HelpdeskAuthorizedAgentUpsertRequestV1 {
+                agent_id: agent_id.to_string(),
+                display_name: Some(display_name.to_string()),
+            },
+        )
+        .await
+        .expect("authorize agent");
+    }
 
     #[tokio::test]
     async fn duplicate_event_id_is_rejected() {
@@ -3353,6 +3591,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn helpdesk_presence_requires_authorized_agent() {
+        let temp = tempdir().expect("create temp dir");
+        let db_path = temp.path().join("helpdesk-auth.db");
+        let pool = connect_sqlite(&db_path).await.expect("connect sqlite");
+
+        let payload = HelpdeskAgentPresenceUpdateV1 {
+            agent_id: "agent-unauthorized".to_string(),
+            display_name: Some("Unauthorized".to_string()),
+            avatar_url: None,
+            status: HelpdeskAgentStatus::Available,
+        };
+
+        let err = upsert_helpdesk_agent_presence(&pool, &payload)
+            .await
+            .expect_err("presence should fail for unauthorized agent");
+        assert!(err
+            .to_string()
+            .contains("is not authorized for helpdesk operator mode"));
+
+        upsert_helpdesk_authorized_agent(
+            &pool,
+            &HelpdeskAuthorizedAgentUpsertRequestV1 {
+                agent_id: payload.agent_id.clone(),
+                display_name: Some("Authorized".to_string()),
+            },
+        )
+        .await
+        .expect("authorize agent");
+
+        let agent = upsert_helpdesk_agent_presence(&pool, &payload)
+            .await
+            .expect("presence should succeed for authorized agent");
+        assert_eq!(agent.agent_id, payload.agent_id);
+
+        let authorization = get_helpdesk_agent_authorization_status(&pool, &payload.agent_id)
+            .await
+            .expect("authorization status");
+        assert!(authorization.authorized);
+    }
+
+    #[tokio::test]
     async fn control_changed_false_clears_active_controller() {
         let temp = tempdir().expect("create temp dir");
         let db_path = temp.path().join("presence-control.db");
@@ -3425,6 +3704,7 @@ mod tests {
         let temp = tempdir().expect("create temp dir");
         let db_path = temp.path().join("helpdesk-assign.db");
         let pool = connect_sqlite(&db_path).await.expect("connect sqlite");
+        authorize_agent(&pool, "agent-1", "Agent One").await;
 
         let agent = upsert_helpdesk_agent_presence(
             &pool,
@@ -3479,6 +3759,8 @@ mod tests {
         let temp = tempdir().expect("create temp dir");
         let db_path = temp.path().join("helpdesk-preferred-agent.db");
         let pool = connect_sqlite(&db_path).await.expect("connect sqlite");
+        authorize_agent(&pool, "agent-1", "Agent One").await;
+        authorize_agent(&pool, "agent-2", "Agent Two").await;
 
         upsert_helpdesk_agent_presence(
             &pool,
@@ -3545,6 +3827,7 @@ mod tests {
         let temp = tempdir().expect("create temp dir");
         let db_path = temp.path().join("helpdesk-queue.db");
         let pool = connect_sqlite(&db_path).await.expect("connect sqlite");
+        authorize_agent(&pool, "agent-queued", "Agent Queue").await;
 
         let ticket = create_helpdesk_ticket(
             &pool,
@@ -3597,6 +3880,7 @@ mod tests {
         let temp = tempdir().expect("create temp dir");
         let db_path = temp.path().join("helpdesk-lifecycle.db");
         let pool = connect_sqlite(&db_path).await.expect("connect sqlite");
+        authorize_agent(&pool, "agent-life", "Agent Life").await;
 
         upsert_helpdesk_agent_presence(
             &pool,
@@ -3653,6 +3937,7 @@ mod tests {
         let temp = tempdir().expect("create temp dir");
         let db_path = temp.path().join("helpdesk-expired-opening.db");
         let pool = connect_sqlite(&db_path).await.expect("connect sqlite");
+        authorize_agent(&pool, "agent-expire", "Agent Expire").await;
 
         upsert_helpdesk_agent_presence(
             &pool,
@@ -3724,6 +4009,7 @@ mod tests {
         let temp = tempdir().expect("create temp dir");
         let db_path = temp.path().join("helpdesk-stale-busy.db");
         let pool = connect_sqlite(&db_path).await.expect("connect sqlite");
+        authorize_agent(&pool, "agent-stale", "Agent Stale").await;
 
         upsert_helpdesk_agent_presence(
             &pool,
@@ -3796,6 +4082,7 @@ mod tests {
         let temp = tempdir().expect("create temp dir");
         let db_path = temp.path().join("helpdesk-audit-summary.db");
         let pool = connect_sqlite(&db_path).await.expect("connect sqlite");
+        authorize_agent(&pool, "agent-audit", "Agent Audit").await;
 
         upsert_helpdesk_agent_presence(
             &pool,
@@ -3854,6 +4141,8 @@ mod tests {
         let temp = tempdir().expect("create temp dir");
         let db_path = temp.path().join("helpdesk-manual-assign.db");
         let pool = connect_sqlite(&db_path).await.expect("connect sqlite");
+        authorize_agent(&pool, "agent-queue-owner", "Agent Queue Owner").await;
+        authorize_agent(&pool, "agent-2", "Agent Two").await;
 
         upsert_helpdesk_agent_presence(
             &pool,
@@ -3936,6 +4225,7 @@ mod tests {
         let temp = tempdir().expect("create temp dir");
         let db_path = temp.path().join("helpdesk-requeue.db");
         let pool = connect_sqlite(&db_path).await.expect("connect sqlite");
+        authorize_agent(&pool, "agent-requeue", "Agent Requeue").await;
 
         upsert_helpdesk_agent_presence(
             &pool,
@@ -3988,6 +4278,7 @@ mod tests {
         let temp = tempdir().expect("create temp dir");
         let db_path = temp.path().join("helpdesk-cancel.db");
         let pool = connect_sqlite(&db_path).await.expect("connect sqlite");
+        authorize_agent(&pool, "agent-cancel", "Agent Cancel").await;
 
         upsert_helpdesk_agent_presence(
             &pool,

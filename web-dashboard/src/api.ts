@@ -4,6 +4,7 @@ import type {
   DashboardSummary,
   HelpdeskAuditEvent,
   HelpdeskAgent,
+  HelpdeskAuthorizedAgent,
   HelpdeskOperationalSummary,
   HelpdeskTicket,
   PaginatedResponse,
@@ -140,9 +141,40 @@ export async function apiHelpdeskAgents(): Promise<HelpdeskAgent[]> {
   return response.agents;
 }
 
+export async function apiHelpdeskAuthorizedAgents(): Promise<HelpdeskAuthorizedAgent[]> {
+  const response = await request<{ agents: HelpdeskAuthorizedAgent[] }>(
+    '/api/v1/helpdesk/agent-authorizations',
+  );
+  return response.agents;
+}
+
 export async function apiHelpdeskTickets(): Promise<HelpdeskTicket[]> {
   const response = await request<{ tickets: HelpdeskTicket[] }>('/api/v1/helpdesk/tickets');
   return response.tickets;
+}
+
+export interface HelpdeskAuthorizedAgentUpsertBody {
+  agent_id: string;
+  display_name?: string;
+}
+
+export async function apiHelpdeskAuthorizedAgentUpsert(
+  body: HelpdeskAuthorizedAgentUpsertBody,
+): Promise<HelpdeskAuthorizedAgent> {
+  const response = await request<{ agent: HelpdeskAuthorizedAgent }>(
+    '/api/v1/helpdesk/agent-authorizations',
+    {
+      method: 'POST',
+      body: JSON.stringify(body),
+    },
+  );
+  return response.agent;
+}
+
+export async function apiHelpdeskAuthorizedAgentDelete(agentId: string): Promise<void> {
+  await request<null>(`/api/v1/helpdesk/agent-authorizations/${encodeURIComponent(agentId)}`, {
+    method: 'DELETE',
+  });
 }
 
 export interface HelpdeskCreateTicketBody {

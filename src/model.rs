@@ -249,6 +249,30 @@ pub struct HelpdeskAgentV1 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HelpdeskAuthorizedAgentV1 {
+    pub agent_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HelpdeskAuthorizedAgentUpsertRequestV1 {
+    pub agent_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HelpdeskAgentAuthorizationStatusV1 {
+    pub agent_id: String,
+    pub authorized: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HelpdeskTicketCreateRequestV1 {
     pub client_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -381,6 +405,20 @@ impl HelpdeskAgentPresenceUpdateV1 {
     pub fn validate(&self) -> Result<(), EventValidationError> {
         if self.agent_id.trim().is_empty() {
             return Err(EventValidationError::EmptyField("agent_id"));
+        }
+        Ok(())
+    }
+}
+
+impl HelpdeskAuthorizedAgentUpsertRequestV1 {
+    pub fn validate(&self) -> Result<(), EventValidationError> {
+        if self.agent_id.trim().is_empty() {
+            return Err(EventValidationError::EmptyField("agent_id"));
+        }
+        if let Some(display_name) = &self.display_name {
+            if display_name.trim().is_empty() {
+                return Err(EventValidationError::EmptyField("display_name"));
+            }
         }
         Ok(())
     }

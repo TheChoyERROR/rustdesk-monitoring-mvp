@@ -7,8 +7,8 @@ use anyhow::Context;
 use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, Request, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
-use axum::response::{IntoResponse, Response};
 use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, get_service, post};
 use axum::{Extension, Json, Router};
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
@@ -26,22 +26,24 @@ use crate::config::ServerConfig;
 use crate::metrics::Metrics;
 use crate::model::{
     AuthLoginRequestV1, AuthLoginResponseV1, AuthRoleV1, AuthUserV1, HelpdeskAgentPresenceUpdateV1,
-    HelpdeskAssignmentStartRequestV1, HelpdeskTicketAssignRequestV1, HelpdeskTicketCreateRequestV1,
-    HelpdeskTicketResolveRequestV1, HelpdeskTicketSupervisorActionRequestV1, HelpdeskAgentStatus,
-    PaginatedResponseV1, SessionEventType, SessionEventV1,
+    HelpdeskAgentStatus, HelpdeskAssignmentStartRequestV1, HelpdeskAuthorizedAgentUpsertRequestV1,
+    HelpdeskTicketAssignRequestV1, HelpdeskTicketCreateRequestV1, HelpdeskTicketResolveRequestV1,
+    HelpdeskTicketSupervisorActionRequestV1, PaginatedResponseV1, SessionEventType, SessionEventV1,
 };
 use crate::storage::{
-    assign_helpdesk_ticket, claim_due_events, cleanup_expired_dashboard_sessions,
-    cleanup_failed_older_than, connect_sqlite, cancel_helpdesk_ticket,
-    create_helpdesk_ticket, delete_dashboard_session, get_dashboard_session_by_token,
-    get_dashboard_summary, get_dashboard_user_by_username, get_helpdesk_assignment_for_agent,
-    get_helpdesk_operational_summary, get_helpdesk_ticket, get_session_presence, insert_event,
-    list_active_session_presence, list_helpdesk_agents, list_helpdesk_ticket_audit_events,
-    list_helpdesk_tickets, mark_delivered, mark_failed, query_session_report_rows,
-    query_session_timeline, query_timeline_events, reconcile_helpdesk_runtime, requeue_helpdesk_ticket,
+    assign_helpdesk_ticket, cancel_helpdesk_ticket, claim_due_events,
+    cleanup_expired_dashboard_sessions, cleanup_failed_older_than, connect_sqlite,
+    create_helpdesk_ticket, delete_dashboard_session, delete_helpdesk_authorized_agent,
+    expire_stale_presence, get_dashboard_session_by_token, get_dashboard_summary,
+    get_dashboard_user_by_username, get_helpdesk_agent_authorization_status,
+    get_helpdesk_assignment_for_agent, get_helpdesk_operational_summary, get_helpdesk_ticket,
+    get_session_presence, insert_event, list_active_session_presence, list_helpdesk_agents,
+    list_helpdesk_authorized_agents, list_helpdesk_ticket_audit_events, list_helpdesk_tickets,
+    mark_delivered, mark_failed, query_session_report_rows, query_session_timeline,
+    query_timeline_events, reconcile_helpdesk_runtime, requeue_helpdesk_ticket,
     reset_stuck_processing, resolve_helpdesk_ticket, schedule_retry, start_helpdesk_ticket,
-    unix_millis_now, upsert_dashboard_user, upsert_helpdesk_agent_presence, EventQueryFilter,
-    InsertOutcome, OutboxRecord, expire_stale_presence,
+    unix_millis_now, upsert_dashboard_user, upsert_helpdesk_agent_presence,
+    upsert_helpdesk_authorized_agent, EventQueryFilter, InsertOutcome, OutboxRecord,
 };
 use crate::webhook::WebhookDispatcher;
 
@@ -101,7 +103,11 @@ struct HelpdeskAuditQuery {
     limit: Option<u64>,
 }
 
-pub async fn run(bind_addr: &str, database_path: &Path, config: ServerConfig) -> anyhow::Result<()> {
+pub async fn run(
+    bind_addr: &str,
+    database_path: &Path,
+    config: ServerConfig,
+) -> anyhow::Result<()> {
     validate_server_config(&config)?;
     info!(
         stale_after_seconds = config.presence.stale_after_seconds,
@@ -151,10 +157,22 @@ pub async fn run(bind_addr: &str, database_path: &Path, config: ServerConfig) ->
         .route("/api/v1/dashboard/summary", get(dashboard_summary_handler))
         .route("/api/v1/events", get(events_list_handler))
         .route(
+            "/api/v1/helpdesk/agent-authorizations",
+            get(list_helpdesk_authorized_agents_handler)
+                .post(upsert_helpdesk_authorized_agent_handler),
+        )
+        .route(
+            "/api/v1/helpdesk/agent-authorizations/:agent_id",
+            axum::routing::delete(delete_helpdesk_authorized_agent_handler),
+        )
+        .route(
             "/api/v1/sessions/:session_id/timeline",
             get(session_timeline_handler),
         )
-        .route("/api/v1/reports/sessions.csv", get(sessions_report_csv_handler))
+        .route(
+            "/api/v1/reports/sessions.csv",
+            get(sessions_report_csv_handler),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_dashboard_auth,
@@ -166,8 +184,18 @@ pub async fn run(bind_addr: &str, database_path: &Path, config: ServerConfig) ->
         .route("/api/v1/auth/login", post(auth_login_handler))
         .route("/api/v1/auth/logout", post(auth_logout_handler))
         .route("/api/v1/helpdesk/agents", get(list_helpdesk_agents_handler))
-        .route("/api/v1/helpdesk/agents/presence", post(upsert_helpdesk_agent_presence_handler))
-        .route("/api/v1/helpdesk/summary", get(get_helpdesk_summary_handler))
+        .route(
+            "/api/v1/helpdesk/agents/presence",
+            post(upsert_helpdesk_agent_presence_handler),
+        )
+        .route(
+            "/api/v1/helpdesk/agents/:agent_id/authorization",
+            get(get_helpdesk_agent_authorization_handler),
+        )
+        .route(
+            "/api/v1/helpdesk/summary",
+            get(get_helpdesk_summary_handler),
+        )
         .route(
             "/api/v1/helpdesk/agents/:agent_id/assignment",
             get(get_helpdesk_assignment_for_agent_handler),
@@ -176,8 +204,14 @@ pub async fn run(bind_addr: &str, database_path: &Path, config: ServerConfig) ->
             "/api/v1/helpdesk/agents/:agent_id/assignment/start",
             post(start_helpdesk_assignment_handler),
         )
-        .route("/api/v1/helpdesk/tickets", get(list_helpdesk_tickets_handler).post(create_helpdesk_ticket_handler))
-        .route("/api/v1/helpdesk/tickets/:ticket_id", get(get_helpdesk_ticket_handler))
+        .route(
+            "/api/v1/helpdesk/tickets",
+            get(list_helpdesk_tickets_handler).post(create_helpdesk_ticket_handler),
+        )
+        .route(
+            "/api/v1/helpdesk/tickets/:ticket_id",
+            get(get_helpdesk_ticket_handler),
+        )
         .route(
             "/api/v1/helpdesk/tickets/:ticket_id/assign",
             post(assign_helpdesk_ticket_handler),
@@ -198,7 +232,10 @@ pub async fn run(bind_addr: &str, database_path: &Path, config: ServerConfig) ->
             "/api/v1/helpdesk/tickets/:ticket_id/cancel",
             post(cancel_helpdesk_ticket_handler),
         )
-        .route("/api/v1/sessions/presence", get(list_presence_sessions_handler))
+        .route(
+            "/api/v1/sessions/presence",
+            get(list_presence_sessions_handler),
+        )
         .route(
             "/api/v1/sessions/:session_id/presence",
             get(get_session_presence_handler),
@@ -218,9 +255,8 @@ pub async fn run(bind_addr: &str, database_path: &Path, config: ServerConfig) ->
         let index_file = dist_dir.join("index.html");
         if index_file.is_file() {
             info!(path = %dist_dir.display(), "dashboard static files enabled");
-            let static_service = get_service(
-                ServeDir::new(dist_dir).fallback(ServeFile::new(index_file)),
-            );
+            let static_service =
+                get_service(ServeDir::new(dist_dir).fallback(ServeFile::new(index_file)));
             router = router.fallback_service(static_service);
         } else {
             warn!(
@@ -267,7 +303,15 @@ fn validate_server_config(config: &ServerConfig) -> anyhow::Result<()> {
         if config.webhook.url.is_none() {
             anyhow::bail!("webhook.enabled=true requires webhook.url");
         }
-        if config.webhook.hmac.enabled && config.webhook.hmac.secret.as_deref().unwrap_or("").is_empty() {
+        if config.webhook.hmac.enabled
+            && config
+                .webhook
+                .hmac
+                .secret
+                .as_deref()
+                .unwrap_or("")
+                .is_empty()
+        {
             anyhow::bail!("webhook.hmac.enabled=true requires webhook.hmac.secret");
         }
     }
@@ -316,7 +360,10 @@ async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
     let body = state.metrics.render_prometheus();
     (
         StatusCode::OK,
-        [(header::CONTENT_TYPE, HeaderValue::from_static("text/plain; version=0.0.4"))],
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/plain; version=0.0.4"),
+        )],
         body,
     )
 }
@@ -326,6 +373,83 @@ async fn list_helpdesk_agents_handler(State(state): State<AppState>) -> impl Int
         Ok(agents) => (StatusCode::OK, Json(json!({ "agents": agents }))).into_response(),
         Err(err) => {
             error!(error = %err, "failed to list helpdesk agents");
+            internal_error()
+        }
+    }
+}
+
+async fn list_helpdesk_authorized_agents_handler(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    match list_helpdesk_authorized_agents(&state.pool).await {
+        Ok(agents) => (StatusCode::OK, Json(json!({ "agents": agents }))).into_response(),
+        Err(err) => {
+            error!(error = %err, "failed to list authorized helpdesk agents");
+            internal_error()
+        }
+    }
+}
+
+async fn upsert_helpdesk_authorized_agent_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<HelpdeskAuthorizedAgentUpsertRequestV1>,
+) -> impl IntoResponse {
+    if let Err(validation_error) = payload.validate() {
+        return bad_request(validation_error.to_string());
+    }
+
+    match upsert_helpdesk_authorized_agent(&state.pool, &payload).await {
+        Ok(agent) => (StatusCode::OK, Json(json!({ "agent": agent }))).into_response(),
+        Err(err) => {
+            error!(
+                error = %err,
+                agent_id = payload.agent_id,
+                "failed to upsert authorized helpdesk agent"
+            );
+            internal_error()
+        }
+    }
+}
+
+async fn delete_helpdesk_authorized_agent_handler(
+    State(state): State<AppState>,
+    AxumPath(agent_id): AxumPath<String>,
+) -> impl IntoResponse {
+    let agent_id = agent_id.trim().to_string();
+    if agent_id.is_empty() {
+        return bad_request("agent_id cannot be empty");
+    }
+
+    match delete_helpdesk_authorized_agent(&state.pool, &agent_id).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "error": "not_found",
+                "message": "Authorized agent was not found",
+            })),
+        )
+            .into_response(),
+        Err(err) => {
+            error!(error = %err, agent_id, "failed to delete authorized helpdesk agent");
+            internal_error()
+        }
+    }
+}
+
+async fn get_helpdesk_agent_authorization_handler(
+    State(state): State<AppState>,
+    AxumPath(agent_id): AxumPath<String>,
+) -> impl IntoResponse {
+    let agent_id = agent_id.trim().to_string();
+    if agent_id.is_empty() {
+        return bad_request("agent_id cannot be empty");
+    }
+
+    match get_helpdesk_agent_authorization_status(&state.pool, &agent_id).await {
+        Ok(status) => (StatusCode::OK, Json(json!({ "authorization": status }))).into_response(),
+        Err(err) => {
+            error!(error = %err, agent_id, "failed to query helpdesk agent authorization");
             internal_error()
         }
     }
@@ -352,6 +476,12 @@ async fn upsert_helpdesk_agent_presence_handler(
     match upsert_helpdesk_agent_presence(&state.pool, &payload).await {
         Ok(agent) => (StatusCode::OK, Json(json!({ "agent": agent }))).into_response(),
         Err(err) => {
+            if err
+                .to_string()
+                .contains("is not authorized for helpdesk operator mode")
+            {
+                return forbidden(err.to_string());
+            }
             error!(error = %err, agent_id = payload.agent_id, "failed to upsert helpdesk agent presence");
             internal_error()
         }
@@ -368,7 +498,9 @@ async fn get_helpdesk_assignment_for_agent_handler(
     }
 
     match get_helpdesk_assignment_for_agent(&state.pool, &agent_id).await {
-        Ok(Some(assignment)) => (StatusCode::OK, Json(json!({ "assignment": assignment }))).into_response(),
+        Ok(Some(assignment)) => {
+            (StatusCode::OK, Json(json!({ "assignment": assignment }))).into_response()
+        }
         Ok(None) => (StatusCode::OK, Json(json!({ "assignment": null }))).into_response(),
         Err(err) => {
             error!(error = %err, agent_id, "failed to get helpdesk assignment for agent");
@@ -542,7 +674,14 @@ async fn resolve_helpdesk_ticket_handler(
         .next_agent_status
         .unwrap_or(HelpdeskAgentStatus::Available);
 
-    match resolve_helpdesk_ticket(&state.pool, &ticket_id, &payload.agent_id, next_agent_status).await {
+    match resolve_helpdesk_ticket(
+        &state.pool,
+        &ticket_id,
+        &payload.agent_id,
+        next_agent_status,
+    )
+    .await
+    {
         Ok((ticket, agent)) => (
             StatusCode::OK,
             Json(json!({
@@ -675,7 +814,9 @@ async fn auth_login_handler(
         }
     };
 
-    if !user_record.is_active || !auth::verify_password(&payload.password, &user_record.password_hash) {
+    if !user_record.is_active
+        || !auth::verify_password(&payload.password, &user_record.password_hash)
+    {
         return (
             StatusCode::UNAUTHORIZED,
             jar,
@@ -693,18 +834,19 @@ async fn auth_login_handler(
         role: user_record.role,
     };
     let expires_at = now + ChronoDuration::minutes(session_ttl_minutes(&state.auth));
-    let session_token = match auth::issue_dashboard_session_token(&state.auth, &response_user, expires_at) {
-        Ok(token) => token,
-        Err(err) => {
-            error!(error = %err, username, "failed to issue dashboard session token");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                jar,
-                Json(json!({ "error": "internal_error" })),
-            )
-                .into_response();
-        }
-    };
+    let session_token =
+        match auth::issue_dashboard_session_token(&state.auth, &response_user, expires_at) {
+            Ok(token) => token,
+            Err(err) => {
+                error!(error = %err, username, "failed to issue dashboard session token");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    jar,
+                    Json(json!({ "error": "internal_error" })),
+                )
+                    .into_response();
+            }
+        };
 
     let cookie = build_dashboard_session_cookie(&state.auth, session_token, expires_at);
     let jar = jar.add(cookie);
@@ -763,7 +905,8 @@ async fn dashboard_summary_handler(
     Query(query): Query<SummaryQuery>,
 ) -> impl IntoResponse {
     let now = Utc::now();
-    let from = match parse_optional_datetime(query.from.as_deref(), now - ChronoDuration::hours(24)) {
+    let from = match parse_optional_datetime(query.from.as_deref(), now - ChronoDuration::hours(24))
+    {
         Ok(value) => value,
         Err(err) => return bad_request(err),
     };
@@ -812,8 +955,14 @@ async fn events_list_handler(
     let page_size = query.page_size.unwrap_or(50).clamp(1, 200);
 
     let filter = EventQueryFilter {
-        session_id: query.session_id.map(|value| value.trim().to_string()).filter(|v| !v.is_empty()),
-        user_id: query.user_id.map(|value| value.trim().to_string()).filter(|v| !v.is_empty()),
+        session_id: query
+            .session_id
+            .map(|value| value.trim().to_string())
+            .filter(|v| !v.is_empty()),
+        user_id: query
+            .user_id
+            .map(|value| value.trim().to_string())
+            .filter(|v| !v.is_empty()),
         event_type,
         from,
         to,
@@ -873,7 +1022,8 @@ async fn sessions_report_csv_handler(
     Query(query): Query<CsvReportQuery>,
 ) -> impl IntoResponse {
     let now = Utc::now();
-    let from = match parse_optional_datetime(query.from.as_deref(), now - ChronoDuration::hours(24)) {
+    let from = match parse_optional_datetime(query.from.as_deref(), now - ChronoDuration::hours(24))
+    {
         Ok(value) => value,
         Err(err) => return bad_request(err),
     };
@@ -922,11 +1072,16 @@ async fn sessions_report_csv_handler(
     (
         StatusCode::OK,
         [
-            (header::CONTENT_TYPE, HeaderValue::from_static("text/csv; charset=utf-8")),
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/csv; charset=utf-8"),
+            ),
             (
                 header::CONTENT_DISPOSITION,
                 HeaderValue::from_str(&format!("attachment; filename=\"{filename}\""))
-                    .unwrap_or_else(|_| HeaderValue::from_static("attachment; filename=\"sessions-report.csv\"")),
+                    .unwrap_or_else(|_| {
+                        HeaderValue::from_static("attachment; filename=\"sessions-report.csv\"")
+                    }),
             ),
         ],
         csv,
@@ -966,14 +1121,17 @@ async fn require_dashboard_auth(
     };
 
     let refreshed_expires_at = now + ChronoDuration::minutes(session_ttl_minutes(&state.auth));
-    let refreshed_token =
-        match auth::issue_dashboard_session_token(&state.auth, &authenticated_user, refreshed_expires_at) {
-            Ok(token) => token,
-            Err(err) => {
-                error!(error = %err, "failed to refresh dashboard session token");
-                return internal_error();
-            }
-        };
+    let refreshed_token = match auth::issue_dashboard_session_token(
+        &state.auth,
+        &authenticated_user,
+        refreshed_expires_at,
+    ) {
+        Ok(token) => token,
+        Err(err) => {
+            error!(error = %err, "failed to refresh dashboard session token");
+            return internal_error();
+        }
+    };
 
     request.extensions_mut().insert(AuthContext {
         user: authenticated_user,
@@ -1050,7 +1208,10 @@ async fn stream_session_presence_handler(
                 if emit_initial {
                     emit_initial = false;
                     let event = presence_snapshot_sse_event(&state, &session_id).await;
-                    return Some((Ok::<Event, Infallible>(event), (receiver, state, session_id, emit_initial)));
+                    return Some((
+                        Ok::<Event, Infallible>(event),
+                        (receiver, state, session_id, emit_initial),
+                    ));
                 }
 
                 match receiver.recv().await {
@@ -1059,13 +1220,20 @@ async fn stream_session_presence_handler(
                             continue;
                         }
                         let event = presence_snapshot_sse_event(&state, &session_id).await;
-                        return Some((Ok::<Event, Infallible>(event), (receiver, state, session_id, emit_initial)));
+                        return Some((
+                            Ok::<Event, Infallible>(event),
+                            (receiver, state, session_id, emit_initial),
+                        ));
                     }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        let event = Event::default()
-                            .event("presence_lagged")
-                            .data(json!({ "session_id": session_id, "skipped_updates": skipped }).to_string());
-                        return Some((Ok::<Event, Infallible>(event), (receiver, state, session_id, emit_initial)));
+                        let event = Event::default().event("presence_lagged").data(
+                            json!({ "session_id": session_id, "skipped_updates": skipped })
+                                .to_string(),
+                        );
+                        return Some((
+                            Ok::<Event, Infallible>(event),
+                            (receiver, state, session_id, emit_initial),
+                        ));
                     }
                     Err(broadcast::error::RecvError::Closed) => return None,
                 }
@@ -1073,7 +1241,11 @@ async fn stream_session_presence_handler(
         },
     );
 
-    Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(10)).text("keepalive"))
+    Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(10))
+            .text("keepalive"),
+    )
 }
 
 async fn ingest_session_event(
@@ -1165,7 +1337,9 @@ fn find_cookie_value(cookie_header: &str, cookie_name: &str) -> Option<String> {
 }
 
 fn session_ttl_minutes(auth: &AuthSettings) -> i64 {
-    i64::try_from(auth.session_ttl_minutes).unwrap_or(480).max(1)
+    i64::try_from(auth.session_ttl_minutes)
+        .unwrap_or(480)
+        .max(1)
 }
 
 fn build_dashboard_session_cookie(
@@ -1181,7 +1355,10 @@ fn build_dashboard_session_cookie(
         .build()
 }
 
-fn parse_optional_datetime(raw: Option<&str>, default: DateTime<Utc>) -> Result<DateTime<Utc>, String> {
+fn parse_optional_datetime(
+    raw: Option<&str>,
+    default: DateTime<Utc>,
+) -> Result<DateTime<Utc>, String> {
     match raw {
         Some(value) if !value.trim().is_empty() => parse_datetime(value),
         _ => Ok(default),
@@ -1244,6 +1421,17 @@ fn unauthorized() -> Response {
         StatusCode::UNAUTHORIZED,
         Json(json!({
             "error": "unauthorized"
+        })),
+    )
+        .into_response()
+}
+
+fn forbidden(message: impl Into<String>) -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({
+            "error": "forbidden",
+            "message": message.into(),
         })),
     )
         .into_response()
@@ -1407,7 +1595,13 @@ async fn process_outbox_record(state: AppState, record: OutboxRecord) -> anyhow:
 }
 
 async fn cleanup_worker(state: AppState) {
-    let interval = Duration::from_secs(state.config.retention.cleanup_interval_minutes.saturating_mul(60));
+    let interval = Duration::from_secs(
+        state
+            .config
+            .retention
+            .cleanup_interval_minutes
+            .saturating_mul(60),
+    );
 
     loop {
         tokio::time::sleep(interval).await;
@@ -1439,7 +1633,11 @@ async fn cleanup_worker(state: AppState) {
 
 async fn presence_cleanup_worker(state: AppState) {
     let interval = Duration::from_secs(state.config.presence.cleanup_interval_seconds);
-    let stale_after_ms = state.config.presence.stale_after_seconds.saturating_mul(1_000);
+    let stale_after_ms = state
+        .config
+        .presence
+        .stale_after_seconds
+        .saturating_mul(1_000);
 
     loop {
         tokio::time::sleep(interval).await;
@@ -1472,7 +1670,13 @@ async fn helpdesk_reconcile_worker(state: AppState) {
     loop {
         tokio::time::sleep(interval).await;
 
-        match reconcile_helpdesk_runtime(&state.pool, HELPDESK_AGENT_STALE_AFTER_MS, unix_millis_now() as i64).await {
+        match reconcile_helpdesk_runtime(
+            &state.pool,
+            HELPDESK_AGENT_STALE_AFTER_MS,
+            unix_millis_now() as i64,
+        )
+        .await
+        {
             Ok(stats)
                 if stats.opening_timeouts > 0
                     || stats.agents_marked_offline > 0
@@ -1556,7 +1760,10 @@ impl CircuitBreaker {
             let open_until = now_ms.saturating_add(self.cooldown_ms);
             guard.open_until_ms = Some(open_until);
             guard.consecutive_failures = 0;
-            warn!(open_until, "circuit breaker opened after repeated webhook failures");
+            warn!(
+                open_until,
+                "circuit breaker opened after repeated webhook failures"
+            );
         }
     }
 }

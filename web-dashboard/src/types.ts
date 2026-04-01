@@ -103,6 +103,13 @@ export interface HelpdeskAgent {
   updated_at: string;
 }
 
+export interface HelpdeskAuthorizedAgent {
+  agent_id: string;
+  display_name?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface HelpdeskTicket {
   ticket_id: string;
   client_id: string;

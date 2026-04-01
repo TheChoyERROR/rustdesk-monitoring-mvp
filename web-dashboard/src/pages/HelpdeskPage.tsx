@@ -1,10 +1,19 @@
 import { useCallback, useEffect, useMemo, useState, type FormEvent } from 'react';
 import { Link } from 'react-router-dom';
 
-import { apiHelpdeskAgents, apiHelpdeskCreateTicket, apiHelpdeskSummary, apiHelpdeskTickets } from '../api';
+import {
+  apiHelpdeskAgents,
+  apiHelpdeskAuthorizedAgentDelete,
+  apiHelpdeskAuthorizedAgentUpsert,
+  apiHelpdeskAuthorizedAgents,
+  apiHelpdeskCreateTicket,
+  apiHelpdeskSummary,
+  apiHelpdeskTickets,
+} from '../api';
 import { formatDateTime } from '../lib/time';
 import type {
   HelpdeskAgent,
+  HelpdeskAuthorizedAgent,
   HelpdeskAgentStatus,
   HelpdeskOperationalSummary,
   HelpdeskTicket,
@@ -101,6 +110,7 @@ type CreateFeedback =
 export default function HelpdeskPage() {
   const [summary, setSummary] = useState<HelpdeskOperationalSummary | null>(null);
   const [agents, setAgents] = useState<HelpdeskAgent[]>([]);
+  const [authorizedAgents, setAuthorizedAgents] = useState<HelpdeskAuthorizedAgent[]>([]);
   const [tickets, setTickets] = useState<HelpdeskTicket[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -110,6 +120,12 @@ export default function HelpdeskPage() {
   const [failedAvatarIds, setFailedAvatarIds] = useState<Record<string, boolean>>({});
   const [createBusy, setCreateBusy] = useState(false);
   const [createFeedback, setCreateFeedback] = useState<CreateFeedback>(null);
+  const [authorizeBusy, setAuthorizeBusy] = useState(false);
+  const [authorizeFeedback, setAuthorizeFeedback] = useState<CreateFeedback>(null);
+  const [authorizedForm, setAuthorizedForm] = useState({
+    agentId: '',
+    displayName: '',
+  });
   const [createForm, setCreateForm] = useState({
     clientId: '',
     clientDisplayName: '',
@@ -128,13 +144,15 @@ export default function HelpdeskPage() {
     }
     setError(null);
     try {
-      const [summaryData, agentsData, ticketsData] = await Promise.all([
+      const [summaryData, agentsData, authorizedAgentsData, ticketsData] = await Promise.all([
         apiHelpdeskSummary(),
         apiHelpdeskAgents(),
+        apiHelpdeskAuthorizedAgents(),
         apiHelpdeskTickets(),
       ]);
       setSummary(summaryData);
       setAgents(agentsData);
+      setAuthorizedAgents(authorizedAgentsData);
       setTickets(ticketsData);
       setFailedAvatarIds({});
     } catch {
@@ -168,6 +186,10 @@ export default function HelpdeskPage() {
     return agents.filter((agent) => agent.status === 'available');
   }, [agents]);
 
+  const authorizedAgentIds = useMemo(() => {
+    return new Set(authorizedAgents.map((agent) => agent.agent_id));
+  }, [authorizedAgents]);
+
   useEffect(() => {
     if (
       createForm.preferredAgentId !== 'auto' &&
@@ -180,6 +202,67 @@ export default function HelpdeskPage() {
   const activeQueue = summary
     ? summary.tickets_new + summary.tickets_queued + summary.tickets_opening
     : 0;
+
+  const handleAuthorizeAgent = useCallback(
+    async (event: FormEvent<HTMLFormElement>) => {
+      event.preventDefault();
+      setAuthorizeBusy(true);
+      setAuthorizeFeedback(null);
+      setError(null);
+
+      try {
+        const agent = await apiHelpdeskAuthorizedAgentUpsert({
+          agent_id: authorizedForm.agentId.trim(),
+          display_name: authorizedForm.displayName.trim() || undefined,
+        });
+        setAuthorizeFeedback({
+          tone: 'success',
+          message: `El equipo ${agent.agent_id} quedó habilitado para usar modo agente.`,
+        });
+        setAuthorizedForm({ agentId: '', displayName: '' });
+        await load(true);
+      } catch (authorizeError) {
+        setAuthorizeFeedback({
+          tone: 'error',
+          message:
+            authorizeError instanceof Error
+              ? authorizeError.message
+              : 'No se pudo autorizar el agente.',
+        });
+      } finally {
+        setAuthorizeBusy(false);
+      }
+    },
+    [authorizedForm, load],
+  );
+
+  const handleRemoveAuthorizedAgent = useCallback(
+    async (agentId: string) => {
+      setAuthorizeBusy(true);
+      setAuthorizeFeedback(null);
+      setError(null);
+
+      try {
+        await apiHelpdeskAuthorizedAgentDelete(agentId);
+        setAuthorizeFeedback({
+          tone: 'success',
+          message: `El equipo ${agentId} dejó de estar autorizado como agente.`,
+        });
+        await load(true);
+      } catch (removeError) {
+        setAuthorizeFeedback({
+          tone: 'error',
+          message:
+            removeError instanceof Error
+              ? removeError.message
+              : 'No se pudo quitar la autorización del agente.',
+        });
+      } finally {
+        setAuthorizeBusy(false);
+      }
+    },
+    [load],
+  );
 
   const handleCreateTicket = useCallback(
     async (event: FormEvent<HTMLFormElement>) => {
@@ -329,6 +412,113 @@ export default function HelpdeskPage() {
           </div>
         </>
       )}
+
+      <div className="panel">
+        <div>
+          <h2>Equipos autorizados como agentes</h2>
+          <p className="activity-summary-line">
+            El switch local ya no basta por sí solo. Solo los RustDesk ID autorizados aquí pueden
+            publicar presencia de operador y recibir tickets.
+          </p>
+        </div>
+
+        <form className="stack" onSubmit={(event) => void handleAuthorizeAgent(event)}>
+          <div className="filter-grid">
+            <div>
+              <label htmlFor="authorized-agent-id">RustDesk ID del agente</label>
+              <input
+                id="authorized-agent-id"
+                value={authorizedForm.agentId}
+                onChange={(event) =>
+                  setAuthorizedForm((current) => ({ ...current, agentId: event.target.value }))
+                }
+                placeholder="419797027"
+                required
+              />
+            </div>
+            <div>
+              <label htmlFor="authorized-agent-name">Nombre visible</label>
+              <input
+                id="authorized-agent-name"
+                value={authorizedForm.displayName}
+                onChange={(event) =>
+                  setAuthorizedForm((current) => ({
+                    ...current,
+                    displayName: event.target.value,
+                  }))
+                }
+                placeholder="Edward soporte"
+              />
+            </div>
+          </div>
+
+          <div className="filter-actions">
+            <button type="submit" className="btn primary" disabled={authorizeBusy}>
+              {authorizeBusy ? 'Guardando...' : 'Autorizar agente'}
+            </button>
+            {authorizeFeedback ? (
+              <p className={authorizeFeedback.tone === 'error' ? 'error-text' : 'success-text'}>
+                {authorizeFeedback.message}
+              </p>
+            ) : (
+              <p className="activity-summary-line">
+                Si un cliente final activa el switch por error, no aparecerá como agente si su
+                RustDesk ID no está autorizado aquí.
+              </p>
+            )}
+          </div>
+        </form>
+
+        {authorizedAgents.length === 0 ? (
+          <p>Aún no hay equipos autorizados como agentes.</p>
+        ) : (
+          <table>
+            <thead>
+              <tr>
+                <th>Agente autorizado</th>
+                <th>Estado actual</th>
+                <th>Autorizado desde</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              {authorizedAgents.map((authorizedAgent) => {
+                const liveAgent =
+                  agents.find((agent) => agent.agent_id === authorizedAgent.agent_id) ?? null;
+                const label = authorizedAgent.display_name?.trim() || authorizedAgent.agent_id;
+                return (
+                  <tr key={authorizedAgent.agent_id}>
+                    <td>
+                      <strong>{label}</strong>
+                      <div className="table-subtle">{authorizedAgent.agent_id}</div>
+                    </td>
+                    <td>
+                      {liveAgent ? (
+                        <span className={`status-pill ${statusClass(liveAgent.status)}`}>
+                          {statusLabel(liveAgent.status)}
+                        </span>
+                      ) : (
+                        <span className="status-pill status-neutral">Sin presencia</span>
+                      )}
+                    </td>
+                    <td>{formatDateTime(authorizedAgent.created_at)}</td>
+                    <td>
+                      <button
+                        type="button"
+                        className="btn secondary"
+                        disabled={authorizeBusy}
+                        onClick={() => void handleRemoveAuthorizedAgent(authorizedAgent.agent_id)}
+                      >
+                        Quitar
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
+      </div>
 
       <div className="panel">
         <div>
@@ -532,6 +722,9 @@ export default function HelpdeskPage() {
                       <div>
                         <strong>{agentName(agent)}</strong>
                         <div className="table-subtle">{agent.agent_id}</div>
+                        {!authorizedAgentIds.has(agent.agent_id) && (
+                          <div className="table-subtle">Sin autorización de operador</div>
+                        )}
                       </div>
                     </div>
                   </td>
