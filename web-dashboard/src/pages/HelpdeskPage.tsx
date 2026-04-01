@@ -306,22 +306,21 @@ export default function HelpdeskPage() {
             tone: 'success',
             message: `Ticket ${ticket.ticket_id} enviado a ${
               assignedAgent ? agentName(assignedAgent) : assignedAgentId
-            }. La app del agente intentará conectarse automáticamente al equipo ${ticket.client_id}.`,
+            }. La conexion automatica del agente ocurrira solo despues del despacho del supervisor al equipo ${ticket.client_id}.`,
           });
         } else if (selectedAgent) {
           setCreateFeedback({
             tone: 'success',
             message: `Ticket ${ticket.ticket_id} creado en cola. ${agentName(
               selectedAgent,
-            )} ya no estaba disponible para recibirlo.`,
+            )} queda sugerido, pero el supervisor debe despacharlo manualmente.`,
           });
         } else {
           setCreateFeedback({
             tone: 'success',
-            message: `Ticket ${ticket.ticket_id} creado en cola. Se despachará cuando haya un agente disponible.`,
+            message: `Ticket ${ticket.ticket_id} creado en cola. El supervisor debe despacharlo desde la web.`,
           });
         }
-
         setCreateForm((current) => ({
           ...current,
           clientId: '',
@@ -437,7 +436,7 @@ export default function HelpdeskPage() {
                 onChange={(event) =>
                   setAuthorizedForm((current) => ({ ...current, agentId: event.target.value }))
                 }
-                placeholder="419797027"
+                placeholder="123456789"
                 required
               />
             </div>
@@ -452,7 +451,7 @@ export default function HelpdeskPage() {
                     displayName: event.target.value,
                   }))
                 }
-                placeholder="Edward soporte"
+                placeholder="Mesa de ayuda - turno manana"
               />
             </div>
           </div>
@@ -551,7 +550,7 @@ export default function HelpdeskPage() {
                 onChange={(event) =>
                   setCreateForm((current) => ({ ...current, clientId: event.target.value }))
                 }
-                placeholder="419797027"
+                placeholder="123456789"
                 required
               />
             </div>
@@ -570,7 +569,7 @@ export default function HelpdeskPage() {
               />
             </div>
             <div>
-              <label htmlFor="helpdesk-preferred-agent">Despachar a</label>
+              <label htmlFor="helpdesk-preferred-agent">Agente sugerido</label>
               <select
                 id="helpdesk-preferred-agent"
                 value={createForm.preferredAgentId}
@@ -581,7 +580,7 @@ export default function HelpdeskPage() {
                   }))
                 }
               >
-                <option value="auto">Primer agente disponible</option>
+                <option value="auto">Sin sugerencia</option>
                 {availableAgents.map((agent) => (
                   <option key={agent.agent_id} value={agent.agent_id}>
                     {agentName(agent)} ({agent.agent_id})
@@ -657,7 +656,7 @@ export default function HelpdeskPage() {
 
           <div className="filter-actions">
             <button type="submit" className="btn primary" disabled={createBusy}>
-              {createBusy ? 'Creando...' : 'Crear y despachar'}
+              {createBusy ? 'Creando...' : 'Crear ticket'}
             </button>
             {createFeedback ? (
               <p className={createFeedback.tone === 'error' ? 'error-text' : 'success-text'}>
