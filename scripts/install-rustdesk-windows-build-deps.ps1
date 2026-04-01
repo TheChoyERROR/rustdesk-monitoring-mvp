@@ -86,7 +86,7 @@ if ($InstallAll) {
 
 $vsConfigPath = Join-Path $scriptDir "rustdesk-buildtools.vsconfig"
 $repoRoot = Split-Path -Parent $scriptDir
-$vendoredFlutterRoot = Get-RustDeskFlutterRoot -RepoRoot $repoRoot
+$vendoredFlutterRoot = Get-RustDeskVendoredFlutterRoot -RepoRoot $repoRoot
 $vendoredFlutterVersion = Get-RustDeskFlutterVersion -FlutterRoot $vendoredFlutterRoot
 $winget = Ensure-Winget
 

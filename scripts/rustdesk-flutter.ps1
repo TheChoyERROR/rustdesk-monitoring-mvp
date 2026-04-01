@@ -1,3 +1,27 @@
+function Get-RustDeskVendoredFlutterRoot {
+  param([string]$RepoRoot = "")
+
+  if ([string]::IsNullOrWhiteSpace($RepoRoot)) {
+    $RepoRoot = Split-Path -Parent $PSScriptRoot
+  }
+
+  foreach ($candidate in @(
+      (Join-Path $RepoRoot "tools\flutter-3.24.5"),
+      (Join-Path $RepoRoot "tools\flutter")
+    )) {
+    if ([string]::IsNullOrWhiteSpace($candidate)) {
+      continue
+    }
+
+    $flutterBat = Join-Path $candidate "bin\flutter.bat"
+    if (Test-Path $flutterBat) {
+      return (Resolve-Path $candidate).Path
+    }
+  }
+
+  return $null
+}
+
 function Get-RustDeskFlutterRoot {
   param([string]$RepoRoot = "")
 
@@ -5,13 +29,16 @@ function Get-RustDeskFlutterRoot {
     $RepoRoot = Split-Path -Parent $PSScriptRoot
   }
 
+  $vendoredFlutterRoot = Get-RustDeskVendoredFlutterRoot -RepoRoot $RepoRoot
+  if (-not [string]::IsNullOrWhiteSpace($vendoredFlutterRoot)) {
+    return $vendoredFlutterRoot
+  }
+
   $candidateRoots = New-Object 'System.Collections.Generic.List[string]'
 
   foreach ($candidate in @(
       $env:RUSTDESK_FLUTTER_ROOT,
-      $env:FLUTTER_ROOT,
-      (Join-Path $RepoRoot "tools\flutter-3.24.5"),
-      (Join-Path $RepoRoot "tools\flutter")
+      $env:FLUTTER_ROOT
     )) {
     if (-not [string]::IsNullOrWhiteSpace($candidate)) {
       $candidateRoots.Add($candidate)
