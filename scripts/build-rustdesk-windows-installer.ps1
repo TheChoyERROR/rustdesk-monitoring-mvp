@@ -6,6 +6,7 @@ param(
   [string]$Version = "",
   [string]$OutputDir = "",
   [string]$AppName = "RustDesk Monitoring Corporate",
+  [string]$NativeAppName = "RustDesk",
   [string]$CompanyName = "YourCompany",
   [string]$InstallDirName = "RustDeskMonitoringCorporate",
   [string]$UninstallKey = "RustDeskMonitoringCorporate",
@@ -269,8 +270,10 @@ Contenido instalado:
 - MONITORING-POLICY.txt
 
 Uso recomendado:
-1) Abrir el acceso directo "$AppName" del menu Inicio, o
-2) Ejecutar launch-rustdesk.cmd
+1) El ZIP portable usa launch-rustdesk.cmd para inyectar RUSTDESK_MONITORING_URL.
+2) El setup.exe arranca la instalacion nativa de $NativeAppName y luego configura
+   monitoring-server-url dentro de la app instalada.
+3) Despues del setup, usa el acceso directo nativo de $NativeAppName creado en Windows.
 
 El launcher configura RUSTDESK_MONITORING_URL en:
 $MonitoringUrl
@@ -332,83 +335,56 @@ SetCompressor /SOLID lzma
 !define EXE_NAME "$exeName"
 !define STAGE_DIR "$(To-NsisPath $stageDir)"
 !define OUTPUT_EXE "$(To-NsisPath $setupExePath)"
-!define INSTALL_DIR_NAME "$InstallDirName"
-!define UNINSTALL_KEY "$UninstallKey"
+!define MONITORING_URL "$MonitoringUrl"
+!define NATIVE_APP_NAME "$NativeAppName"
+!define NATIVE_UNINSTALL_KEY "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\$NativeAppName"
 
 Name "`${APP_NAME}"
 OutFile "`${OUTPUT_EXE}"
-InstallDir "`$PROGRAMFILES64\\`${INSTALL_DIR_NAME}"
-InstallDirRegKey HKLM "Software\\`${UNINSTALL_KEY}" "InstallLocation"
-
-Page directory
 Page instfiles
-UninstPage uninstConfirm
-UninstPage instfiles
-
-Function CloseRunningRustDesk
-  DetailPrint "Cerrando instancias activas de `${EXE_NAME} si existen..."
-  ClearErrors
-  ExecWait '`"`$SYSDIR\\taskkill.exe`" /F /T /IM `${EXE_NAME}' `$0
-  Sleep 1000
-FunctionEnd
-
-Function un.CloseRunningRustDesk
-  DetailPrint "Cerrando instancias activas de `${EXE_NAME} si existen..."
-  ClearErrors
-  ExecWait '`"`$SYSDIR\\taskkill.exe`" /F /T /IM `${EXE_NAME}' `$0
-  Sleep 1000
-FunctionEnd
 
 Section "Install"
   SetShellVarContext all
-  Call CloseRunningRustDesk
-  SetOutPath "`$INSTDIR\\app"
+  SetRegView 64
+  InitPluginsDir
+  SetOutPath "`$PLUGINSDIR\\bootstrap\\app"
   File /r "`${STAGE_DIR}\\app\\*.*"
 
-  SetOutPath "`$INSTDIR"
-  File "`${STAGE_DIR}\\launch-rustdesk.cmd"
-  File "`${STAGE_DIR}\\launch-rustdesk.ps1"
+  SetOutPath "`$PLUGINSDIR\\bootstrap"
   File "`${STAGE_DIR}\\monitoring-launcher.env"
   File "`${STAGE_DIR}\\MONITORING-POLICY.txt"
   File "`${STAGE_DIR}\\README-INSTALL.txt"
 
-  CreateDirectory "`$SMPROGRAMS\\`${APP_NAME}"
-  CreateShortCut "`$SMPROGRAMS\\`${APP_NAME}\\`${APP_NAME}.lnk" "`$INSTDIR\\launch-rustdesk.cmd"
-  CreateShortCut "`$DESKTOP\\`${APP_NAME}.lnk" "`$INSTDIR\\launch-rustdesk.cmd"
+  DetailPrint "Instalando `${NATIVE_APP_NAME} a nivel de sistema..."
+  ClearErrors
+  ExecWait '`"`$PLUGINSDIR\\bootstrap\\app\\`${EXE_NAME}`" --silent-install' `$0
+  StrCmp `$0 0 +3
+    MessageBox MB_ICONSTOP "La instalacion nativa de `${NATIVE_APP_NAME} fallo con codigo `$0."
+    Abort
 
-  WriteUninstaller "`$INSTDIR\\Uninstall.exe"
+  ReadRegStr `$1 HKLM "`${NATIVE_UNINSTALL_KEY}" "InstallLocation"
+  StrCmp `$1 "" native_install_location_missing native_install_location_ready
 
-  WriteRegStr HKLM "Software\\`${UNINSTALL_KEY}" "DisplayName" "`${APP_NAME}"
-  WriteRegStr HKLM "Software\\`${UNINSTALL_KEY}" "DisplayVersion" "`${APP_VERSION}"
-  WriteRegStr HKLM "Software\\`${UNINSTALL_KEY}" "Publisher" "`${COMPANY_NAME}"
-  WriteRegStr HKLM "Software\\`${UNINSTALL_KEY}" "InstallLocation" "`$INSTDIR"
-  WriteRegStr HKLM "Software\\`${UNINSTALL_KEY}" "UninstallString" "`$\"`$INSTDIR\\Uninstall.exe`$\""
+native_install_location_missing:
+  MessageBox MB_ICONEXCLAMATION "La instalacion termino, pero no se pudo leer InstallLocation de `${NATIVE_APP_NAME}. Revisa si la app se instalo correctamente."
+  Goto native_install_done
 
-  WriteRegStr HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\`${UNINSTALL_KEY}" "DisplayName" "`${APP_NAME}"
-  WriteRegStr HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\`${UNINSTALL_KEY}" "DisplayVersion" "`${APP_VERSION}"
-  WriteRegStr HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\`${UNINSTALL_KEY}" "Publisher" "`${COMPANY_NAME}"
-  WriteRegStr HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\`${UNINSTALL_KEY}" "InstallLocation" "`$INSTDIR"
-  WriteRegStr HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\`${UNINSTALL_KEY}" "UninstallString" "`$\"`$INSTDIR\\Uninstall.exe`$\""
-SectionEnd
+native_install_location_ready:
+  DetailPrint "Guardando monitoring-server-url en la instalacion nativa..."
+  ClearErrors
+  ExecWait '`"`$1\\`${EXE_NAME}`" --option "monitoring-server-url" "`${MONITORING_URL}"' `$2
+  StrCmp `$2 0 +3
+    MessageBox MB_ICONEXCLAMATION "La instalacion nativa termino, pero no se pudo guardar monitoring-server-url. Codigo: `$2"
 
-Section "Uninstall"
-  SetShellVarContext all
-  Call un.CloseRunningRustDesk
-  Delete "`$DESKTOP\\`${APP_NAME}.lnk"
-  Delete "`$SMPROGRAMS\\`${APP_NAME}\\`${APP_NAME}.lnk"
-  RMDir "`$SMPROGRAMS\\`${APP_NAME}"
+  DetailPrint "Guardando monitoring-server legacy option..."
+  ClearErrors
+  ExecWait '`"`$1\\`${EXE_NAME}`" --option "monitoring-server" "`${MONITORING_URL}"' `$3
 
-  Delete "`$INSTDIR\\launch-rustdesk.cmd"
-  Delete "`$INSTDIR\\launch-rustdesk.ps1"
-  Delete "`$INSTDIR\\monitoring-launcher.env"
-  Delete "`$INSTDIR\\MONITORING-POLICY.txt"
-  Delete "`$INSTDIR\\README-INSTALL.txt"
-  Delete "`$INSTDIR\\Uninstall.exe"
-  RMDir /r "`$INSTDIR\\app"
-  RMDir "`$INSTDIR"
+  CopyFiles /SILENT "`$PLUGINSDIR\\bootstrap\\monitoring-launcher.env" "`$1\\monitoring-launcher.env"
+  CopyFiles /SILENT "`$PLUGINSDIR\\bootstrap\\MONITORING-POLICY.txt" "`$1\\MONITORING-POLICY.txt"
+  CopyFiles /SILENT "`$PLUGINSDIR\\bootstrap\\README-INSTALL.txt" "`$1\\README-INSTALL.txt"
 
-  DeleteRegKey HKLM "Software\\`${UNINSTALL_KEY}"
-  DeleteRegKey HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\`${UNINSTALL_KEY}"
+native_install_done:
 SectionEnd
 "@ | Set-Content -Path $nsiPath -Encoding ASCII
 
