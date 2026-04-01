@@ -307,6 +307,10 @@ pub async fn init_schema(pool: &SqlitePool) -> anyhow::Result<()> {
             client_display_name TEXT,
             device_id TEXT,
             requested_by TEXT,
+            title TEXT,
+            description TEXT,
+            difficulty TEXT,
+            estimated_minutes INTEGER,
             summary TEXT,
             status TEXT NOT NULL,
             assigned_agent_id TEXT,
@@ -319,6 +323,11 @@ pub async fn init_schema(pool: &SqlitePool) -> anyhow::Result<()> {
     .execute(pool)
     .await
     .context("failed to create helpdesk_tickets table")?;
+
+    ensure_text_column(pool, "helpdesk_tickets", "title").await?;
+    ensure_text_column(pool, "helpdesk_tickets", "description").await?;
+    ensure_text_column(pool, "helpdesk_tickets", "difficulty").await?;
+    ensure_integer_column(pool, "helpdesk_tickets", "estimated_minutes").await?;
 
     sqlx::query(
         r#"
@@ -1108,6 +1117,11 @@ pub async fn create_helpdesk_ticket(
     let ticket_id = Uuid::new_v4().to_string();
     let client_id = payload.client_id.trim().to_string();
     let preferred_agent_id = normalize_optional_text(payload.preferred_agent_id.as_deref());
+    let normalized_title = normalize_optional_text(payload.title.as_deref());
+    let normalized_summary =
+        normalize_optional_text(payload.summary.as_deref()).or_else(|| normalized_title.clone());
+    let normalized_description = normalize_optional_text(payload.description.as_deref());
+    let normalized_difficulty = normalize_optional_text(payload.difficulty.as_deref());
 
     let mut tx = pool
         .begin()
@@ -1122,6 +1136,10 @@ pub async fn create_helpdesk_ticket(
             client_display_name,
             device_id,
             requested_by,
+            title,
+            description,
+            difficulty,
+            estimated_minutes,
             summary,
             status,
             assigned_agent_id,
@@ -1129,7 +1147,7 @@ pub async fn create_helpdesk_ticket(
             created_at,
             updated_at
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued', NULL, NULL, ?7, ?8)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'queued', NULL, NULL, ?11, ?12)
         "#,
     )
     .bind(&ticket_id)
@@ -1139,7 +1157,11 @@ pub async fn create_helpdesk_ticket(
     ))
     .bind(normalize_optional_text(payload.device_id.as_deref()))
     .bind(normalize_optional_text(payload.requested_by.as_deref()))
-    .bind(normalize_optional_text(payload.summary.as_deref()))
+    .bind(normalized_title.clone())
+    .bind(normalized_description.clone())
+    .bind(normalized_difficulty.clone())
+    .bind(payload.estimated_minutes.map(i64::from))
+    .bind(normalized_summary.clone())
     .bind(now_ms)
     .bind(now_ms)
     .execute(&mut *tx)
@@ -1154,6 +1176,11 @@ pub async fn create_helpdesk_ticket(
         Some(serde_json::json!({
             "client_id": client_id,
             "device_id": payload.device_id,
+            "title": normalized_title,
+            "description": normalized_description,
+            "difficulty": normalized_difficulty,
+            "estimated_minutes": payload.estimated_minutes,
+            "summary": normalized_summary,
         })),
         now_ms,
     )
@@ -1262,7 +1289,12 @@ pub async fn assign_helpdesk_ticket(
         .with_context(|| format!("helpdesk ticket '{}' not found after assign", ticket_id))?;
     let agent = get_helpdesk_agent_tx(&mut tx, &selected_agent_id)
         .await?
-        .with_context(|| format!("helpdesk agent '{}' not found after assign", selected_agent_id))?;
+        .with_context(|| {
+            format!(
+                "helpdesk agent '{}' not found after assign",
+                selected_agent_id
+            )
+        })?;
 
     tx.commit()
         .await
@@ -1301,6 +1333,10 @@ pub async fn list_helpdesk_tickets(pool: &SqlitePool) -> anyhow::Result<Vec<Help
             client_display_name,
             device_id,
             requested_by,
+            title,
+            description,
+            difficulty,
+            estimated_minutes,
             summary,
             status,
             assigned_agent_id,
@@ -1369,6 +1405,10 @@ pub async fn get_helpdesk_ticket(
             client_display_name,
             device_id,
             requested_by,
+            title,
+            description,
+            difficulty,
+            estimated_minutes,
             summary,
             status,
             assigned_agent_id,
@@ -2707,6 +2747,26 @@ async fn ensure_text_column(pool: &SqlitePool, table: &str, column: &str) -> any
     Ok(())
 }
 
+async fn ensure_integer_column(pool: &SqlitePool, table: &str, column: &str) -> anyhow::Result<()> {
+    let rows = sqlx::query(&format!("PRAGMA table_info({table})"))
+        .fetch_all(pool)
+        .await
+        .with_context(|| format!("failed to inspect SQLite schema for table '{table}'"))?;
+
+    let exists = rows
+        .iter()
+        .any(|row| row.get::<String, _>("name").eq_ignore_ascii_case(column));
+    if exists {
+        return Ok(());
+    }
+
+    sqlx::query(&format!("ALTER TABLE {table} ADD COLUMN {column} INTEGER"))
+        .execute(pool)
+        .await
+        .with_context(|| format!("failed to add column '{column}' to table '{table}'"))?;
+    Ok(())
+}
+
 fn role_from_db(raw: &str) -> AuthRoleV1 {
     match raw.trim().to_ascii_lowercase().as_str() {
         "supervisor" => AuthRoleV1::Supervisor,
@@ -2997,6 +3057,10 @@ async fn get_helpdesk_ticket_tx(
             client_display_name,
             device_id,
             requested_by,
+            title,
+            description,
+            difficulty,
+            estimated_minutes,
             summary,
             status,
             assigned_agent_id,
@@ -3037,6 +3101,12 @@ fn row_to_helpdesk_ticket(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<Helpde
         client_display_name: row.get("client_display_name"),
         device_id: row.get("device_id"),
         requested_by: row.get("requested_by"),
+        title: row.get("title"),
+        description: row.get("description"),
+        difficulty: row.get("difficulty"),
+        estimated_minutes: row
+            .get::<Option<i64>, _>("estimated_minutes")
+            .and_then(|value| u32::try_from(value).ok()),
         summary: row.get("summary"),
         status: helpdesk_ticket_status_from_db(&status),
         assigned_agent_id: row.get("assigned_agent_id"),
@@ -3381,6 +3451,10 @@ mod tests {
                 client_display_name: Some("Cliente 1".to_string()),
                 device_id: Some("device-1".to_string()),
                 requested_by: Some("user@example.com".to_string()),
+                title: None,
+                description: None,
+                difficulty: None,
+                estimated_minutes: None,
                 summary: Some("Necesito ayuda".to_string()),
                 preferred_agent_id: None,
             },
@@ -3437,6 +3511,10 @@ mod tests {
                 client_display_name: Some("Cliente Preferred".to_string()),
                 device_id: None,
                 requested_by: Some("Supervisor".to_string()),
+                title: None,
+                description: None,
+                difficulty: None,
+                estimated_minutes: None,
                 summary: Some("Dispatch to agent 2".to_string()),
                 preferred_agent_id: Some("agent-2".to_string()),
             },
@@ -3475,6 +3553,10 @@ mod tests {
                 client_display_name: None,
                 device_id: None,
                 requested_by: None,
+                title: None,
+                description: None,
+                difficulty: None,
+                estimated_minutes: None,
                 summary: Some("En cola".to_string()),
                 preferred_agent_id: None,
             },
@@ -3535,6 +3617,10 @@ mod tests {
                 client_display_name: None,
                 device_id: None,
                 requested_by: None,
+                title: None,
+                description: None,
+                difficulty: None,
+                estimated_minutes: None,
                 summary: Some("Lifecycle".to_string()),
                 preferred_agent_id: None,
             },
@@ -3587,6 +3673,10 @@ mod tests {
                 client_display_name: None,
                 device_id: None,
                 requested_by: None,
+                title: None,
+                description: None,
+                difficulty: None,
+                estimated_minutes: None,
                 summary: Some("Opening timeout".to_string()),
                 preferred_agent_id: None,
             },
@@ -3654,6 +3744,10 @@ mod tests {
                 client_display_name: None,
                 device_id: None,
                 requested_by: None,
+                title: None,
+                description: None,
+                difficulty: None,
+                estimated_minutes: None,
                 summary: Some("Busy stale".to_string()),
                 preferred_agent_id: None,
             },
@@ -3722,6 +3816,10 @@ mod tests {
                 client_display_name: Some("Cliente Audit".to_string()),
                 device_id: Some("device-audit".to_string()),
                 requested_by: None,
+                title: None,
+                description: None,
+                difficulty: None,
+                estimated_minutes: None,
                 summary: Some("Resumen".to_string()),
                 preferred_agent_id: None,
             },
@@ -3776,6 +3874,10 @@ mod tests {
                 client_display_name: Some("Cliente Manual".to_string()),
                 device_id: None,
                 requested_by: Some("Supervisor".to_string()),
+                title: None,
+                description: None,
+                difficulty: None,
+                estimated_minutes: None,
                 summary: Some("Manual dispatch".to_string()),
                 preferred_agent_id: None,
             },
@@ -3818,9 +3920,15 @@ mod tests {
         .expect("assign queued ticket");
 
         assert_eq!(assigned_ticket.status, HelpdeskTicketStatus::Opening);
-        assert_eq!(assigned_ticket.assigned_agent_id.as_deref(), Some("agent-2"));
+        assert_eq!(
+            assigned_ticket.assigned_agent_id.as_deref(),
+            Some("agent-2")
+        );
         assert_eq!(assigned_agent.status, HelpdeskAgentStatus::Opening);
-        assert_eq!(assigned_agent.current_ticket_id.as_deref(), Some(ticket.ticket_id.as_str()));
+        assert_eq!(
+            assigned_agent.current_ticket_id.as_deref(),
+            Some(ticket.ticket_id.as_str())
+        );
     }
 
     #[tokio::test]
@@ -3848,6 +3956,10 @@ mod tests {
                 client_display_name: Some("Cliente Requeue".to_string()),
                 device_id: None,
                 requested_by: None,
+                title: None,
+                description: None,
+                difficulty: None,
+                estimated_minutes: None,
                 summary: Some("Supervisor requeue".to_string()),
                 preferred_agent_id: None,
             },
@@ -3896,6 +4008,10 @@ mod tests {
                 client_display_name: Some("Cliente Cancel".to_string()),
                 device_id: None,
                 requested_by: None,
+                title: None,
+                description: None,
+                difficulty: None,
+                estimated_minutes: None,
                 summary: Some("Supervisor cancel".to_string()),
                 preferred_agent_id: None,
             },

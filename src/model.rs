@@ -258,6 +258,14 @@ pub struct HelpdeskTicketCreateRequestV1 {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requested_by: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub difficulty: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimated_minutes: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preferred_agent_id: Option<String>,
@@ -273,6 +281,14 @@ pub struct HelpdeskTicketV1 {
     pub device_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requested_by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub difficulty: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimated_minutes: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
     pub status: HelpdeskTicketStatus,
@@ -375,6 +391,24 @@ impl HelpdeskTicketCreateRequestV1 {
         if self.client_id.trim().is_empty() {
             return Err(EventValidationError::EmptyField("client_id"));
         }
+        if let Some(title) = &self.title {
+            if title.trim().is_empty() {
+                return Err(EventValidationError::EmptyField("title"));
+            }
+        }
+        if let Some(description) = &self.description {
+            if description.trim().is_empty() {
+                return Err(EventValidationError::EmptyField("description"));
+            }
+        }
+        if let Some(difficulty) = &self.difficulty {
+            if difficulty.trim().is_empty() {
+                return Err(EventValidationError::EmptyField("difficulty"));
+            }
+        }
+        if matches!(self.estimated_minutes, Some(0)) {
+            return Err(EventValidationError::InvalidHelpdeskEstimatedMinutes);
+        }
         if let Some(preferred_agent_id) = &self.preferred_agent_id {
             if preferred_agent_id.trim().is_empty() {
                 return Err(EventValidationError::EmptyField("preferred_agent_id"));
@@ -441,6 +475,8 @@ pub enum EventValidationError {
     EmptyField(&'static str),
     #[error("meta field must be a JSON object")]
     MetaMustBeObject,
+    #[error("estimated_minutes must be greater than zero")]
+    InvalidHelpdeskEstimatedMinutes,
     #[error("next_agent_status must be either 'available' or 'away'")]
     InvalidHelpdeskAgentTerminalStatus,
 }

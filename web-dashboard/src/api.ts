@@ -150,6 +150,10 @@ export interface HelpdeskCreateTicketBody {
   client_display_name?: string;
   device_id?: string;
   requested_by?: string;
+  title?: string;
+  description?: string;
+  difficulty?: string;
+  estimated_minutes?: number;
   summary?: string;
   preferred_agent_id?: string;
 }

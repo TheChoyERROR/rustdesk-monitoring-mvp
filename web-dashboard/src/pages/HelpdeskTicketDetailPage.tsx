@@ -56,6 +56,18 @@ function statusClass(status: HelpdeskTicketStatus) {
   }
 }
 
+function difficultyLabel(rawDifficulty?: string | null) {
+  switch ((rawDifficulty ?? '').trim().toLowerCase()) {
+    case 'low':
+      return 'Baja';
+    case 'high':
+      return 'Alta';
+    case 'medium':
+    default:
+      return 'Media';
+  }
+}
+
 function auditPayloadToText(payload: HelpdeskAuditEvent['payload']) {
   if (!payload || Object.keys(payload).length === 0) {
     return '';
@@ -274,6 +286,14 @@ export default function HelpdeskTicketDetailPage() {
                 <div>{ticket.assigned_agent_id || 'Sin asignar'}</div>
               </div>
               <div>
+                <label>Dificultad</label>
+                <div>{ticket.difficulty ? difficultyLabel(ticket.difficulty) : '-'}</div>
+              </div>
+              <div>
+                <label>Tiempo estimado</label>
+                <div>{ticket.estimated_minutes ? `${ticket.estimated_minutes} min` : '-'}</div>
+              </div>
+              <div>
                 <label>Deadline de apertura</label>
                 <div>{ticket.opening_deadline_at ? formatDateTime(ticket.opening_deadline_at) : '-'}</div>
               </div>
@@ -286,7 +306,19 @@ export default function HelpdeskTicketDetailPage() {
                 <div>{formatDateTime(ticket.updated_at)}</div>
               </div>
             </div>
-            {ticket.summary ? (
+            {ticket.title ? (
+              <div className="detail-block">
+                <label>Titulo</label>
+                <div>{ticket.title}</div>
+              </div>
+            ) : null}
+            {ticket.description ? (
+              <div className="detail-block">
+                <label>Descripcion</label>
+                <div>{ticket.description}</div>
+              </div>
+            ) : null}
+            {!ticket.title && ticket.summary ? (
               <div className="detail-block">
                 <label>Resumen</label>
                 <div>{ticket.summary}</div>

@@ -63,6 +63,18 @@ function statusClass(status: HelpdeskTicketStatus | HelpdeskAgentStatus) {
   }
 }
 
+function difficultyLabel(rawDifficulty?: string | null) {
+  switch ((rawDifficulty ?? '').trim().toLowerCase()) {
+    case 'low':
+      return 'Baja';
+    case 'high':
+      return 'Alta';
+    case 'medium':
+    default:
+      return 'Media';
+  }
+}
+
 function agentName(agent: HelpdeskAgent): string {
   const displayName = agent.display_name?.trim();
   if (displayName) {
@@ -101,7 +113,10 @@ export default function HelpdeskPage() {
   const [createForm, setCreateForm] = useState({
     clientId: '',
     clientDisplayName: '',
-    summary: '',
+    title: '',
+    description: '',
+    difficulty: 'medium',
+    estimatedMinutes: '30',
     preferredAgentId: 'auto',
   });
 
@@ -183,7 +198,12 @@ export default function HelpdeskPage() {
         const ticket = await apiHelpdeskCreateTicket({
           client_id: createForm.clientId.trim(),
           client_display_name: createForm.clientDisplayName.trim() || undefined,
-          summary: createForm.summary.trim() || undefined,
+          title: createForm.title.trim() || undefined,
+          description: createForm.description.trim() || undefined,
+          difficulty: createForm.difficulty.trim() || undefined,
+          estimated_minutes:
+            Number.parseInt(createForm.estimatedMinutes.trim(), 10) || undefined,
+          summary: createForm.title.trim() || undefined,
           preferred_agent_id: preferredAgentId,
         });
 
@@ -218,7 +238,9 @@ export default function HelpdeskPage() {
           ...current,
           clientId: '',
           clientDisplayName: '',
-          summary: '',
+          title: '',
+          description: '',
+          estimatedMinutes: '30',
         }));
         await load(true);
       } catch (createError) {
@@ -312,8 +334,8 @@ export default function HelpdeskPage() {
         <div>
           <h2>Crear ticket</h2>
           <p className="activity-summary-line">
-            Crea el ticket desde la web usando el RustDesk ID de la maquina. Si eliges un agente
-            disponible, el sistema se lo despacha de inmediato; si no, queda en cola.
+            Crea el ticket desde la web usando el RustDesk ID de la maquina. Ahora puedes registrar
+            titulo, descripcion, dificultad y tiempo estimado antes de despacharlo.
           </p>
           <p className="activity-summary-line">
             Agentes disponibles ahora: <strong>{availableAgents.length}</strong>
@@ -369,17 +391,69 @@ export default function HelpdeskPage() {
               </select>
             </div>
             <div>
-              <label htmlFor="helpdesk-summary">Resumen</label>
+              <label htmlFor="helpdesk-title">Titulo</label>
               <input
-                id="helpdesk-summary"
-                value={createForm.summary}
+                id="helpdesk-title"
+                value={createForm.title}
                 onChange={(event) =>
-                  setCreateForm((current) => ({ ...current, summary: event.target.value }))
+                  setCreateForm((current) => ({ ...current, title: event.target.value }))
                 }
                 placeholder="No puede abrir el sistema contable"
                 required
               />
             </div>
+            <div>
+              <label htmlFor="helpdesk-difficulty">Dificultad</label>
+              <select
+                id="helpdesk-difficulty"
+                value={createForm.difficulty}
+                onChange={(event) =>
+                  setCreateForm((current) => ({
+                    ...current,
+                    difficulty: event.target.value,
+                  }))
+                }
+              >
+                <option value="low">Baja</option>
+                <option value="medium">Media</option>
+                <option value="high">Alta</option>
+              </select>
+            </div>
+            <div>
+              <label htmlFor="helpdesk-estimated">Tiempo aprox. (min)</label>
+              <input
+                id="helpdesk-estimated"
+                type="number"
+                min="1"
+                step="1"
+                value={createForm.estimatedMinutes}
+                onChange={(event) =>
+                  setCreateForm((current) => ({
+                    ...current,
+                    estimatedMinutes: event.target.value,
+                  }))
+                }
+                placeholder="30"
+                required
+              />
+            </div>
+          </div>
+
+          <div>
+            <label htmlFor="helpdesk-description">Descripcion</label>
+            <textarea
+              id="helpdesk-description"
+              value={createForm.description}
+              onChange={(event) =>
+                setCreateForm((current) => ({
+                  ...current,
+                  description: event.target.value,
+                }))
+              }
+              placeholder="Describe claramente lo que el cliente necesita y cualquier error visible."
+              rows={4}
+              required
+            />
           </div>
 
           <div className="filter-actions">
@@ -521,11 +595,20 @@ export default function HelpdeskPage() {
                         {ticket.ticket_id}
                       </Link>
                     </strong>
-                    {ticket.summary ? <div className="table-subtle">{ticket.summary}</div> : null}
+                    {ticket.title ? <div className="table-subtle">{ticket.title}</div> : null}
+                    {!ticket.title && ticket.summary ? (
+                      <div className="table-subtle">{ticket.summary}</div>
+                    ) : null}
                   </td>
                   <td>
                     <strong>{ticket.client_display_name || ticket.client_id}</strong>
                     <div className="table-subtle">{ticket.client_id}</div>
+                    {ticket.difficulty ? (
+                      <div className="table-subtle">
+                        {difficultyLabel(ticket.difficulty)}
+                        {ticket.estimated_minutes ? ` · ${ticket.estimated_minutes} min` : ''}
+                      </div>
+                    ) : null}
                   </td>
                   <td>
                     <span className={`status-pill ${statusClass(ticket.status)}`}>

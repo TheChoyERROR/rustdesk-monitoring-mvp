@@ -109,6 +109,10 @@ export interface HelpdeskTicket {
   client_display_name?: string | null;
   device_id?: string | null;
   requested_by?: string | null;
+  title?: string | null;
+  description?: string | null;
+  difficulty?: string | null;
+  estimated_minutes?: number | null;
   summary?: string | null;
   status: HelpdeskTicketStatus;
   assigned_agent_id?: string | null;
