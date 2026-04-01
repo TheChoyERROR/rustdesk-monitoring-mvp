@@ -2212,6 +2212,8 @@ pub async fn get_dashboard_summary(
 ) -> anyhow::Result<DashboardSummaryV1> {
     let from_str = from.to_rfc3339();
     let to_str = to.to_rfc3339();
+    let from_ms = from.timestamp_millis();
+    let to_ms = to.timestamp_millis();
 
     let row = sqlx::query(
         r#"
@@ -2244,9 +2246,12 @@ pub async fn get_dashboard_summary(
         r#"
         SELECT status, COUNT(*) AS total
         FROM outbox_events
+        WHERE created_at >= ?1 AND created_at <= ?2
         GROUP BY status
         "#,
     )
+    .bind(from_ms)
+    .bind(to_ms)
     .fetch_all(pool)
     .await
     .context("failed to aggregate outbox status counts")?;
