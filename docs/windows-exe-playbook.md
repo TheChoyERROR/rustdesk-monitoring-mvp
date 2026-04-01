@@ -76,7 +76,19 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build-rustdesk-windows-instal
 
 Opciones utiles:
 - `-BuildRustDesk`: ejecuta build del fork antes de empaquetar.
+- `-RustDeskExePath`: usa un `.exe` ya compilado sin depender de autodeteccion.
 - `-SkipNsis`: omite el instalador NSIS y deja paquete portable/staging.
+
+Artefactos a conservar por release:
+- `*-setup.exe`
+- `*-portable.zip`
+- `package-manifest.json`
+
+Primera prueba recomendada:
+1. Generar paquete contra `http://127.0.0.1:8080`.
+2. Instalar en una VM o PC Windows limpia.
+3. Abrir el acceso directo creado por el instalador.
+4. Validar que el backend recibe eventos del fork corporativo.
 
 ## Checklist de verificacion final
 1. Instalar paquete en una PC limpia.
