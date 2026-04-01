@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::Path;
 
 use anyhow::Context;
@@ -1031,10 +1032,11 @@ pub async fn upsert_helpdesk_agent_presence(
     payload: &HelpdeskAgentPresenceUpdateV1,
 ) -> anyhow::Result<HelpdeskAgentV1> {
     let now_ms = unix_millis_now() as i64;
-    if !is_helpdesk_agent_authorized(pool, payload.agent_id.trim()).await? {
+    let agent_id = normalize_helpdesk_agent_id(&payload.agent_id);
+    if !is_helpdesk_agent_authorized(pool, &agent_id).await? {
         anyhow::bail!(
             "agent '{}' is not authorized for helpdesk operator mode",
-            payload.agent_id.trim()
+            agent_id
         );
     }
     let display_name = payload
@@ -1042,9 +1044,8 @@ pub async fn upsert_helpdesk_agent_presence(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .unwrap_or(payload.agent_id.trim())
+        .unwrap_or(&agent_id)
         .to_string();
-    let agent_id = payload.agent_id.trim().to_string();
     let avatar_url = payload
         .avatar_url
         .as_deref()
@@ -1135,8 +1136,10 @@ pub async fn upsert_helpdesk_authorized_agent(
     payload: &HelpdeskAuthorizedAgentUpsertRequestV1,
 ) -> anyhow::Result<HelpdeskAuthorizedAgentV1> {
     let now_ms = unix_millis_now() as i64;
-    let agent_id = payload.agent_id.trim().to_string();
-    let display_name = normalize_optional_text(payload.display_name.as_deref());
+    let agent_id = normalize_helpdesk_agent_id(&payload.agent_id);
+    let existing_agent = get_helpdesk_authorized_agent(pool, &agent_id).await?;
+    let display_name = normalize_optional_text(payload.display_name.as_deref())
+        .or_else(|| existing_agent.and_then(|agent| agent.display_name));
 
     sqlx::query(
         r#"
@@ -1154,6 +1157,8 @@ pub async fn upsert_helpdesk_authorized_agent(
     .execute(pool)
     .await
     .with_context(|| format!("failed to upsert authorized helpdesk agent '{}'", agent_id))?;
+
+    delete_legacy_helpdesk_authorized_agent_variants(pool, &agent_id).await?;
 
     get_helpdesk_authorized_agent(pool, &agent_id)
         .await?
@@ -1179,26 +1184,37 @@ pub async fn list_helpdesk_authorized_agents(
     .await
     .context("failed to list authorized helpdesk agents")?;
 
-    rows.into_iter()
-        .map(row_to_helpdesk_authorized_agent)
-        .collect()
+    let mut normalized_ids = HashSet::new();
+    let mut agents = Vec::new();
+    for row in rows {
+        let agent = row_to_helpdesk_authorized_agent(row)?;
+        if normalized_ids.insert(agent.agent_id.clone()) {
+            agents.push(agent);
+        }
+    }
+    Ok(agents)
 }
 
 pub async fn get_helpdesk_authorized_agent(
     pool: &SqlitePool,
     agent_id: &str,
 ) -> anyhow::Result<Option<HelpdeskAuthorizedAgentV1>> {
-    let row = sqlx::query(
+    let agent_id = normalize_helpdesk_agent_id(agent_id);
+    let normalized_sql = normalized_helpdesk_agent_id_sql("agent_id");
+    let query = format!(
         r#"
         SELECT agent_id, display_name, created_at, updated_at
         FROM helpdesk_authorized_agents
-        WHERE agent_id = ?1
-        "#,
-    )
-    .bind(agent_id)
-    .fetch_optional(pool)
-    .await
-    .with_context(|| format!("failed to query authorized helpdesk agent '{}'", agent_id))?;
+        WHERE {normalized_sql} = ?1
+        ORDER BY updated_at DESC, agent_id ASC
+        LIMIT 1
+        "#
+    );
+    let row = sqlx::query(&query)
+        .bind(&agent_id)
+        .fetch_optional(pool)
+        .await
+        .with_context(|| format!("failed to query authorized helpdesk agent '{}'", agent_id))?;
 
     row.map(row_to_helpdesk_authorized_agent).transpose()
 }
@@ -1207,9 +1223,10 @@ pub async fn get_helpdesk_agent_authorization_status(
     pool: &SqlitePool,
     agent_id: &str,
 ) -> anyhow::Result<HelpdeskAgentAuthorizationStatusV1> {
-    let authorized_agent = get_helpdesk_authorized_agent(pool, agent_id).await?;
+    let agent_id = normalize_helpdesk_agent_id(agent_id);
+    let authorized_agent = get_helpdesk_authorized_agent(pool, &agent_id).await?;
     Ok(HelpdeskAgentAuthorizationStatusV1 {
-        agent_id: agent_id.to_string(),
+        agent_id,
         authorized: authorized_agent.is_some(),
         display_name: authorized_agent.and_then(|agent| agent.display_name),
     })
@@ -1223,7 +1240,7 @@ pub async fn delete_helpdesk_authorized_agent(
         .begin()
         .await
         .context("failed to open delete authorized helpdesk agent transaction")?;
-    let agent_id = agent_id.trim().to_string();
+    let agent_id = normalize_helpdesk_agent_id(agent_id);
     let now_ms = unix_millis_now() as i64;
 
     let current_ticket_id = sqlx::query_scalar::<_, Option<String>>(
@@ -1244,16 +1261,18 @@ pub async fn delete_helpdesk_authorized_agent(
     })?
     .flatten();
 
-    let result = sqlx::query(
+    let normalized_sql = normalized_helpdesk_agent_id_sql("agent_id");
+    let delete_query = format!(
         r#"
         DELETE FROM helpdesk_authorized_agents
-        WHERE agent_id = ?1
-        "#,
-    )
-    .bind(&agent_id)
-    .execute(&mut *tx)
-    .await
-    .with_context(|| format!("failed to delete authorized helpdesk agent '{}'", agent_id))?;
+        WHERE {normalized_sql} = ?1
+        "#
+    );
+    let result = sqlx::query(&delete_query)
+        .bind(&agent_id)
+        .execute(&mut *tx)
+        .await
+        .with_context(|| format!("failed to delete authorized helpdesk agent '{}'", agent_id))?;
 
     sqlx::query(
         r#"
@@ -1307,17 +1326,20 @@ pub async fn is_helpdesk_agent_authorized(
     pool: &SqlitePool,
     agent_id: &str,
 ) -> anyhow::Result<bool> {
-    let row = sqlx::query_scalar::<_, i64>(
+    let agent_id = normalize_helpdesk_agent_id(agent_id);
+    let normalized_sql = normalized_helpdesk_agent_id_sql("agent_id");
+    let query = format!(
         r#"
         SELECT COUNT(*)
         FROM helpdesk_authorized_agents
-        WHERE agent_id = ?1
-        "#,
-    )
-    .bind(agent_id)
-    .fetch_one(pool)
-    .await
-    .with_context(|| format!("failed to verify authorized helpdesk agent '{}'", agent_id))?;
+        WHERE {normalized_sql} = ?1
+        "#
+    );
+    let row = sqlx::query_scalar::<_, i64>(&query)
+        .bind(&agent_id)
+        .fetch_one(pool)
+        .await
+        .with_context(|| format!("failed to verify authorized helpdesk agent '{}'", agent_id))?;
 
     Ok(row > 0)
 }
@@ -3309,11 +3331,50 @@ fn row_to_helpdesk_authorized_agent(
     row: sqlx::sqlite::SqliteRow,
 ) -> anyhow::Result<HelpdeskAuthorizedAgentV1> {
     Ok(HelpdeskAuthorizedAgentV1 {
-        agent_id: row.get("agent_id"),
+        agent_id: normalize_helpdesk_agent_id(&row.get::<String, _>("agent_id")),
         display_name: row.get("display_name"),
         created_at: millis_to_utc(row.get("created_at")),
         updated_at: millis_to_utc(row.get("updated_at")),
     })
+}
+
+fn normalize_helpdesk_agent_id(raw: &str) -> String {
+    raw.trim()
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect()
+}
+
+fn normalized_helpdesk_agent_id_sql(column: &str) -> String {
+    format!(
+        "REPLACE(REPLACE(REPLACE(REPLACE({column}, ' ', ''), char(9), ''), char(10), ''), char(13), '')"
+    )
+}
+
+async fn delete_legacy_helpdesk_authorized_agent_variants(
+    pool: &SqlitePool,
+    agent_id: &str,
+) -> anyhow::Result<()> {
+    let normalized_sql = normalized_helpdesk_agent_id_sql("agent_id");
+    let query = format!(
+        r#"
+        DELETE FROM helpdesk_authorized_agents
+        WHERE {normalized_sql} = ?1
+          AND agent_id != ?2
+        "#
+    );
+    sqlx::query(&query)
+        .bind(agent_id)
+        .bind(agent_id)
+        .execute(pool)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to delete legacy authorized helpdesk agent variants for '{}'",
+                agent_id
+            )
+        })?;
+    Ok(())
 }
 
 fn row_to_helpdesk_ticket(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<HelpdeskTicketV1> {
@@ -3629,6 +3690,42 @@ mod tests {
             .await
             .expect("authorization status");
         assert!(authorization.authorized);
+    }
+
+    #[tokio::test]
+    async fn helpdesk_authorization_ignores_agent_id_whitespace() {
+        let temp = tempdir().expect("create temp dir");
+        let db_path = temp.path().join("helpdesk-auth-whitespace.db");
+        let pool = connect_sqlite(&db_path).await.expect("connect sqlite");
+
+        upsert_helpdesk_authorized_agent(
+            &pool,
+            &HelpdeskAuthorizedAgentUpsertRequestV1 {
+                agent_id: "419 797 027".to_string(),
+                display_name: Some("Edward soporte".to_string()),
+            },
+        )
+        .await
+        .expect("authorize agent with formatted id");
+
+        let authorization = get_helpdesk_agent_authorization_status(&pool, "419797027")
+            .await
+            .expect("authorization status without spaces");
+        assert!(authorization.authorized);
+        assert_eq!(authorization.agent_id, "419797027");
+
+        let agent = upsert_helpdesk_agent_presence(
+            &pool,
+            &HelpdeskAgentPresenceUpdateV1 {
+                agent_id: "419797027".to_string(),
+                display_name: Some("Edward Mendoza".to_string()),
+                avatar_url: None,
+                status: HelpdeskAgentStatus::Available,
+            },
+        )
+        .await
+        .expect("presence should succeed for normalized id");
+        assert_eq!(agent.agent_id, "419797027");
     }
 
     #[tokio::test]

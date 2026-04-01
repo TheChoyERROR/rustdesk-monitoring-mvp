@@ -84,6 +84,10 @@ function difficultyLabel(rawDifficulty?: string | null) {
   }
 }
 
+function normalizeRustDeskId(rawValue: string): string {
+  return rawValue.replace(/\s+/g, '').trim();
+}
+
 function agentName(agent: HelpdeskAgent): string {
   const displayName = agent.display_name?.trim();
   if (displayName) {
@@ -187,7 +191,7 @@ export default function HelpdeskPage() {
   }, [agents]);
 
   const authorizedAgentIds = useMemo(() => {
-    return new Set(authorizedAgents.map((agent) => agent.agent_id));
+    return new Set(authorizedAgents.map((agent) => normalizeRustDeskId(agent.agent_id)));
   }, [authorizedAgents]);
 
   useEffect(() => {
@@ -211,8 +215,9 @@ export default function HelpdeskPage() {
       setError(null);
 
       try {
+        const normalizedAgentId = normalizeRustDeskId(authorizedForm.agentId);
         const agent = await apiHelpdeskAuthorizedAgentUpsert({
-          agent_id: authorizedForm.agentId.trim(),
+          agent_id: normalizedAgentId,
           display_name: authorizedForm.displayName.trim() || undefined,
         });
         setAuthorizeFeedback({
@@ -484,7 +489,11 @@ export default function HelpdeskPage() {
             <tbody>
               {authorizedAgents.map((authorizedAgent) => {
                 const liveAgent =
-                  agents.find((agent) => agent.agent_id === authorizedAgent.agent_id) ?? null;
+                  agents.find(
+                    (agent) =>
+                      normalizeRustDeskId(agent.agent_id) ===
+                      normalizeRustDeskId(authorizedAgent.agent_id),
+                  ) ?? null;
                 const label = authorizedAgent.display_name?.trim() || authorizedAgent.agent_id;
                 return (
                   <tr key={authorizedAgent.agent_id}>
