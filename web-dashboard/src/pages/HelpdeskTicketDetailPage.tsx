@@ -8,6 +8,7 @@ import {
   apiHelpdeskTicketAudit,
   apiHelpdeskTicketCancel,
   apiHelpdeskTicketRequeue,
+  apiHelpdeskTicketUpdateOperational,
 } from '../api';
 import { formatDateTime } from '../lib/time';
 import type {
@@ -87,7 +88,10 @@ export default function HelpdeskTicketDetailPage() {
   const [error, setError] = useState<string | null>(null);
   const [actionReason, setActionReason] = useState('');
   const [nextAgentStatus, setNextAgentStatus] = useState<'available' | 'away'>('available');
-  const [dispatchAgentId, setDispatchAgentId] = useState<'auto' | string>('auto');
+  const [dispatchAgentId, setDispatchAgentId] = useState('');
+  const [operationalDifficulty, setOperationalDifficulty] = useState('medium');
+  const [operationalEstimatedMinutes, setOperationalEstimatedMinutes] = useState('30');
+  const [operationalBusy, setOperationalBusy] = useState(false);
   const [actionBusy, setActionBusy] = useState<null | 'assign' | 'requeue' | 'cancel'>(null);
 
   const load = useCallback(async (background = false) => {
@@ -130,13 +134,18 @@ export default function HelpdeskTicketDetailPage() {
   }, [agents]);
 
   useEffect(() => {
-    if (
-      dispatchAgentId !== 'auto' &&
-      !availableAgents.some((agent) => agent.agent_id === dispatchAgentId)
-    ) {
-      setDispatchAgentId('auto');
+    if (dispatchAgentId !== '' && !availableAgents.some((agent) => agent.agent_id === dispatchAgentId)) {
+      setDispatchAgentId('');
     }
   }, [availableAgents, dispatchAgentId]);
+
+  useEffect(() => {
+    if (!ticket) {
+      return;
+    }
+    setOperationalDifficulty((ticket.difficulty ?? 'medium').trim().toLowerCase() || 'medium');
+    setOperationalEstimatedMinutes(ticket.estimated_minutes ? String(ticket.estimated_minutes) : '30');
+  }, [ticket?.ticket_id, ticket?.updated_at]);
 
   return (
     <section className="stack">
@@ -169,7 +178,7 @@ export default function HelpdeskTicketDetailPage() {
                     value={dispatchAgentId}
                     onChange={(event) => setDispatchAgentId(event.target.value)}
                   >
-                    <option value="auto">Primer agente disponible</option>
+                    <option value="">Selecciona un agente</option>
                     {availableAgents.map((agent) => (
                       <option key={agent.agent_id} value={agent.agent_id}>
                         {agent.display_name || agent.agent_id} ({agent.agent_id})
@@ -202,13 +211,18 @@ export default function HelpdeskTicketDetailPage() {
                 <button
                   type="button"
                   className="btn primary"
-                  disabled={actionBusy !== null || ticket.status !== 'queued' || availableAgents.length === 0}
+                  disabled={
+                    actionBusy !== null ||
+                    ticket.status !== 'queued' ||
+                    availableAgents.length === 0 ||
+                    dispatchAgentId === ''
+                  }
                   onClick={async () => {
                     setActionBusy('assign');
                     setError(null);
                     try {
                       await apiHelpdeskTicketAssign(decodedTicketId, {
-                        agent_id: dispatchAgentId === 'auto' ? undefined : dispatchAgentId,
+                        agent_id: dispatchAgentId,
                         reason: actionReason.trim() || undefined,
                       });
                       await load();
@@ -265,6 +279,64 @@ export default function HelpdeskTicketDetailPage() {
                 >
                   {actionBusy === 'cancel' ? 'Cancelando...' : 'Cancelar'}
                 </button>
+              </div>
+            </div>
+            <div className="detail-block">
+              <label>Campos operativos</label>
+              <div className="filter-grid">
+                <div>
+                  <label htmlFor="ticket-operational-difficulty">Dificultad</label>
+                  <select
+                    id="ticket-operational-difficulty"
+                    value={operationalDifficulty}
+                    onChange={(event) => setOperationalDifficulty(event.target.value)}
+                    disabled={operationalBusy}
+                  >
+                    <option value="low">Baja</option>
+                    <option value="medium">Media</option>
+                    <option value="high">Alta</option>
+                  </select>
+                </div>
+                <div>
+                  <label htmlFor="ticket-operational-estimated">Tiempo estimado (min)</label>
+                  <input
+                    id="ticket-operational-estimated"
+                    type="number"
+                    min="1"
+                    step="1"
+                    value={operationalEstimatedMinutes}
+                    onChange={(event) => setOperationalEstimatedMinutes(event.target.value)}
+                    disabled={operationalBusy}
+                  />
+                </div>
+              </div>
+              <div className="filter-actions">
+                <button
+                  type="button"
+                  className="btn secondary"
+                  disabled={operationalBusy}
+                  onClick={async () => {
+                    setOperationalBusy(true);
+                    setError(null);
+                    try {
+                      await apiHelpdeskTicketUpdateOperational(decodedTicketId, {
+                        difficulty: operationalDifficulty,
+                        estimated_minutes:
+                          Number.parseInt(operationalEstimatedMinutes.trim(), 10) || undefined,
+                      });
+                      await load();
+                    } catch {
+                      setError('No se pudieron guardar los campos operativos.');
+                    } finally {
+                      setOperationalBusy(false);
+                    }
+                  }}
+                >
+                  {operationalBusy ? 'Guardando...' : 'Guardar campos operativos'}
+                </button>
+                <p className="activity-summary-line">
+                  Dificultad y tiempo estimado deben ser definidos por quien atiende o coordina el ticket.
+                </p>
               </div>
             </div>
             <div className="detail-grid">

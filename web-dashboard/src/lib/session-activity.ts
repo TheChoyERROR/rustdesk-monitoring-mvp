@@ -3,6 +3,7 @@ import type { SessionEventType, SessionTimelineItem } from '../types';
 export interface SessionActivityUserSummary {
   userId: string;
   displayName: string;
+  actorType: SessionTimelineItem['actor_type'];
   avatarUrl?: string | null;
   totalEvents: number;
   sessionCount: number;
@@ -12,6 +13,7 @@ export interface SessionActivityUserSummary {
 export interface SessionActivitySegment {
   userId: string;
   displayName: string;
+  actorType: SessionTimelineItem['actor_type'];
   avatarUrl?: string | null;
   sessionId: string;
   direction: SessionTimelineItem['direction'];
@@ -118,6 +120,7 @@ export function buildSessionActivityTimeline(
     {
       userId: string;
       displayName: string;
+      actorType: SessionTimelineItem['actor_type'];
       avatarUrl?: string | null;
       totalEvents: number;
       sessionIds: Set<string>;
@@ -136,6 +139,9 @@ export function buildSessionActivityTimeline(
         currentSummary.lastEventMs = event.timestampMs;
         currentSummary.lastEventAt = event.timestamp;
       }
+      if (event.actor_type !== 'unknown') {
+        currentSummary.actorType = event.actor_type;
+      }
       if (event.displayName !== event.user_id) {
         currentSummary.displayName = event.displayName;
       }
@@ -146,6 +152,7 @@ export function buildSessionActivityTimeline(
       userSummaries.set(event.user_id, {
         userId: event.user_id,
         displayName: event.displayName,
+        actorType: event.actor_type,
         avatarUrl: event.avatarUrl,
         totalEvents: 1,
         sessionIds: new Set([event.session_id]),
@@ -167,6 +174,7 @@ export function buildSessionActivityTimeline(
     .map((summary) => ({
       userId: summary.userId,
       displayName: summary.displayName,
+      actorType: summary.actorType,
       avatarUrl: summary.avatarUrl,
       totalEvents: summary.totalEvents,
       sessionCount: summary.sessionIds.size,
@@ -213,6 +221,7 @@ export function buildSessionActivityTimeline(
           segments.push({
             userId: event.user_id,
             displayName: event.displayName,
+            actorType: event.actor_type,
             avatarUrl: event.avatarUrl,
             sessionId: event.session_id,
             direction: event.direction,
@@ -236,6 +245,7 @@ export function buildSessionActivityTimeline(
       segments.push({
         userId: lastEvent.user_id,
         displayName: lastEvent.displayName,
+        actorType: lastEvent.actor_type,
         avatarUrl: lastEvent.avatarUrl,
         sessionId: lastEvent.session_id,
         direction: lastEvent.direction,
@@ -254,6 +264,7 @@ export function buildSessionActivityTimeline(
     segments.push({
       userId: firstEvent.user_id,
       displayName: firstEvent.displayName,
+      actorType: firstEvent.actor_type,
       avatarUrl: firstEvent.avatarUrl,
       sessionId: firstEvent.session_id,
       direction: firstEvent.direction,

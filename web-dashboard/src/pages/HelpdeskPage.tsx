@@ -88,6 +88,10 @@ function normalizeRustDeskId(rawValue: string): string {
   return rawValue.replace(/\s+/g, '').trim();
 }
 
+function normalizeDisplayNameKey(rawValue: string): string {
+  return rawValue.trim().replace(/\s+/g, ' ').toLocaleLowerCase();
+}
+
 function agentName(agent: HelpdeskAgent): string {
   const displayName = agent.display_name?.trim();
   if (displayName) {
@@ -194,6 +198,28 @@ export default function HelpdeskPage() {
     return new Set(authorizedAgents.map((agent) => normalizeRustDeskId(agent.agent_id)));
   }, [authorizedAgents]);
 
+  const normalizedAgentNames = useMemo(() => {
+    const nextMap = new Map<string, string>();
+
+    authorizedAgents.forEach((agent) => {
+      const displayName = agent.display_name?.trim();
+      if (!displayName) {
+        return;
+      }
+      nextMap.set(normalizeDisplayNameKey(displayName), normalizeRustDeskId(agent.agent_id));
+    });
+
+    agents.forEach((agent) => {
+      const displayName = agent.display_name?.trim();
+      if (!displayName) {
+        return;
+      }
+      nextMap.set(normalizeDisplayNameKey(displayName), normalizeRustDeskId(agent.agent_id));
+    });
+
+    return nextMap;
+  }, [agents, authorizedAgents]);
+
   useEffect(() => {
     if (
       createForm.preferredAgentId !== 'auto' &&
@@ -216,6 +242,15 @@ export default function HelpdeskPage() {
 
       try {
         const normalizedAgentId = normalizeRustDeskId(authorizedForm.agentId);
+        const normalizedDisplayName = normalizeDisplayNameKey(authorizedForm.displayName);
+        if (normalizedDisplayName) {
+          const conflictingAgentId = normalizedAgentNames.get(normalizedDisplayName);
+          if (conflictingAgentId && conflictingAgentId !== normalizedAgentId) {
+            throw new Error(
+              `Ya existe otro agente con el nombre '${authorizedForm.displayName.trim()}'. Usa un nombre visible distinto.`,
+            );
+          }
+        }
         const agent = await apiHelpdeskAuthorizedAgentUpsert({
           agent_id: normalizedAgentId,
           display_name: authorizedForm.displayName.trim() || undefined,

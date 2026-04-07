@@ -7,6 +7,17 @@ import type { SessionActivityTimelineModel } from '../lib/session-activity';
 const OUTGOING_COLOR = '#0f766e';
 const INCOMING_COLOR = '#f97316';
 
+function actorTypeLabel(actorType: string): string {
+  switch (actorType) {
+    case 'agent':
+      return 'Agente';
+    case 'client':
+      return 'Cliente';
+    default:
+      return 'Sin clasificar';
+  }
+}
+
 function escapeHtml(value: string): string {
   return value
     .replaceAll('&', '&amp;')
@@ -46,6 +57,7 @@ export default function SessionActivityChart({
       sessionId: segment.sessionId,
       userId: segment.userId,
       displayName: segment.displayName,
+      actorType: segment.actorType,
       direction: segment.direction,
       eventCount: segment.eventCount,
       startLabel: formatDateTime(new Date(segment.startMs).toISOString()),
@@ -114,6 +126,7 @@ export default function SessionActivityChart({
           return [
             `<strong>${escapeHtml(data.displayName)}</strong>`,
             `Usuario: ${escapeHtml(data.userId)}`,
+            `Actor: ${escapeHtml(actorTypeLabel(data.actorType))}`,
             `Session: ${escapeHtml(data.sessionId)}`,
             `Direccion: ${escapeHtml(data.direction)}`,
             `Inicio: ${escapeHtml(data.startLabel)}`,

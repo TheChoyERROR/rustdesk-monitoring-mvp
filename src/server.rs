@@ -27,8 +27,10 @@ use crate::metrics::Metrics;
 use crate::model::{
     AuthLoginRequestV1, AuthLoginResponseV1, AuthRoleV1, AuthUserV1, HelpdeskAgentPresenceUpdateV1,
     HelpdeskAgentStatus, HelpdeskAssignmentStartRequestV1, HelpdeskAuthorizedAgentUpsertRequestV1,
-    HelpdeskTicketAssignRequestV1, HelpdeskTicketCreateRequestV1, HelpdeskTicketResolveRequestV1,
-    HelpdeskTicketSupervisorActionRequestV1, PaginatedResponseV1, SessionEventType, SessionEventV1,
+    HelpdeskTicketAssignRequestV1, HelpdeskTicketCreateRequestV1,
+    HelpdeskTicketOperationalUpdateRequestV1, HelpdeskTicketResolveRequestV1,
+    HelpdeskTicketSupervisorActionRequestV1, PaginatedResponseV1, SessionActorTypeV1,
+    SessionEventType, SessionEventV1,
 };
 use crate::storage::{
     assign_helpdesk_ticket, cancel_helpdesk_ticket, claim_due_events,
@@ -39,11 +41,12 @@ use crate::storage::{
     get_helpdesk_assignment_for_agent, get_helpdesk_operational_summary, get_helpdesk_ticket,
     get_session_presence, insert_event, list_active_session_presence, list_helpdesk_agents,
     list_helpdesk_authorized_agents, list_helpdesk_ticket_audit_events, list_helpdesk_tickets,
-    mark_delivered, mark_failed, query_session_report_rows, query_session_timeline,
-    query_timeline_events, reconcile_helpdesk_runtime, requeue_helpdesk_ticket,
+    mark_delivered, mark_failed, query_session_report_rows, query_timeline_events,
+    reconcile_helpdesk_runtime, requeue_helpdesk_ticket,
     reset_stuck_processing, resolve_helpdesk_ticket, schedule_retry, start_helpdesk_ticket,
-    unix_millis_now, upsert_dashboard_user, upsert_helpdesk_agent_presence,
-    upsert_helpdesk_authorized_agent, EventQueryFilter, InsertOutcome, OutboxRecord,
+    unix_millis_now, update_helpdesk_ticket_operational_fields, upsert_dashboard_user,
+    upsert_helpdesk_agent_presence, upsert_helpdesk_authorized_agent, EventQueryFilter,
+    InsertOutcome, OutboxRecord,
 };
 use crate::turso::{
     compute_helpdesk_sync_signature, compute_monitoring_sync_signature,
@@ -84,6 +87,7 @@ struct SummaryQuery {
 struct EventListQuery {
     session_id: Option<String>,
     user_id: Option<String>,
+    actor_type: Option<String>,
     event_type: Option<String>,
     from: Option<String>,
     to: Option<String>,
@@ -93,6 +97,7 @@ struct EventListQuery {
 
 #[derive(Debug, Clone, Deserialize)]
 struct TimelineQuery {
+    actor_type: Option<String>,
     page: Option<u64>,
     page_size: Option<u64>,
 }
@@ -102,6 +107,7 @@ struct CsvReportQuery {
     from: Option<String>,
     to: Option<String>,
     user_id: Option<String>,
+    actor_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -273,6 +279,10 @@ pub async fn run(
         .route(
             "/api/v1/helpdesk/tickets/:ticket_id/assign",
             post(assign_helpdesk_ticket_handler),
+        )
+        .route(
+            "/api/v1/helpdesk/tickets/:ticket_id/operational",
+            post(update_helpdesk_ticket_operational_handler),
         )
         .route(
             "/api/v1/helpdesk/tickets/:ticket_id/audit",
@@ -462,6 +472,9 @@ async fn upsert_helpdesk_authorized_agent_handler(
     match upsert_helpdesk_authorized_agent(&state.pool, &payload).await {
         Ok(agent) => (StatusCode::OK, Json(json!({ "agent": agent }))).into_response(),
         Err(err) => {
+            if err.to_string().contains("display name '") {
+                return bad_request(err.to_string());
+            }
             error!(
                 error = %err,
                 agent_id = payload.agent_id,
@@ -542,6 +555,9 @@ async fn upsert_helpdesk_agent_presence_handler(
                 .contains("is not authorized for helpdesk operator mode")
             {
                 return forbidden(err.to_string());
+            }
+            if err.to_string().contains("display name '") {
+                return bad_request(err.to_string());
             }
             error!(error = %err, agent_id = payload.agent_id, "failed to upsert helpdesk agent presence");
             internal_error()
@@ -718,6 +734,52 @@ async fn assign_helpdesk_ticket_handler(
                 "failed to assign helpdesk ticket"
             );
             bad_request(err.to_string())
+        }
+    }
+}
+
+async fn update_helpdesk_ticket_operational_handler(
+    State(state): State<AppState>,
+    AxumPath(ticket_id): AxumPath<String>,
+    Json(payload): Json<HelpdeskTicketOperationalUpdateRequestV1>,
+) -> impl IntoResponse {
+    let ticket_id = ticket_id.trim().to_string();
+    if ticket_id.is_empty() {
+        return bad_request("ticket_id cannot be empty");
+    }
+
+    if let Err(validation_error) = payload.validate() {
+        return bad_request(validation_error.to_string());
+    }
+
+    match update_helpdesk_ticket_operational_fields(
+        &state.pool,
+        &ticket_id,
+        payload.difficulty.as_deref(),
+        payload.estimated_minutes,
+    )
+    .await
+    {
+        Ok(ticket) => (
+            StatusCode::OK,
+            Json(json!({
+                "ticket": ticket,
+            })),
+        )
+            .into_response(),
+        Err(err) => {
+            if err
+                .to_string()
+                .contains("can no longer be updated operationally")
+            {
+                return bad_request(err.to_string());
+            }
+            error!(
+                error = %err,
+                ticket_id,
+                "failed to update helpdesk ticket operational fields"
+            );
+            internal_error()
         }
     }
 }
@@ -993,6 +1055,10 @@ async fn events_list_handler(
     State(state): State<AppState>,
     Query(query): Query<EventListQuery>,
 ) -> impl IntoResponse {
+    let actor_type = match parse_optional_actor_type(query.actor_type.as_deref()) {
+        Ok(value) => value,
+        Err(err) => return bad_request(err),
+    };
     let event_type = match parse_optional_event_type(query.event_type.as_deref()) {
         Ok(value) => value,
         Err(err) => return bad_request(err),
@@ -1024,6 +1090,7 @@ async fn events_list_handler(
             .user_id
             .map(|value| value.trim().to_string())
             .filter(|v| !v.is_empty()),
+        actor_type,
         event_type,
         from,
         to,
@@ -1059,8 +1126,18 @@ async fn session_timeline_handler(
 
     let page = query.page.unwrap_or(1).max(1);
     let page_size = query.page_size.unwrap_or(50).clamp(1, 200);
+    let actor_type = match parse_optional_actor_type(query.actor_type.as_deref()) {
+        Ok(value) => value,
+        Err(err) => return bad_request(err),
+    };
 
-    match query_session_timeline(&state.pool, &session_id, page, page_size).await {
+    let filter = EventQueryFilter {
+        session_id: Some(session_id.clone()),
+        actor_type,
+        ..Default::default()
+    };
+
+    match query_timeline_events(&state.pool, &filter, page, page_size).await {
         Ok((items, total)) => (
             StatusCode::OK,
             Json(PaginatedResponseV1 {
@@ -1101,8 +1178,12 @@ async fn sessions_report_csv_handler(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
+    let actor_type = match parse_optional_actor_type(query.actor_type.as_deref()) {
+        Ok(value) => value,
+        Err(err) => return bad_request(err),
+    };
 
-    let rows = match query_session_report_rows(&state.pool, from, to, user_id).await {
+    let rows = match query_session_report_rows(&state.pool, from, to, user_id, actor_type).await {
         Ok(rows) => rows,
         Err(err) => {
             error!(error = %err, "failed to query session report rows");
@@ -1460,6 +1541,28 @@ fn parse_optional_event_type(raw: Option<&str>) -> Result<Option<SessionEventTyp
         _ => {
             return Err(format!(
                 "invalid event_type '{raw}'. allowed: session_started, session_ended, recording_started, recording_stopped, participant_joined, participant_left, control_changed, participant_activity"
+            ))
+        }
+    };
+    Ok(Some(parsed))
+}
+
+fn parse_optional_actor_type(raw: Option<&str>) -> Result<Option<SessionActorTypeV1>, String> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+
+    let parsed = match raw {
+        "agent" => SessionActorTypeV1::Agent,
+        "client" => SessionActorTypeV1::Client,
+        "unknown" => SessionActorTypeV1::Unknown,
+        _ => {
+            return Err(format!(
+                "invalid actor_type '{raw}'. allowed: agent, client, unknown"
             ))
         }
     };

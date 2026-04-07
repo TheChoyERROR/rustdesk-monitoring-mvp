@@ -50,6 +50,24 @@ pub enum SessionDirection {
     Outgoing,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionActorTypeV1 {
+    Agent,
+    Client,
+    Unknown,
+}
+
+impl SessionActorTypeV1 {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Agent => "agent",
+            Self::Client => "client",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HostInfo {
     pub hostname: String,
@@ -150,6 +168,7 @@ pub struct SessionTimelineItemV1 {
     pub event_type: SessionEventType,
     pub session_id: String,
     pub user_id: String,
+    pub actor_type: SessionActorTypeV1,
     pub direction: SessionDirection,
     pub timestamp: DateTime<Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -370,6 +389,14 @@ pub struct HelpdeskTicketAssignRequestV1 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HelpdeskTicketOperationalUpdateRequestV1 {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub difficulty: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimated_minutes: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HelpdeskTicketResolveRequestV1 {
     pub agent_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -467,10 +494,25 @@ impl HelpdeskAssignmentStartRequestV1 {
 
 impl HelpdeskTicketAssignRequestV1 {
     pub fn validate(&self) -> Result<(), EventValidationError> {
-        if let Some(agent_id) = &self.agent_id {
-            if agent_id.trim().is_empty() {
-                return Err(EventValidationError::EmptyField("agent_id"));
+        match self.agent_id.as_deref() {
+            Some(agent_id) if !agent_id.trim().is_empty() => Ok(()),
+            _ => Err(EventValidationError::EmptyField("agent_id")),
+        }
+    }
+}
+
+impl HelpdeskTicketOperationalUpdateRequestV1 {
+    pub fn validate(&self) -> Result<(), EventValidationError> {
+        if let Some(difficulty) = &self.difficulty {
+            if difficulty.trim().is_empty() {
+                return Err(EventValidationError::EmptyField("difficulty"));
             }
+        }
+        if matches!(self.estimated_minutes, Some(0)) {
+            return Err(EventValidationError::InvalidHelpdeskEstimatedMinutes);
+        }
+        if self.difficulty.is_none() && self.estimated_minutes.is_none() {
+            return Err(EventValidationError::EmptyHelpdeskOperationalUpdate);
         }
         Ok(())
     }
@@ -513,6 +555,8 @@ pub enum EventValidationError {
     EmptyField(&'static str),
     #[error("meta field must be a JSON object")]
     MetaMustBeObject,
+    #[error("at least one operational ticket field must be provided")]
+    EmptyHelpdeskOperationalUpdate,
     #[error("estimated_minutes must be greater than zero")]
     InvalidHelpdeskEstimatedMinutes,
     #[error("next_agent_status must be either 'available' or 'away'")]

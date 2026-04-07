@@ -10,6 +10,7 @@ import type {
   PaginatedResponse,
   PresenceSessionSummary,
   SessionPresence,
+  SessionActorType,
   SessionTimelineItem,
   SessionEventType,
 } from './types';
@@ -87,6 +88,7 @@ export async function apiSummary(from?: string, to?: string): Promise<DashboardS
 export interface EventsQuery {
   session_id?: string;
   user_id?: string;
+  actor_type?: SessionActorType;
   event_type?: SessionEventType;
   from?: string;
   to?: string;
@@ -104,9 +106,11 @@ export async function apiSessionTimeline(
   sessionId: string,
   page = 1,
   pageSize = 50,
+  actorType?: SessionActorType,
 ): Promise<PaginatedResponse<SessionTimelineItem>> {
   return request<PaginatedResponse<SessionTimelineItem>>(
     `/api/v1/sessions/${encodeURIComponent(sessionId)}/timeline${buildQuery({
+      actor_type: actorType,
       page,
       page_size: pageSize,
     })}`,
@@ -228,7 +232,7 @@ interface HelpdeskSupervisorActionBody {
 }
 
 interface HelpdeskTicketAssignBody {
-  agent_id?: string;
+  agent_id: string;
   reason?: string;
 }
 
@@ -238,6 +242,25 @@ export async function apiHelpdeskTicketAssign(
 ): Promise<HelpdeskTicket> {
   const response = await request<{ ticket: HelpdeskTicket }>(
     `/api/v1/helpdesk/tickets/${encodeURIComponent(ticketId)}/assign`,
+    {
+      method: 'POST',
+      body: JSON.stringify(body),
+    },
+  );
+  return response.ticket;
+}
+
+interface HelpdeskTicketOperationalBody {
+  difficulty?: string;
+  estimated_minutes?: number;
+}
+
+export async function apiHelpdeskTicketUpdateOperational(
+  ticketId: string,
+  body: HelpdeskTicketOperationalBody,
+): Promise<HelpdeskTicket> {
+  const response = await request<{ ticket: HelpdeskTicket }>(
+    `/api/v1/helpdesk/tickets/${encodeURIComponent(ticketId)}/operational`,
     {
       method: 'POST',
       body: JSON.stringify(body),
@@ -278,8 +301,8 @@ export function sessionPresenceStreamUrl(sessionId: string): string {
   return `/api/v1/sessions/${encodeURIComponent(sessionId)}/presence/stream`;
 }
 
-export function sessionsCsvUrl(from?: string, to?: string, userId?: string): string {
-  return `/api/v1/reports/sessions.csv${buildQuery({ from, to, user_id: userId })}`;
+export function sessionsCsvUrl(from?: string, to?: string, userId?: string, actorType?: SessionActorType): string {
+  return `/api/v1/reports/sessions.csv${buildQuery({ from, to, user_id: userId, actor_type: actorType })}`;
 }
 
 export { ApiError };

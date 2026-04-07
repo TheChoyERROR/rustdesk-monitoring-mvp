@@ -38,11 +38,14 @@ export type SessionEventType =
   | 'control_changed'
   | 'participant_activity';
 
+export type SessionActorType = 'agent' | 'client' | 'unknown';
+
 export interface SessionTimelineItem {
   event_id: string;
   event_type: SessionEventType;
   session_id: string;
   user_id: string;
+  actor_type: SessionActorType;
   direction: 'incoming' | 'outgoing';
   timestamp: string;
   host_info?: {

@@ -13,8 +13,9 @@ use crate::model::{
     HelpdeskAgentPresenceUpdateV1, HelpdeskAgentStatus, HelpdeskAgentV1, HelpdeskAssignmentV1,
     HelpdeskAuditEventV1, HelpdeskAuthorizedAgentUpsertRequestV1, HelpdeskAuthorizedAgentV1,
     HelpdeskOperationalSummaryV1, HelpdeskTicketCreateRequestV1, HelpdeskTicketStatus,
-    HelpdeskTicketV1, PresenceParticipantV1, PresenceSessionSummaryV1, SessionEventType,
-    SessionEventV1, SessionPresenceV1, SessionReportRowV1, SessionTimelineItemV1,
+    HelpdeskTicketV1, PresenceParticipantV1, PresenceSessionSummaryV1, SessionActorTypeV1,
+    SessionEventType, SessionEventV1, SessionPresenceV1, SessionReportRowV1,
+    SessionTimelineItemV1,
 };
 use crate::schema::init_sqlite_schema;
 
@@ -38,6 +39,28 @@ struct PresenceActor {
     avatar_url: Option<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct SessionActorReferenceIndex {
+    agent_ids: HashSet<String>,
+    client_ids: HashSet<String>,
+}
+
+impl SessionActorReferenceIndex {
+    fn classify(&self, user_id: &str) -> SessionActorTypeV1 {
+        let normalized_user_id = normalize_helpdesk_identity_id(user_id);
+        if normalized_user_id.is_empty() {
+            return SessionActorTypeV1::Unknown;
+        }
+        if self.agent_ids.contains(&normalized_user_id) {
+            return SessionActorTypeV1::Agent;
+        }
+        if self.client_ids.contains(&normalized_user_id) {
+            return SessionActorTypeV1::Client;
+        }
+        SessionActorTypeV1::Unknown
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DashboardUserRecord {
     pub id: i64,
@@ -58,6 +81,7 @@ pub struct DashboardSessionRecord {
 pub struct EventQueryFilter {
     pub session_id: Option<String>,
     pub user_id: Option<String>,
+    pub actor_type: Option<SessionActorTypeV1>,
     pub event_type: Option<SessionEventType>,
     pub from: Option<DateTime<Utc>>,
     pub to: Option<DateTime<Utc>>,
@@ -704,13 +728,22 @@ pub async fn upsert_helpdesk_agent_presence(
             agent_id
         );
     }
-    let display_name = payload
+    let authorized_agent = get_helpdesk_authorized_agent(pool, &agent_id).await?;
+    let fallback_display_name = payload
         .display_name
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or(&agent_id)
         .to_string();
+    let display_name = authorized_agent
+        .as_ref()
+        .and_then(|agent| agent.display_name.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or(fallback_display_name);
+    ensure_helpdesk_agent_display_name_available(pool, &agent_id, Some(&display_name)).await?;
     let avatar_url = payload
         .avatar_url
         .as_deref()
@@ -810,6 +843,12 @@ pub async fn upsert_helpdesk_authorized_agent(
     let existing_agent = get_helpdesk_authorized_agent(pool, &agent_id).await?;
     let display_name = normalize_optional_text(payload.display_name.as_deref())
         .or_else(|| existing_agent.and_then(|agent| agent.display_name));
+    ensure_helpdesk_agent_display_name_available(pool, &agent_id, display_name.as_deref()).await?;
+
+    let mut tx = pool
+        .begin()
+        .await
+        .context("failed to open authorized helpdesk agent transaction")?;
 
     sqlx::query(
         r#"
@@ -824,9 +863,34 @@ pub async fn upsert_helpdesk_authorized_agent(
     .bind(display_name.as_deref())
     .bind(now_ms)
     .bind(now_ms)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .with_context(|| format!("failed to upsert authorized helpdesk agent '{}'", agent_id))?;
+
+    sqlx::query(
+        r#"
+        UPDATE helpdesk_agents
+        SET display_name = ?2,
+            updated_at = ?3
+        WHERE agent_id = ?1
+          AND ?2 IS NOT NULL
+        "#,
+    )
+    .bind(&agent_id)
+    .bind(display_name.as_deref())
+    .bind(now_ms)
+    .execute(&mut *tx)
+    .await
+    .with_context(|| {
+        format!(
+            "failed to align live helpdesk agent display name for '{}'",
+            agent_id
+        )
+    })?;
+
+    tx.commit()
+        .await
+        .context("failed to commit authorized helpdesk agent transaction")?;
 
     delete_legacy_helpdesk_authorized_agent_variants(pool, &agent_id).await?;
 
@@ -1115,6 +1179,82 @@ pub async fn create_helpdesk_ticket(
     Ok(ticket)
 }
 
+pub async fn update_helpdesk_ticket_operational_fields(
+    pool: &SqlitePool,
+    ticket_id: &str,
+    difficulty: Option<&str>,
+    estimated_minutes: Option<u32>,
+) -> anyhow::Result<HelpdeskTicketV1> {
+    let now_ms = unix_millis_now() as i64;
+    let ticket_id = ticket_id.trim();
+    let normalized_difficulty = normalize_optional_text(difficulty);
+
+    let mut tx = pool
+        .begin()
+        .await
+        .context("failed to open helpdesk ticket operational update transaction")?;
+
+    let current_ticket = get_helpdesk_ticket_tx(&mut tx, ticket_id)
+        .await?
+        .with_context(|| format!("helpdesk ticket '{}' not found before operational update", ticket_id))?;
+
+    if matches!(
+        current_ticket.status,
+        HelpdeskTicketStatus::Resolved | HelpdeskTicketStatus::Cancelled | HelpdeskTicketStatus::Failed
+    ) {
+        anyhow::bail!("ticket can no longer be updated operationally");
+    }
+
+    sqlx::query(
+        r#"
+        UPDATE helpdesk_tickets
+        SET difficulty = COALESCE(?2, difficulty),
+            estimated_minutes = COALESCE(?3, estimated_minutes),
+            updated_at = ?4
+        WHERE ticket_id = ?1
+        "#,
+    )
+    .bind(ticket_id)
+    .bind(normalized_difficulty.as_deref())
+    .bind(estimated_minutes.map(i64::from))
+    .bind(now_ms)
+    .execute(&mut *tx)
+    .await
+    .with_context(|| {
+        format!(
+            "failed to update operational fields for helpdesk ticket '{}'",
+            ticket_id
+        )
+    })?;
+
+    insert_helpdesk_audit_event_tx(
+        &mut tx,
+        "ticket",
+        ticket_id,
+        "operational_fields_updated",
+        Some(serde_json::json!({
+            "difficulty": normalized_difficulty,
+            "estimated_minutes": estimated_minutes,
+        })),
+        now_ms,
+    )
+    .await?;
+
+    let ticket = get_helpdesk_ticket_tx(&mut tx, ticket_id)
+        .await?
+        .with_context(|| {
+            format!(
+                "helpdesk ticket '{}' not found after operational update",
+                ticket_id
+            )
+        })?;
+
+    tx.commit()
+        .await
+        .context("failed to commit helpdesk ticket operational update transaction")?;
+    Ok(ticket)
+}
+
 pub async fn assign_helpdesk_ticket(
     pool: &SqlitePool,
     ticket_id: &str,
@@ -1138,33 +1278,18 @@ pub async fn assign_helpdesk_ticket(
         anyhow::bail!("ticket must be queued before it can be assigned");
     }
 
-    let selected_agent_id = if let Some(agent_id) = requested_agent_id {
-        agent_id.to_string()
-    } else {
-        let row = sqlx::query(
-            r#"
-            SELECT agent_id
-            FROM helpdesk_agents
-            WHERE status = 'available'
-            ORDER BY updated_at ASC, agent_id ASC
-            LIMIT 1
-            "#,
-        )
-        .fetch_optional(&mut *tx)
-        .await
-        .context("failed to select available helpdesk agent for manual assignment")?;
-
-        let Some(row) = row else {
-            anyhow::bail!("no available agents to assign this ticket");
-        };
-
-        row.get("agent_id")
+    let Some(selected_agent_id) = requested_agent_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        anyhow::bail!("agent_id is required for manual assignment");
     };
 
     let assigned = assign_helpdesk_ticket_to_agent_tx(
         &mut tx,
         ticket_id,
-        &selected_agent_id,
+        selected_agent_id,
         now_ms,
         "supervisor_manual",
         reason,
@@ -1178,7 +1303,7 @@ pub async fn assign_helpdesk_ticket(
     let ticket = get_helpdesk_ticket_tx(&mut tx, ticket_id)
         .await?
         .with_context(|| format!("helpdesk ticket '{}' not found after assign", ticket_id))?;
-    let agent = get_helpdesk_agent_tx(&mut tx, &selected_agent_id)
+    let agent = get_helpdesk_agent_tx(&mut tx, selected_agent_id)
         .await?
         .with_context(|| {
             format!(
@@ -2327,12 +2452,18 @@ pub async fn query_timeline_events(
         .await
         .context("failed to query filtered timeline events")?;
 
+    if rows.is_empty() {
+        return Ok((Vec::new(), total));
+    }
+
+    let actor_reference_index = load_session_actor_reference_index(pool).await?;
     let mut items = Vec::with_capacity(rows.len());
     for row in rows {
         let payload: String = row.get("payload");
         let event: SessionEventV1 = serde_json::from_str(&payload)
             .context("failed to deserialize event payload from session_events")?;
-        items.push(event_to_timeline_item(event));
+        let actor_type = actor_reference_index.classify(&event.user_id);
+        items.push(event_to_timeline_item(event, actor_type));
     }
 
     Ok((items, total))
@@ -2356,6 +2487,7 @@ pub async fn query_session_report_rows(
     from: DateTime<Utc>,
     to: DateTime<Utc>,
     user_id: Option<&str>,
+    actor_type: Option<SessionActorTypeV1>,
 ) -> anyhow::Result<Vec<SessionReportRowV1>> {
     let mut qb = QueryBuilder::<Sqlite>::new(
         r#"
@@ -2375,6 +2507,11 @@ pub async fn query_session_report_rows(
     if let Some(user_id) = user_id {
         qb.push(" AND user_id = ");
         qb.push_bind(user_id.trim().to_string());
+    }
+
+    if let Some(actor_type) = actor_type {
+        qb.push(" AND ");
+        push_session_actor_type_match_clause(&mut qb, actor_type, "session_events.user_id");
     }
 
     qb.push(" GROUP BY session_id ORDER BY started_at DESC");
@@ -2643,6 +2780,10 @@ fn apply_event_filters(qb: &mut QueryBuilder<'_, Sqlite>, filter: &EventQueryFil
         qb.push(" AND event_type = ");
         qb.push_bind(event_type.as_str().to_string());
     }
+    if let Some(actor_type) = filter.actor_type {
+        qb.push(" AND ");
+        push_session_actor_type_match_clause(qb, actor_type, "session_events.user_id");
+    }
     if let Some(from) = filter.from.as_ref() {
         qb.push(" AND timestamp >= ");
         qb.push_bind(from.to_rfc3339());
@@ -2653,12 +2794,97 @@ fn apply_event_filters(qb: &mut QueryBuilder<'_, Sqlite>, filter: &EventQueryFil
     }
 }
 
-fn event_to_timeline_item(event: SessionEventV1) -> SessionTimelineItemV1 {
+fn push_session_actor_type_match_clause(
+    qb: &mut QueryBuilder<'_, Sqlite>,
+    actor_type: SessionActorTypeV1,
+    user_id_expr: &str,
+) {
+    match actor_type {
+        SessionActorTypeV1::Agent => {
+            push_helpdesk_agent_match_clause(qb, user_id_expr);
+        }
+        SessionActorTypeV1::Client => {
+            push_helpdesk_client_match_clause(qb, user_id_expr);
+        }
+        SessionActorTypeV1::Unknown => {
+            qb.push("NOT (");
+            push_helpdesk_agent_match_clause(qb, user_id_expr);
+            qb.push(") AND NOT (");
+            push_helpdesk_client_match_clause(qb, user_id_expr);
+            qb.push(")");
+        }
+    }
+}
+
+fn push_helpdesk_agent_match_clause(qb: &mut QueryBuilder<'_, Sqlite>, user_id_expr: &str) {
+    let normalized_user_expr = format!("REPLACE(TRIM({user_id_expr}), ' ', '')");
+    qb.push(format!(
+        "(EXISTS (SELECT 1 FROM helpdesk_authorized_agents haa WHERE REPLACE(TRIM(haa.agent_id), ' ', '') = {normalized_user_expr}) \
+OR EXISTS (SELECT 1 FROM helpdesk_agents ha WHERE REPLACE(TRIM(ha.agent_id), ' ', '') = {normalized_user_expr}))"
+    ));
+}
+
+fn push_helpdesk_client_match_clause(qb: &mut QueryBuilder<'_, Sqlite>, user_id_expr: &str) {
+    let normalized_user_expr = format!("REPLACE(TRIM({user_id_expr}), ' ', '')");
+    qb.push(format!(
+        "EXISTS (SELECT 1 FROM helpdesk_tickets ht WHERE REPLACE(TRIM(ht.client_id), ' ', '') = {normalized_user_expr})"
+    ));
+}
+
+async fn load_session_actor_reference_index(
+    pool: &SqlitePool,
+) -> anyhow::Result<SessionActorReferenceIndex> {
+    let mut actor_reference_index = SessionActorReferenceIndex::default();
+
+    let agent_ids = sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT agent_id FROM helpdesk_authorized_agents
+        UNION
+        SELECT agent_id FROM helpdesk_agents
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .context("failed to query helpdesk agent ids for session actor classification")?;
+
+    for agent_id in agent_ids {
+        let normalized = normalize_helpdesk_identity_id(&agent_id);
+        if !normalized.is_empty() {
+            actor_reference_index.agent_ids.insert(normalized);
+        }
+    }
+
+    let client_ids = sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT DISTINCT client_id
+        FROM helpdesk_tickets
+        WHERE TRIM(client_id) != ''
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .context("failed to query helpdesk client ids for session actor classification")?;
+
+    for client_id in client_ids {
+        let normalized = normalize_helpdesk_identity_id(&client_id);
+        if !normalized.is_empty() {
+            actor_reference_index.client_ids.insert(normalized);
+        }
+    }
+
+    Ok(actor_reference_index)
+}
+
+fn event_to_timeline_item(
+    event: SessionEventV1,
+    actor_type: SessionActorTypeV1,
+) -> SessionTimelineItemV1 {
     SessionTimelineItemV1 {
         event_id: event.event_id,
         event_type: event.event_type,
         session_id: event.session_id,
         user_id: event.user_id,
+        actor_type,
         direction: event.direction,
         timestamp: event.timestamp,
         host_info: event.host_info,
@@ -2900,11 +3126,72 @@ fn row_to_helpdesk_authorized_agent(
     })
 }
 
+fn normalize_helpdesk_identity_id(raw: &str) -> String {
+    raw.trim().chars().filter(|ch| !ch.is_whitespace()).collect()
+}
+
 fn normalize_helpdesk_agent_id(raw: &str) -> String {
-    raw.trim()
-        .chars()
-        .filter(|ch| !ch.is_whitespace())
-        .collect()
+    normalize_helpdesk_identity_id(raw)
+}
+
+async fn ensure_helpdesk_agent_display_name_available(
+    pool: &SqlitePool,
+    agent_id: &str,
+    display_name: Option<&str>,
+) -> anyhow::Result<()> {
+    let Some(display_name) = display_name.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+
+    let conflicting_authorized_agent = sqlx::query_scalar::<_, Option<String>>(
+        r#"
+        SELECT agent_id
+        FROM helpdesk_authorized_agents
+        WHERE agent_id != ?1
+          AND lower(trim(display_name)) = lower(trim(?2))
+        LIMIT 1
+        "#,
+    )
+    .bind(agent_id)
+    .bind(display_name)
+    .fetch_optional(pool)
+    .await
+    .context("failed to validate authorized helpdesk agent display name uniqueness")?
+    .flatten();
+
+    if let Some(conflicting_agent_id) = conflicting_authorized_agent {
+        anyhow::bail!(
+            "display name '{}' is already assigned to agent '{}'",
+            display_name,
+            conflicting_agent_id
+        );
+    }
+
+    let conflicting_live_agent = sqlx::query_scalar::<_, Option<String>>(
+        r#"
+        SELECT agent_id
+        FROM helpdesk_agents
+        WHERE agent_id != ?1
+          AND lower(trim(display_name)) = lower(trim(?2))
+        LIMIT 1
+        "#,
+    )
+    .bind(agent_id)
+    .bind(display_name)
+    .fetch_optional(pool)
+    .await
+    .context("failed to validate live helpdesk agent display name uniqueness")?
+    .flatten();
+
+    if let Some(conflicting_agent_id) = conflicting_live_agent {
+        anyhow::bail!(
+            "display name '{}' is already assigned to agent '{}'",
+            display_name,
+            conflicting_agent_id
+        );
+    }
+
+    Ok(())
 }
 
 fn normalized_helpdesk_agent_id_sql(column: &str) -> String {
@@ -3041,8 +3328,8 @@ mod tests {
 
     use crate::model::{
         HelpdeskAgentPresenceUpdateV1, HelpdeskAgentStatus, HelpdeskAuthorizedAgentUpsertRequestV1,
-        HelpdeskTicketCreateRequestV1, HelpdeskTicketStatus, SessionDirection, SessionEventType,
-        SessionEventV1,
+        HelpdeskTicketCreateRequestV1, HelpdeskTicketStatus, SessionActorTypeV1,
+        SessionDirection, SessionEventType, SessionEventV1,
     };
 
     use super::{
@@ -3051,8 +3338,10 @@ mod tests {
         get_helpdesk_assignment_for_agent, get_helpdesk_operational_summary, get_helpdesk_ticket,
         get_session_presence, insert_event, list_active_session_presence,
         list_helpdesk_ticket_audit_events, list_helpdesk_tickets, reconcile_helpdesk_runtime,
-        requeue_helpdesk_ticket, resolve_helpdesk_ticket, start_helpdesk_ticket, unix_millis_now,
-        upsert_helpdesk_agent_presence, upsert_helpdesk_authorized_agent, InsertOutcome,
+        query_timeline_events, requeue_helpdesk_ticket, resolve_helpdesk_ticket,
+        start_helpdesk_ticket, unix_millis_now, update_helpdesk_ticket_operational_fields,
+        upsert_helpdesk_agent_presence, upsert_helpdesk_authorized_agent, EventQueryFilter,
+        InsertOutcome,
     };
 
     async fn authorize_agent(pool: &sqlx::SqlitePool, agent_id: &str, display_name: &str) {
@@ -3288,6 +3577,117 @@ mod tests {
         .await
         .expect("presence should succeed for normalized id");
         assert_eq!(agent.agent_id, "419797027");
+    }
+
+    #[tokio::test]
+    async fn session_timeline_events_can_be_filtered_by_actor_type() {
+        let temp = tempdir().expect("create temp dir");
+        let db_path = temp.path().join("session-actor-filter.db");
+        let pool = connect_sqlite(&db_path).await.expect("connect sqlite");
+
+        authorize_agent(&pool, "278084673", "Edward soporte").await;
+        create_helpdesk_ticket(
+            &pool,
+            &HelpdeskTicketCreateRequestV1 {
+                client_id: "1945832881".to_string(),
+                client_display_name: Some("Cliente prueba".to_string()),
+                device_id: Some("device-actor".to_string()),
+                requested_by: Some("cliente".to_string()),
+                title: Some("Necesito ayuda".to_string()),
+                description: Some("Validar filtro de actores".to_string()),
+                difficulty: None,
+                estimated_minutes: None,
+                summary: Some("Filtro actor".to_string()),
+                preferred_agent_id: None,
+            },
+        )
+        .await
+        .expect("create client ticket");
+
+        let events = vec![
+            SessionEventV1 {
+                event_id: Uuid::new_v4(),
+                event_type: SessionEventType::SessionStarted,
+                session_id: "sess-actor-filter".to_string(),
+                user_id: "278084673".to_string(),
+                direction: SessionDirection::Outgoing,
+                timestamp: Utc::now(),
+                host_info: None,
+                meta: None,
+            },
+            SessionEventV1 {
+                event_id: Uuid::new_v4(),
+                event_type: SessionEventType::ParticipantJoined,
+                session_id: "sess-actor-filter".to_string(),
+                user_id: "1945832881".to_string(),
+                direction: SessionDirection::Incoming,
+                timestamp: Utc::now(),
+                host_info: None,
+                meta: None,
+            },
+            SessionEventV1 {
+                event_id: Uuid::new_v4(),
+                event_type: SessionEventType::ParticipantActivity,
+                session_id: "sess-actor-filter".to_string(),
+                user_id: "guest-unknown".to_string(),
+                direction: SessionDirection::Incoming,
+                timestamp: Utc::now(),
+                host_info: None,
+                meta: None,
+            },
+        ];
+
+        for event in events {
+            insert_event(&pool, &event).await.expect("insert event");
+        }
+
+        let (agent_items, agent_total) = query_timeline_events(
+            &pool,
+            &EventQueryFilter {
+                actor_type: Some(SessionActorTypeV1::Agent),
+                ..Default::default()
+            },
+            1,
+            50,
+        )
+        .await
+        .expect("query agent actor type");
+        assert_eq!(agent_total, 1);
+        assert_eq!(agent_items.len(), 1);
+        assert_eq!(agent_items[0].actor_type, SessionActorTypeV1::Agent);
+        assert_eq!(agent_items[0].user_id, "278084673");
+
+        let (client_items, client_total) = query_timeline_events(
+            &pool,
+            &EventQueryFilter {
+                actor_type: Some(SessionActorTypeV1::Client),
+                ..Default::default()
+            },
+            1,
+            50,
+        )
+        .await
+        .expect("query client actor type");
+        assert_eq!(client_total, 1);
+        assert_eq!(client_items.len(), 1);
+        assert_eq!(client_items[0].actor_type, SessionActorTypeV1::Client);
+        assert_eq!(client_items[0].user_id, "1945832881");
+
+        let (unknown_items, unknown_total) = query_timeline_events(
+            &pool,
+            &EventQueryFilter {
+                actor_type: Some(SessionActorTypeV1::Unknown),
+                ..Default::default()
+            },
+            1,
+            50,
+        )
+        .await
+        .expect("query unknown actor type");
+        assert_eq!(unknown_total, 1);
+        assert_eq!(unknown_items.len(), 1);
+        assert_eq!(unknown_items[0].actor_type, SessionActorTypeV1::Unknown);
+        assert_eq!(unknown_items[0].user_id, "guest-unknown");
     }
 
     #[tokio::test]
@@ -3974,6 +4374,106 @@ mod tests {
             assigned_agent.current_ticket_id.as_deref(),
             Some(ticket.ticket_id.as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn supervisor_cannot_assign_without_explicit_agent_selection() {
+        let temp = tempdir().expect("create temp dir");
+        let db_path = temp.path().join("helpdesk-manual-agent-required.db");
+        let pool = connect_sqlite(&db_path).await.expect("connect sqlite");
+        authorize_agent(&pool, "agent-required", "Agent Required").await;
+
+        upsert_helpdesk_agent_presence(
+            &pool,
+            &HelpdeskAgentPresenceUpdateV1 {
+                agent_id: "agent-required".to_string(),
+                display_name: Some("Agent Required".to_string()),
+                avatar_url: None,
+                status: HelpdeskAgentStatus::Available,
+            },
+        )
+        .await
+        .expect("upsert agent");
+
+        let ticket = create_helpdesk_ticket(
+            &pool,
+            &HelpdeskTicketCreateRequestV1 {
+                client_id: "client-required".to_string(),
+                client_display_name: Some("Cliente Required".to_string()),
+                device_id: None,
+                requested_by: Some("Supervisor".to_string()),
+                title: Some("Manual only".to_string()),
+                description: Some("Agent selection required".to_string()),
+                difficulty: None,
+                estimated_minutes: None,
+                summary: Some("manual assign".to_string()),
+                preferred_agent_id: None,
+            },
+        )
+        .await
+        .expect("create ticket");
+
+        let error = assign_helpdesk_ticket(&pool, &ticket.ticket_id, None, Some("no agent selected"))
+            .await
+            .expect_err("assignment without explicit agent must fail");
+        assert!(error.to_string().contains("agent_id is required"));
+    }
+
+    #[tokio::test]
+    async fn duplicate_authorized_agent_display_name_is_rejected() {
+        let temp = tempdir().expect("create temp dir");
+        let db_path = temp.path().join("helpdesk-duplicate-authorized-name.db");
+        let pool = connect_sqlite(&db_path).await.expect("connect sqlite");
+        authorize_agent(&pool, "agent-one", "Edward soporte").await;
+
+        let error = upsert_helpdesk_authorized_agent(
+            &pool,
+            &HelpdeskAuthorizedAgentUpsertRequestV1 {
+                agent_id: "agent-two".to_string(),
+                display_name: Some("Edward soporte".to_string()),
+            },
+        )
+        .await
+        .expect_err("duplicate display name must fail");
+
+        assert!(error.to_string().contains("display name 'Edward soporte'"));
+    }
+
+    #[tokio::test]
+    async fn operational_fields_can_be_updated_after_client_ticket_creation() {
+        let temp = tempdir().expect("create temp dir");
+        let db_path = temp.path().join("helpdesk-operational-fields.db");
+        let pool = connect_sqlite(&db_path).await.expect("connect sqlite");
+
+        let ticket = create_helpdesk_ticket(
+            &pool,
+            &HelpdeskTicketCreateRequestV1 {
+                client_id: "client-operational".to_string(),
+                client_display_name: Some("Cliente Operativo".to_string()),
+                device_id: None,
+                requested_by: Some("Cliente".to_string()),
+                title: Some("Issue".to_string()),
+                description: Some("Needs triage".to_string()),
+                difficulty: None,
+                estimated_minutes: None,
+                summary: Some("Issue".to_string()),
+                preferred_agent_id: None,
+            },
+        )
+        .await
+        .expect("create ticket");
+
+        let updated = update_helpdesk_ticket_operational_fields(
+            &pool,
+            &ticket.ticket_id,
+            Some("high"),
+            Some(45),
+        )
+        .await
+        .expect("update operational fields");
+
+        assert_eq!(updated.difficulty.as_deref(), Some("high"));
+        assert_eq!(updated.estimated_minutes, Some(45));
     }
 
     #[tokio::test]

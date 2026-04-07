@@ -5,7 +5,7 @@ import SessionActivityChart from '../components/SessionActivityChart';
 import { apiEvents, sessionsCsvUrl } from '../api';
 import { buildSessionActivityTimeline } from '../lib/session-activity';
 import { formatDateTime, fromLocalInputValue, toLocalInputValue } from '../lib/time';
-import type { PaginatedResponse, SessionEventType, SessionTimelineItem } from '../types';
+import type { PaginatedResponse, SessionActorType, SessionEventType, SessionTimelineItem } from '../types';
 
 const EVENT_TYPES: SessionEventType[] = [
   'session_started',
@@ -18,6 +18,7 @@ const EVENT_TYPES: SessionEventType[] = [
   'participant_activity',
 ];
 
+const ACTOR_TYPES: SessionActorType[] = ['agent', 'client', 'unknown'];
 const EVENTS_PER_PAGE = 200;
 const RAW_TABLE_ROWS = 25;
 
@@ -34,11 +35,38 @@ function hasAvatarUrl(value: string | null | undefined): value is string {
   return typeof value === 'string' && value.trim().length > 0;
 }
 
+function actorTypeLabel(actorType: SessionActorType): string {
+  switch (actorType) {
+    case 'agent':
+      return 'Agente';
+    case 'client':
+      return 'Cliente';
+    case 'unknown':
+      return 'Sin clasificar';
+    default:
+      return actorType;
+  }
+}
+
+function actorTypeClass(actorType: SessionActorType): string {
+  switch (actorType) {
+    case 'agent':
+      return 'status-good';
+    case 'client':
+      return 'status-info';
+    case 'unknown':
+      return 'status-neutral';
+    default:
+      return 'status-neutral';
+  }
+}
+
 export default function SessionsPage() {
   const navigate = useNavigate();
   const range = useMemo(initialRange, []);
   const [sessionId, setSessionId] = useState('');
   const [userId, setUserId] = useState('');
+  const [actorType, setActorType] = useState<SessionActorType | ''>('');
   const [eventType, setEventType] = useState<string>('');
   const [from, setFrom] = useState(range.from);
   const [to, setTo] = useState(range.to);
@@ -56,6 +84,7 @@ export default function SessionsPage() {
         const payload = await apiEvents({
           session_id: sessionId || undefined,
           user_id: userId || undefined,
+          actor_type: actorType || undefined,
           event_type: (eventType || undefined) as SessionEventType | undefined,
           from: fromLocalInputValue(from),
           to: fromLocalInputValue(to),
@@ -70,19 +99,36 @@ export default function SessionsPage() {
         setLoading(false);
       }
     },
-    [eventType, from, page, sessionId, to, userId],
+    [actorType, eventType, from, page, sessionId, to, userId],
   );
 
   useEffect(() => {
     void load(1);
   }, [load]);
 
-  const csvUrl = sessionsCsvUrl(fromLocalInputValue(from), fromLocalInputValue(to), userId || undefined);
+  const csvUrl = sessionsCsvUrl(
+    fromLocalInputValue(from),
+    fromLocalInputValue(to),
+    userId || undefined,
+    actorType || undefined,
+  );
   const activityTimeline = useMemo(
     () => buildSessionActivityTimeline(result?.items ?? [], result?.total ?? 0),
     [result],
   );
   const latestEvents = result?.items.slice(0, RAW_TABLE_ROWS) ?? [];
+  const actorCounts = useMemo(() => {
+    if (!activityTimeline) {
+      return { agent: 0, client: 0, unknown: 0 };
+    }
+    return activityTimeline.users.reduce(
+      (accumulator, user) => {
+        accumulator[user.actorType] += 1;
+        return accumulator;
+      },
+      { agent: 0, client: 0, unknown: 0 } as Record<SessionActorType, number>,
+    );
+  }, [activityTimeline]);
 
   return (
     <section className="stack">
@@ -96,6 +142,17 @@ export default function SessionsPage() {
           <div>
             <label htmlFor="user-id">User ID</label>
             <input id="user-id" value={userId} onChange={(event) => setUserId(event.target.value)} />
+          </div>
+          <div>
+            <label htmlFor="actor-type">Actor</label>
+            <select id="actor-type" value={actorType} onChange={(event) => setActorType(event.target.value as SessionActorType | '')}>
+              <option value="">Todos</option>
+              {ACTOR_TYPES.map((value) => (
+                <option key={value} value={value}>
+                  {actorTypeLabel(value)}
+                </option>
+              ))}
+            </select>
           </div>
           <div>
             <label htmlFor="event-type">Tipo de evento</label>
@@ -149,6 +206,18 @@ export default function SessionsPage() {
               <h3>Eventos totales filtro</h3>
               <strong>{activityTimeline.totalEventsMatching}</strong>
             </article>
+            <article className="card-muted">
+              <h3>Agentes visibles</h3>
+              <strong>{actorCounts.agent}</strong>
+            </article>
+            <article className="card-muted">
+              <h3>Clientes visibles</h3>
+              <strong>{actorCounts.client}</strong>
+            </article>
+            <article className="card-muted">
+              <h3>Sin clasificar</h3>
+              <strong>{actorCounts.unknown}</strong>
+            </article>
           </div>
 
           <div className="panel">
@@ -162,6 +231,10 @@ export default function SessionsPage() {
                 <p className="activity-summary-line">
                   Ventana: {formatDateTime(activityTimeline.rangeStartIso)} -{' '}
                   {formatDateTime(activityTimeline.rangeEndIso)}
+                </p>
+                <p className="activity-summary-line">
+                  Clasificacion visible: {actorCounts.agent} agentes, {actorCounts.client} clientes y {actorCounts.unknown}{' '}
+                  sin clasificar.
                 </p>
                 {activityTimeline.truncated ? (
                   <p className="activity-summary-line">
@@ -196,6 +269,7 @@ export default function SessionsPage() {
                   <div>
                     <h3>{user.displayName}</h3>
                     <p className="table-subtle">{user.userId}</p>
+                    <span className={`status-pill ${actorTypeClass(user.actorType)}`}>{actorTypeLabel(user.actorType)}</span>
                   </div>
                 </div>
                 <div className="activity-user-stats">
@@ -222,14 +296,15 @@ export default function SessionsPage() {
 
           <table>
             <thead>
-              <tr>
-                <th>Timestamp</th>
-                <th>Evento</th>
-                <th>Session ID</th>
-                <th>User ID</th>
-                <th>Direccion</th>
-                <th>Detalle</th>
-              </tr>
+                <tr>
+                  <th>Timestamp</th>
+                  <th>Evento</th>
+                  <th>Session ID</th>
+                  <th>User ID</th>
+                  <th>Actor</th>
+                  <th>Direccion</th>
+                  <th>Detalle</th>
+                </tr>
             </thead>
             <tbody>
               {latestEvents.map((item) => (
@@ -238,6 +313,9 @@ export default function SessionsPage() {
                   <td>{item.event_type}</td>
                   <td>{item.session_id}</td>
                   <td>{item.user_id}</td>
+                  <td>
+                    <span className={`status-pill ${actorTypeClass(item.actor_type)}`}>{actorTypeLabel(item.actor_type)}</span>
+                  </td>
                   <td>{item.direction}</td>
                   <td>
                     <Link to={`/sessions/${encodeURIComponent(item.session_id)}`}>Abrir</Link>
