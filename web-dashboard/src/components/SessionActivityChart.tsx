@@ -1,11 +1,10 @@
 import { useEffect, useRef } from 'react';
 import * as echarts from 'echarts';
+import type { CallbackDataParams, CustomSeriesRenderItem } from 'echarts/types/dist/shared';
 
 import { formatDateTime } from '../lib/time';
 import type { SessionActivityTimelineModel } from '../lib/session-activity';
-
-const OUTGOING_COLOR = '#0f766e';
-const INCOMING_COLOR = '#f97316';
+import { useTheme } from '../useTheme';
 
 function actorTypeLabel(actorType: string): string {
   switch (actorType) {
@@ -27,9 +26,27 @@ function escapeHtml(value: string): string {
     .replaceAll("'", '&#39;');
 }
 
+function readThemeColor(styles: CSSStyleDeclaration, variableName: string, fallback: string): string {
+  const value = styles.getPropertyValue(variableName).trim();
+  return value || fallback;
+}
+
 interface SessionActivityChartProps {
   model: SessionActivityTimelineModel;
   onSelectSession?: (sessionId: string) => void;
+}
+
+interface SessionActivityDatum {
+  value: [number, number, number];
+  sessionId: string;
+  userId: string;
+  displayName: string;
+  actorType: string;
+  direction: string;
+  eventCount: number;
+  startLabel: string;
+  endLabel: string;
+  lastEventType: string;
 }
 
 export default function SessionActivityChart({
@@ -37,6 +54,7 @@ export default function SessionActivityChart({
   onSelectSession,
 }: SessionActivityChartProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
+  const { resolvedTheme } = useTheme();
 
   useEffect(() => {
     if (!containerRef.current) {
@@ -44,11 +62,24 @@ export default function SessionActivityChart({
     }
 
     const chart = echarts.init(containerRef.current);
+    const styles = getComputedStyle(document.documentElement);
+    const colors = {
+      legendText: readThemeColor(styles, '--chart-legend', '#56605f'),
+      tooltipBackground: readThemeColor(styles, '--chart-tooltip-bg', '#1f2e2d'),
+      tooltipBorder: readThemeColor(styles, '--chart-tooltip-border', 'transparent'),
+      tooltipInk: readThemeColor(styles, '--chart-tooltip-ink', '#fffdf8'),
+      axisText: readThemeColor(styles, '--chart-axis-label', '#56605f'),
+      axisStrong: readThemeColor(styles, '--chart-axis-strong', '#1f2e2d'),
+      axisLine: readThemeColor(styles, '--chart-axis-line', '#d6d2c8'),
+      gridLine: readThemeColor(styles, '--chart-grid-line', '#ece8de'),
+      outgoing: readThemeColor(styles, '--chart-series-outgoing', '#0f766e'),
+      incoming: readThemeColor(styles, '--chart-series-incoming', '#f97316'),
+    };
     const categoryIndexByUserId = new Map(
       model.users.map((user, index) => [user.userId, index] as const),
     );
 
-    const baseData = model.segments.map((segment) => ({
+    const baseData: SessionActivityDatum[] = model.segments.map((segment) => ({
       value: [
         categoryIndexByUserId.get(segment.userId) ?? 0,
         segment.startMs,
@@ -65,11 +96,18 @@ export default function SessionActivityChart({
       lastEventType: segment.lastEventType,
     }));
 
-    const renderItem = (params: any, api: any) => {
-      const categoryIndex = api.value(0);
-      const start = api.coord([api.value(1), categoryIndex]);
-      const end = api.coord([api.value(2), categoryIndex]);
-      const barHeight = api.size([0, 1])[1] * 0.52;
+    const renderItem: CustomSeriesRenderItem = (params, api) => {
+      const categoryIndex = Number(api.value(0));
+      const start = api.coord?.([Number(api.value(1)), categoryIndex]) ?? [0, 0];
+      const end = api.coord?.([Number(api.value(2)), categoryIndex]) ?? [0, 0];
+      const size = api.size?.([0, 1]);
+      const barHeight = (Array.isArray(size) ? size[1] : 0) * 0.52;
+      const coordSys = params.coordSys as unknown as {
+        x: number;
+        y: number;
+        width: number;
+        height: number;
+      };
       const rectShape = echarts.graphic.clipRectByRect(
         {
           x: start[0],
@@ -78,10 +116,10 @@ export default function SessionActivityChart({
           height: barHeight,
         },
         {
-          x: params.coordSys.x,
-          y: params.coordSys.y,
-          width: params.coordSys.width,
-          height: params.coordSys.height,
+          x: coordSys.x,
+          y: coordSys.y,
+          width: coordSys.width,
+          height: coordSys.height,
         },
       );
 
@@ -93,7 +131,7 @@ export default function SessionActivityChart({
         type: 'rect',
         transition: ['shape'],
         shape: rectShape,
-        style: api.style(),
+        style: api.style?.(),
       };
     };
 
@@ -111,18 +149,19 @@ export default function SessionActivityChart({
         top: 0,
         right: 0,
         textStyle: {
-          color: '#56605f',
+          color: colors.legendText,
         },
       },
       tooltip: {
         trigger: 'item',
-        backgroundColor: '#1f2e2d',
-        borderWidth: 0,
+        backgroundColor: colors.tooltipBackground,
+        borderColor: colors.tooltipBorder,
+        borderWidth: colors.tooltipBorder === 'transparent' ? 0 : 1,
         textStyle: {
-          color: '#fffdf8',
+          color: colors.tooltipInk,
         },
-        formatter(params: any) {
-          const data = params.data;
+        formatter(params: CallbackDataParams) {
+          const data = params.data as SessionActivityDatum;
           return [
             `<strong>${escapeHtml(data.displayName)}</strong>`,
             `Usuario: ${escapeHtml(data.userId)}`,
@@ -141,16 +180,16 @@ export default function SessionActivityChart({
         min: new Date(model.rangeStartIso).getTime(),
         max: new Date(model.rangeEndIso).getTime(),
         axisLabel: {
-          color: '#56605f',
+          color: colors.axisText,
         },
         axisLine: {
           lineStyle: {
-            color: '#d6d2c8',
+            color: colors.axisLine,
           },
         },
         splitLine: {
           lineStyle: {
-            color: '#ece8de',
+            color: colors.gridLine,
           },
         },
       },
@@ -164,7 +203,7 @@ export default function SessionActivityChart({
           show: false,
         },
         axisLabel: {
-          color: '#1f2e2d',
+          color: colors.axisStrong,
           width: 160,
           overflow: 'truncate',
           formatter(value: string) {
@@ -185,7 +224,7 @@ export default function SessionActivityChart({
             y: 0,
           },
           itemStyle: {
-            color: OUTGOING_COLOR,
+            color: colors.outgoing,
             opacity: 0.9,
           },
           data: baseData.filter((segment) => segment.direction === 'outgoing'),
@@ -199,7 +238,7 @@ export default function SessionActivityChart({
             y: 0,
           },
           itemStyle: {
-            color: INCOMING_COLOR,
+            color: colors.incoming,
             opacity: 0.9,
           },
           data: baseData.filter((segment) => segment.direction === 'incoming'),
@@ -210,8 +249,9 @@ export default function SessionActivityChart({
     const handleResize = () => chart.resize();
     window.addEventListener('resize', handleResize);
 
-    const handleClick = (params: any) => {
-      const sessionId = params?.data?.sessionId;
+    const handleClick = (params: CallbackDataParams) => {
+      const data = params.data as SessionActivityDatum | undefined;
+      const sessionId = data?.sessionId;
       if (sessionId && onSelectSession) {
         onSelectSession(sessionId);
       }
@@ -224,7 +264,7 @@ export default function SessionActivityChart({
       window.removeEventListener('resize', handleResize);
       chart.dispose();
     };
-  }, [model, onSelectSession]);
+  }, [model, onSelectSession, resolvedTheme]);
 
   return <div ref={containerRef} className="session-timeline-chart" />;
 }

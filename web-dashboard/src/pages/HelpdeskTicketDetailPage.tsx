@@ -145,7 +145,7 @@ export default function HelpdeskTicketDetailPage() {
     }
     setOperationalDifficulty((ticket.difficulty ?? 'medium').trim().toLowerCase() || 'medium');
     setOperationalEstimatedMinutes(ticket.estimated_minutes ? String(ticket.estimated_minutes) : '30');
-  }, [ticket?.ticket_id, ticket?.updated_at]);
+  }, [ticket]);
 
   return (
     <section className="stack">

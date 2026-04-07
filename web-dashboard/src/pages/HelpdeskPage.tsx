@@ -273,7 +273,7 @@ export default function HelpdeskPage() {
         setAuthorizeBusy(false);
       }
     },
-    [authorizedForm, load],
+    [authorizedForm, load, normalizedAgentNames],
   );
 
   const handleRemoveAuthorizedAgent = useCallback(

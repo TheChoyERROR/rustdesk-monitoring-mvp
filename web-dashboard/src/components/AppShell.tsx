@@ -1,6 +1,7 @@
 import { NavLink, Outlet, useNavigate } from 'react-router-dom';
 
 import { useAuth } from '../useAuth';
+import ThemeToggle from './ThemeToggle';
 
 export default function AppShell() {
   const { user, logout } = useAuth();
@@ -19,6 +20,7 @@ export default function AppShell() {
           <p>Panel de supervision operativa</p>
         </div>
         <div className="header-actions">
+          <ThemeToggle />
           <span className="chip">{user?.username}</span>
           <button type="button" onClick={onLogout} className="btn secondary">
             Cerrar sesion

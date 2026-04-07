@@ -279,7 +279,11 @@ export function buildSessionActivityTimeline(
   const rangeEndMs = Math.max(...segments.map((segment) => segment.endMs));
 
   return {
-    users: users.map(({ lastEventMs: _ignored, ...user }) => user),
+    users: users.map((user) => {
+      const { lastEventMs, ...nextUser } = user;
+      void lastEventMs;
+      return nextUser;
+    }),
     segments: segments.sort((left, right) => left.startMs - right.startMs),
     rangeStartIso: new Date(rangeStartMs).toISOString(),
     rangeEndIso: new Date(rangeEndMs).toISOString(),

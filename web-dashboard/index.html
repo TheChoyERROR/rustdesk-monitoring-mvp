@@ -3,6 +3,37 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <script>
+      (() => {
+        const storageKey = 'rustdesk-dashboard-theme';
+        const doc = document.documentElement;
+        let preference = 'system';
+
+        try {
+          const stored = window.localStorage.getItem(storageKey);
+          if (stored === 'light' || stored === 'dark' || stored === 'system') {
+            preference = stored;
+          }
+        } catch {
+          preference = 'system';
+        }
+
+        const mediaQuery =
+          typeof window.matchMedia === 'function'
+            ? window.matchMedia('(prefers-color-scheme: dark)')
+            : null;
+        const resolvedTheme =
+          preference === 'system'
+            ? mediaQuery?.matches
+              ? 'dark'
+              : 'light'
+            : preference;
+
+        doc.dataset.theme = resolvedTheme;
+        doc.style.colorScheme = resolvedTheme;
+      })();
+    </script>
     <title>RustDesk Monitoring Dashboard</title>
   </head>
   <body>

@@ -1,5 +1,8 @@
 export type AuthRole = 'supervisor';
 
+export type ThemePreference = 'system' | 'light' | 'dark';
+export type ResolvedTheme = 'light' | 'dark';
+
 export interface AuthUser {
   id: number;
   username: string;

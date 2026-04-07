@@ -27,8 +27,8 @@ const SPARKLINE_WIDTH = 260;
 const SPARKLINE_HEIGHT = 68;
 const SPARKLINE_PADDING = 6;
 const SPARKLINE_BUCKETS = 12;
-const STATUS_CONNECTED_COLOR = '#22c55e';
-const STATUS_DISCONNECTED_COLOR = '#ef4444';
+const STATUS_CONNECTED_COLOR = 'var(--status-connected)';
+const STATUS_DISCONNECTED_COLOR = 'var(--status-disconnected)';
 
 type TimelineWithMs = SessionTimelineItem & { timestampMs: number };
 
