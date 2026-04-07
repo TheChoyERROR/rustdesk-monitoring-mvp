@@ -134,36 +134,53 @@ pub async fn run(
     .await
     .context("failed to seed dashboard supervisor user")?;
 
-    let helpdesk_turso = TursoSyncConfig::from_env();
-    if let Some(sync_cfg) = helpdesk_turso.as_ref() {
-        let summary = initialize_helpdesk_turso_bridge(&pool, &sync_cfg.url, &sync_cfg.auth_token)
-            .await
-            .context("failed to initialize Turso helpdesk bridge")?;
-        info!(
-            mode = summary.mode,
-            local_rows = summary.local_counts.total_rows(),
-            remote_rows = summary.remote_counts.total_rows(),
-            local_tickets = summary.local_counts.tickets,
-            remote_tickets = summary.remote_counts.tickets,
-            "helpdesk Turso bridge initialized"
-        );
+    let mut helpdesk_turso = TursoSyncConfig::from_env();
+    if let Some(sync_cfg) = helpdesk_turso.clone() {
+        match initialize_helpdesk_turso_bridge(&pool, &sync_cfg.url, &sync_cfg.auth_token).await {
+            Ok(summary) => {
+                info!(
+                    mode = summary.mode,
+                    local_rows = summary.local_counts.total_rows(),
+                    remote_rows = summary.remote_counts.total_rows(),
+                    local_tickets = summary.local_counts.tickets,
+                    remote_tickets = summary.remote_counts.tickets,
+                    "helpdesk Turso bridge initialized"
+                );
 
-        let monitoring_summary =
-            initialize_monitoring_turso_bridge(&pool, &sync_cfg.url, &sync_cfg.auth_token)
-                .await
-                .context("failed to initialize Turso monitoring bridge")?;
-        info!(
-            mode = monitoring_summary.mode,
-            local_rows = monitoring_summary.local_counts.total_rows(),
-            remote_rows = monitoring_summary.remote_counts.total_rows(),
-            local_session_events = monitoring_summary.local_counts.session_events,
-            remote_session_events = monitoring_summary.remote_counts.session_events,
-            local_presence_rows = monitoring_summary.local_counts.session_presence,
-            remote_presence_rows = monitoring_summary.remote_counts.session_presence,
-            local_outbox_rows = monitoring_summary.local_counts.outbox_events,
-            remote_outbox_rows = monitoring_summary.remote_counts.outbox_events,
-            "monitoring Turso bridge initialized"
-        );
+                match initialize_monitoring_turso_bridge(&pool, &sync_cfg.url, &sync_cfg.auth_token)
+                    .await
+                {
+                    Ok(monitoring_summary) => {
+                        info!(
+                            mode = monitoring_summary.mode,
+                            local_rows = monitoring_summary.local_counts.total_rows(),
+                            remote_rows = monitoring_summary.remote_counts.total_rows(),
+                            local_session_events = monitoring_summary.local_counts.session_events,
+                            remote_session_events = monitoring_summary.remote_counts.session_events,
+                            local_presence_rows = monitoring_summary.local_counts.session_presence,
+                            remote_presence_rows = monitoring_summary.remote_counts.session_presence,
+                            local_outbox_rows = monitoring_summary.local_counts.outbox_events,
+                            remote_outbox_rows = monitoring_summary.remote_counts.outbox_events,
+                            "monitoring Turso bridge initialized"
+                        );
+                    }
+                    Err(err) => {
+                        error!(
+                            error = %err,
+                            "failed to initialize Turso monitoring bridge; continuing with local SQLite only"
+                        );
+                        helpdesk_turso = None;
+                    }
+                }
+            }
+            Err(err) => {
+                error!(
+                    error = %err,
+                    "failed to initialize Turso helpdesk bridge; continuing with local SQLite only"
+                );
+                helpdesk_turso = None;
+            }
+        }
     } else {
         info!("Turso bridges disabled; TURSO_DATABASE_URL/TURSO_AUTH_TOKEN not set");
     }
