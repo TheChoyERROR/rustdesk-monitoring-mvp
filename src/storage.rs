@@ -71,6 +71,8 @@ pub struct HelpdeskRuntimeReconcileResult {
     pub tickets_failed: u64,
 }
 
+const HELPDESK_OPENING_WINDOW_MS: i64 = 30_000;
+
 pub async fn connect_sqlite(database_path: &Path) -> anyhow::Result<SqlitePool> {
     if let Some(parent) = database_path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -733,8 +735,17 @@ pub async fn upsert_helpdesk_agent_presence(
                 ELSE ?2
             END,
             avatar_url = COALESCE(?3, helpdesk_agents.avatar_url),
-            status = ?4,
+            status = CASE
+                WHEN helpdesk_agents.status IN ('opening', 'busy')
+                     AND helpdesk_agents.current_ticket_id IS NOT NULL
+                     AND ?4 IN ('available', 'away', 'offline')
+                THEN helpdesk_agents.status
+                ELSE ?4
+            END,
             current_ticket_id = CASE
+                WHEN helpdesk_agents.status IN ('opening', 'busy')
+                     AND helpdesk_agents.current_ticket_id IS NOT NULL
+                THEN helpdesk_agents.current_ticket_id
                 WHEN ?4 IN ('available', 'away', 'offline') THEN NULL
                 ELSE helpdesk_agents.current_ticket_id
             END,
@@ -2663,7 +2674,7 @@ async fn assign_helpdesk_ticket_to_agent_tx(
     dispatch_source: &str,
     reason: Option<&str>,
 ) -> anyhow::Result<bool> {
-    let deadline_ms = now_ms + 10_000;
+    let deadline_ms = now_ms + HELPDESK_OPENING_WINDOW_MS;
     let reason = reason.map(str::trim).filter(|value| !value.is_empty());
 
     let ticket_update = sqlx::query(
@@ -3575,6 +3586,82 @@ mod tests {
         assert_eq!(resolved_ticket.status, HelpdeskTicketStatus::Resolved);
         assert_eq!(resolved_agent.status, HelpdeskAgentStatus::Available);
         assert_eq!(resolved_agent.current_ticket_id, None);
+    }
+
+    #[tokio::test]
+    async fn opening_assignment_survives_available_presence_heartbeat() {
+        let temp = tempdir().expect("create temp dir");
+        let db_path = temp.path().join("helpdesk-opening-heartbeat.db");
+        let pool = connect_sqlite(&db_path).await.expect("connect sqlite");
+        authorize_agent(&pool, "agent-heartbeat", "Agent Heartbeat").await;
+
+        upsert_helpdesk_agent_presence(
+            &pool,
+            &HelpdeskAgentPresenceUpdateV1 {
+                agent_id: "agent-heartbeat".to_string(),
+                display_name: Some("Agent Heartbeat".to_string()),
+                avatar_url: None,
+                status: HelpdeskAgentStatus::Available,
+            },
+        )
+        .await
+        .expect("upsert agent");
+
+        let ticket = create_helpdesk_ticket(
+            &pool,
+            &HelpdeskTicketCreateRequestV1 {
+                client_id: "client-heartbeat".to_string(),
+                client_display_name: None,
+                device_id: None,
+                requested_by: None,
+                title: None,
+                description: None,
+                difficulty: None,
+                estimated_minutes: None,
+                summary: Some("Opening heartbeat".to_string()),
+                preferred_agent_id: None,
+            },
+        )
+        .await
+        .expect("create ticket");
+
+        assign_helpdesk_ticket(
+            &pool,
+            &ticket.ticket_id,
+            Some("agent-heartbeat"),
+            Some("manual dispatch"),
+        )
+        .await
+        .expect("assign ticket");
+
+        upsert_helpdesk_agent_presence(
+            &pool,
+            &HelpdeskAgentPresenceUpdateV1 {
+                agent_id: "agent-heartbeat".to_string(),
+                display_name: Some("Agent Heartbeat".to_string()),
+                avatar_url: None,
+                status: HelpdeskAgentStatus::Available,
+            },
+        )
+        .await
+        .expect("heartbeat while opening");
+
+        let agent_during_opening = get_helpdesk_agent(&pool, "agent-heartbeat")
+            .await
+            .expect("get agent")
+            .expect("agent exists");
+        assert_eq!(agent_during_opening.status, HelpdeskAgentStatus::Opening);
+        assert_eq!(
+            agent_during_opening.current_ticket_id.as_deref(),
+            Some(ticket.ticket_id.as_str())
+        );
+
+        let (started_ticket, started_agent) =
+            start_helpdesk_ticket(&pool, "agent-heartbeat", &ticket.ticket_id)
+                .await
+                .expect("start ticket after heartbeat");
+        assert_eq!(started_ticket.status, HelpdeskTicketStatus::InProgress);
+        assert_eq!(started_agent.status, HelpdeskAgentStatus::Busy);
     }
 
     #[tokio::test]
