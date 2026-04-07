@@ -3,6 +3,7 @@ pub mod client;
 pub mod config;
 pub mod metrics;
 pub mod model;
+pub mod postgres;
 pub mod schema;
 pub mod server;
 pub mod storage;
