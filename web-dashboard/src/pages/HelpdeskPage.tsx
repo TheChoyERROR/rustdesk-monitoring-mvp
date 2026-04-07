@@ -84,6 +84,18 @@ function difficultyLabel(rawDifficulty?: string | null) {
   }
 }
 
+function ticketHeadline(ticket: HelpdeskTicket): string {
+  const title = ticket.title?.trim();
+  if (title) {
+    return title;
+  }
+  const summary = ticket.summary?.trim();
+  if (summary) {
+    return summary;
+  }
+  return ticket.ticket_id;
+}
+
 function normalizeRustDeskId(rawValue: string): string {
   return rawValue.replace(/\s+/g, '').trim();
 }
@@ -828,13 +840,10 @@ export default function HelpdeskPage() {
                   <td>
                     <strong>
                       <Link to={`/helpdesk/tickets/${encodeURIComponent(ticket.ticket_id)}`}>
-                        {ticket.ticket_id}
+                        {ticketHeadline(ticket)}
                       </Link>
                     </strong>
-                    {ticket.title ? <div className="table-subtle">{ticket.title}</div> : null}
-                    {!ticket.title && ticket.summary ? (
-                      <div className="table-subtle">{ticket.summary}</div>
-                    ) : null}
+                    <div className="table-subtle">{ticket.ticket_id}</div>
                     {ticket.latest_agent_report ? (
                       <div className="table-subtle">Ultimo reporte: {ticket.latest_agent_report}</div>
                     ) : null}

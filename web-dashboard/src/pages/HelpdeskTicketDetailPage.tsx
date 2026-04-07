@@ -69,6 +69,18 @@ function difficultyLabel(rawDifficulty?: string | null) {
   }
 }
 
+function ticketHeadline(ticket: HelpdeskTicket): string {
+  const title = ticket.title?.trim();
+  if (title) {
+    return title;
+  }
+  const summary = ticket.summary?.trim();
+  if (summary) {
+    return summary;
+  }
+  return ticket.ticket_id;
+}
+
 function auditPayloadToText(payload: HelpdeskAuditEvent['payload']) {
   if (!payload || Object.keys(payload).length === 0) {
     return '';
@@ -154,7 +166,8 @@ export default function HelpdeskTicketDetailPage() {
           <p className="activity-summary-line">
             <Link to="/helpdesk">Helpdesk</Link> / Ticket
           </p>
-          <h2>{decodedTicketId}</h2>
+          <h2>{ticket ? ticketHeadline(ticket) : decodedTicketId}</h2>
+          {ticket ? <p className="activity-summary-line">{ticket.ticket_id}</p> : null}
         </div>
         <button type="button" className="btn secondary" onClick={() => void load()} disabled={refreshing}>
           {refreshing ? 'Actualizando...' : 'Refrescar'}
