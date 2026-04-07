@@ -273,7 +273,9 @@ Uso recomendado:
 1) El ZIP portable usa launch-rustdesk.cmd para inyectar RUSTDESK_MONITORING_URL.
 2) El setup.exe arranca la instalacion nativa de $NativeAppName y luego configura
    monitoring-server-url dentro de la app instalada.
-3) Despues del setup, usa el acceso directo nativo de $NativeAppName creado en Windows.
+3) El setup.exe tambien instala/inicia el servicio nativo de Windows para no
+   depender del boton "Iniciar servicio" al primer arranque.
+4) Despues del setup, usa el acceso directo nativo de $NativeAppName creado en Windows.
 
 El launcher configura RUSTDESK_MONITORING_URL en:
 $MonitoringUrl
@@ -379,6 +381,12 @@ native_install_location_ready:
   DetailPrint "Guardando monitoring-server legacy option..."
   ClearErrors
   ExecWait '`"`$1\\`${EXE_NAME}`" --option "monitoring-server" "`${MONITORING_URL}"' `$3
+
+  DetailPrint "Instalando e iniciando el servicio nativo..."
+  ClearErrors
+  ExecWait '`"`$1\\`${EXE_NAME}`" --install-service' `$4
+  StrCmp `$4 0 +3
+    MessageBox MB_ICONEXCLAMATION "La instalacion termino, pero no se pudo instalar/iniciar el servicio. Codigo: `$4"
 
   CopyFiles /SILENT "`$PLUGINSDIR\\bootstrap\\monitoring-launcher.env" "`$1\\monitoring-launcher.env"
   CopyFiles /SILENT "`$PLUGINSDIR\\bootstrap\\MONITORING-POLICY.txt" "`$1\\MONITORING-POLICY.txt"
