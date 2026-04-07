@@ -76,7 +76,7 @@ export default function SessionsPage() {
   const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(
-    async (targetPage = page) => {
+    async (targetPage = 1) => {
       setLoading(true);
       setError(null);
 
@@ -99,7 +99,7 @@ export default function SessionsPage() {
         setLoading(false);
       }
     },
-    [actorType, eventType, from, page, sessionId, to, userId],
+    [actorType, eventType, from, sessionId, to, userId],
   );
 
   useEffect(() => {
@@ -129,6 +129,7 @@ export default function SessionsPage() {
       { agent: 0, client: 0, unknown: 0 } as Record<SessionActorType, number>,
     );
   }, [activityTimeline]);
+  const totalPages = result ? Math.max(1, Math.ceil(result.total / result.page_size)) : 1;
 
   return (
     <section className="stack">
@@ -341,8 +342,8 @@ export default function SessionsPage() {
             <button
               type="button"
               className="btn secondary"
-              disabled={result.page * result.page_size >= result.total}
-              onClick={() => load(page + 1)}
+              disabled={result.page >= totalPages}
+              onClick={() => load(result.page + 1)}
             >
               Siguiente
             </button>

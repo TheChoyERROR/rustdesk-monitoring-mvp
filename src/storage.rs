@@ -4570,6 +4570,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_assignment_reflects_operational_fields_updated_by_supervisor() {
+        let temp = tempdir().expect("create temp dir");
+        let db_path = temp.path().join("helpdesk-assignment-operational-fields.db");
+        let pool = connect_sqlite(&db_path).await.expect("connect sqlite");
+        authorize_agent(&pool, "agent-operational", "Agent Operational").await;
+
+        upsert_helpdesk_agent_presence(
+            &pool,
+            &HelpdeskAgentPresenceUpdateV1 {
+                agent_id: "agent-operational".to_string(),
+                display_name: Some("Agent Operational".to_string()),
+                avatar_url: None,
+                status: HelpdeskAgentStatus::Available,
+            },
+        )
+        .await
+        .expect("upsert agent");
+
+        let ticket = create_helpdesk_ticket(
+            &pool,
+            &HelpdeskTicketCreateRequestV1 {
+                client_id: "client-operational-assignment".to_string(),
+                client_display_name: Some("Cliente Assignment".to_string()),
+                device_id: None,
+                requested_by: Some("Cliente".to_string()),
+                title: Some("Need triage".to_string()),
+                description: Some("Operational fields should reach the agent".to_string()),
+                difficulty: None,
+                estimated_minutes: None,
+                summary: Some("Need triage".to_string()),
+                preferred_agent_id: None,
+            },
+        )
+        .await
+        .expect("create ticket");
+
+        let updated = update_helpdesk_ticket_operational_fields(
+            &pool,
+            &ticket.ticket_id,
+            Some("medium"),
+            Some(30),
+        )
+        .await
+        .expect("update operational fields");
+
+        assert_eq!(updated.difficulty.as_deref(), Some("medium"));
+        assert_eq!(updated.estimated_minutes, Some(30));
+
+        assign_helpdesk_ticket(
+            &pool,
+            &ticket.ticket_id,
+            Some("agent-operational"),
+            Some("manual dispatch"),
+        )
+        .await
+        .expect("assign ticket");
+
+        let assignment = get_helpdesk_assignment_for_agent(&pool, "agent-operational")
+            .await
+            .expect("get assignment")
+            .expect("assignment should exist");
+
+        assert_eq!(assignment.ticket.difficulty.as_deref(), Some("medium"));
+        assert_eq!(assignment.ticket.estimated_minutes, Some(30));
+    }
+
+    #[tokio::test]
     async fn agent_report_is_saved_on_ticket_and_visible_in_audit() {
         let temp = tempdir().expect("create temp dir");
         let db_path = temp.path().join("helpdesk-agent-report.db");
