@@ -46,6 +46,7 @@ use crate::storage::{
     upsert_helpdesk_authorized_agent, EventQueryFilter, InsertOutcome, OutboxRecord,
 };
 use crate::turso::{
+    compute_helpdesk_sync_signature, compute_monitoring_sync_signature,
     initialize_helpdesk_turso_bridge, initialize_monitoring_turso_bridge,
     sync_helpdesk_snapshot_to_turso, sync_monitoring_snapshot_to_turso, TursoSyncConfig,
 };
@@ -54,7 +55,6 @@ use crate::webhook::WebhookDispatcher;
 const MAX_SESSION_EVENT_BODY_BYTES: usize = 4 * 1024 * 1024;
 const HELPDESK_RECONCILE_INTERVAL_MS: u64 = 5_000;
 const HELPDESK_AGENT_STALE_AFTER_MS: i64 = 30_000;
-const TURSO_SYNC_INTERVAL_MS: u64 = 5_000;
 
 #[derive(Clone)]
 struct AppState {
@@ -136,7 +136,7 @@ pub async fn run(
 
     let mut helpdesk_turso = TursoSyncConfig::from_env();
     if let Some(sync_cfg) = helpdesk_turso.clone() {
-        match initialize_helpdesk_turso_bridge(&pool, &sync_cfg.url, &sync_cfg.auth_token).await {
+        match initialize_helpdesk_turso_bridge(&pool, &sync_cfg).await {
             Ok(summary) => {
                 info!(
                     mode = summary.mode,
@@ -147,7 +147,7 @@ pub async fn run(
                     "helpdesk Turso bridge initialized"
                 );
 
-                match initialize_monitoring_turso_bridge(&pool, &sync_cfg.url, &sync_cfg.auth_token)
+                match initialize_monitoring_turso_bridge(&pool, &sync_cfg)
                     .await
                 {
                     Ok(monitoring_summary) => {
@@ -1763,39 +1763,57 @@ async fn turso_sync_worker(state: AppState) {
         return;
     };
 
-    let interval = Duration::from_millis(TURSO_SYNC_INTERVAL_MS);
+    let interval = Duration::from_millis(sync_cfg.interval_ms);
+    let mut last_helpdesk_signature = compute_helpdesk_sync_signature(&state.pool, &sync_cfg)
+        .await
+        .ok();
+    let mut last_monitoring_signature = compute_monitoring_sync_signature(&state.pool, &sync_cfg)
+        .await
+        .ok();
 
     loop {
         tokio::time::sleep(interval).await;
 
-        match sync_helpdesk_snapshot_to_turso(&state.pool, &sync_cfg.url, &sync_cfg.auth_token)
-            .await
-        {
-            Ok(counts) => {
-                debug!(
-                    rows = counts.total_rows(),
-                    tickets = counts.tickets,
-                    agents = counts.agents,
-                    authorized_agents = counts.authorized_agents,
-                    "helpdesk snapshot synced to Turso"
-                );
+        match compute_helpdesk_sync_signature(&state.pool, &sync_cfg).await {
+            Ok(signature) if last_helpdesk_signature.as_ref() != Some(&signature) => {
+                match sync_helpdesk_snapshot_to_turso(&state.pool, &sync_cfg).await {
+                    Ok(counts) => {
+                        debug!(
+                            rows = counts.total_rows(),
+                            tickets = counts.tickets,
+                            agents = counts.agents,
+                            authorized_agents = counts.authorized_agents,
+                            "helpdesk snapshot synced to Turso"
+                        );
+                        last_helpdesk_signature = Some(signature);
+                    }
+                    Err(err) => error!(error = %err, "failed to sync helpdesk snapshot to Turso"),
+                }
             }
-            Err(err) => error!(error = %err, "failed to sync helpdesk snapshot to Turso"),
+            Ok(_) => {}
+            Err(err) => error!(error = %err, "failed to compute helpdesk Turso sync signature"),
         }
 
-        match sync_monitoring_snapshot_to_turso(&state.pool, &sync_cfg.url, &sync_cfg.auth_token)
-            .await
-        {
-            Ok(counts) => {
-                debug!(
-                    rows = counts.total_rows(),
-                    session_events = counts.session_events,
-                    session_presence = counts.session_presence,
-                    outbox_events = counts.outbox_events,
-                    "monitoring snapshot synced to Turso"
-                );
+        match compute_monitoring_sync_signature(&state.pool, &sync_cfg).await {
+            Ok(signature) if last_monitoring_signature.as_ref() != Some(&signature) => {
+                match sync_monitoring_snapshot_to_turso(&state.pool, &sync_cfg).await {
+                    Ok(counts) => {
+                        debug!(
+                            rows = counts.total_rows(),
+                            session_events = counts.session_events,
+                            session_presence = counts.session_presence,
+                            outbox_events = counts.outbox_events,
+                            "monitoring snapshot synced to Turso"
+                        );
+                        last_monitoring_signature = Some(signature);
+                    }
+                    Err(err) => {
+                        error!(error = %err, "failed to sync monitoring snapshot to Turso")
+                    }
+                }
             }
-            Err(err) => error!(error = %err, "failed to sync monitoring snapshot to Turso"),
+            Ok(_) => {}
+            Err(err) => error!(error = %err, "failed to compute monitoring Turso sync signature"),
         }
     }
 }

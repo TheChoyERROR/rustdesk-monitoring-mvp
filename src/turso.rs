@@ -30,6 +30,12 @@ pub struct TursoHelpdeskSmokeSummary {
 pub struct TursoSyncConfig {
     pub url: String,
     pub auth_token: String,
+    pub interval_ms: u64,
+    pub monitoring_outbox_retention_ms: i64,
+    pub monitoring_session_event_retention_ms: i64,
+    pub monitoring_presence_retention_ms: i64,
+    pub helpdesk_heartbeat_retention_ms: i64,
+    pub helpdesk_audit_retention_ms: i64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -99,7 +105,23 @@ impl TursoSyncConfig {
             .filter(|value| !value.is_empty());
 
         match (url, auth_token) {
-            (Some(url), Some(auth_token)) => Some(Self { url, auth_token }),
+            (Some(url), Some(auth_token)) => Some(Self {
+                url,
+                auth_token,
+                interval_ms: env_u64("TURSO_SYNC_INTERVAL_MS").unwrap_or(60_000),
+                monitoring_outbox_retention_ms: env_i64("TURSO_OUTBOX_RETENTION_MS")
+                    .unwrap_or(3 * 24 * 60 * 60 * 1000),
+                monitoring_session_event_retention_ms: env_i64(
+                    "TURSO_SESSION_EVENT_RETENTION_MS",
+                )
+                .unwrap_or(14 * 24 * 60 * 60 * 1000),
+                monitoring_presence_retention_ms: env_i64("TURSO_SESSION_PRESENCE_RETENTION_MS")
+                    .unwrap_or(24 * 60 * 60 * 1000),
+                helpdesk_heartbeat_retention_ms: env_i64("TURSO_HEARTBEAT_RETENTION_MS")
+                    .unwrap_or(7 * 24 * 60 * 60 * 1000),
+                helpdesk_audit_retention_ms: env_i64("TURSO_AUDIT_RETENTION_MS")
+                    .unwrap_or(90 * 24 * 60 * 60 * 1000),
+            }),
             _ => None,
         }
     }
@@ -107,12 +129,11 @@ impl TursoSyncConfig {
 
 pub async fn initialize_helpdesk_turso_bridge(
     pool: &SqlitePool,
-    url: &str,
-    auth_token: &str,
+    sync_cfg: &TursoSyncConfig,
 ) -> anyhow::Result<HelpdeskTursoBridgeSummary> {
     init_sqlite_schema(pool).await?;
 
-    let db = connect_turso_remote(url, auth_token).await?;
+    let db = connect_turso_remote(&sync_cfg.url, &sync_cfg.auth_token).await?;
     let conn = db
         .connect()
         .context("failed to open Turso connection for helpdesk bridge bootstrap")?;
@@ -133,7 +154,7 @@ pub async fn initialize_helpdesk_turso_bridge(
     }
 
     if local_counts.total_rows() > 0 {
-        let local_snapshot = fetch_helpdesk_snapshot_from_sqlite(pool).await?;
+        let local_snapshot = fetch_helpdesk_snapshot_from_sqlite(pool, Some(sync_cfg)).await?;
         apply_helpdesk_snapshot_to_turso(&conn, &local_snapshot).await?;
         let remote_counts = count_helpdesk_rows_turso(&conn).await?;
         return Ok(HelpdeskTursoBridgeSummary {
@@ -152,13 +173,12 @@ pub async fn initialize_helpdesk_turso_bridge(
 
 pub async fn sync_helpdesk_snapshot_to_turso(
     pool: &SqlitePool,
-    url: &str,
-    auth_token: &str,
+    sync_cfg: &TursoSyncConfig,
 ) -> anyhow::Result<HelpdeskSnapshotCounts> {
     init_sqlite_schema(pool).await?;
 
-    let snapshot = fetch_helpdesk_snapshot_from_sqlite(pool).await?;
-    let db = connect_turso_remote(url, auth_token).await?;
+    let snapshot = fetch_helpdesk_snapshot_from_sqlite(pool, Some(sync_cfg)).await?;
+    let db = connect_turso_remote(&sync_cfg.url, &sync_cfg.auth_token).await?;
     let conn = db
         .connect()
         .context("failed to open Turso connection for helpdesk snapshot sync")?;
@@ -169,12 +189,11 @@ pub async fn sync_helpdesk_snapshot_to_turso(
 
 pub async fn initialize_monitoring_turso_bridge(
     pool: &SqlitePool,
-    url: &str,
-    auth_token: &str,
+    sync_cfg: &TursoSyncConfig,
 ) -> anyhow::Result<MonitoringTursoBridgeSummary> {
     init_sqlite_schema(pool).await?;
 
-    let db = connect_turso_remote(url, auth_token).await?;
+    let db = connect_turso_remote(&sync_cfg.url, &sync_cfg.auth_token).await?;
     let conn = db
         .connect()
         .context("failed to open Turso connection for monitoring bridge bootstrap")?;
@@ -195,7 +214,7 @@ pub async fn initialize_monitoring_turso_bridge(
     }
 
     if local_counts.total_rows() > 0 {
-        let local_snapshot = fetch_monitoring_snapshot_from_sqlite(pool).await?;
+        let local_snapshot = fetch_monitoring_snapshot_from_sqlite(pool, Some(sync_cfg)).await?;
         apply_monitoring_snapshot_to_turso(&conn, &local_snapshot).await?;
         let remote_counts = count_monitoring_rows_turso(&conn).await?;
         return Ok(MonitoringTursoBridgeSummary {
@@ -214,13 +233,12 @@ pub async fn initialize_monitoring_turso_bridge(
 
 pub async fn sync_monitoring_snapshot_to_turso(
     pool: &SqlitePool,
-    url: &str,
-    auth_token: &str,
+    sync_cfg: &TursoSyncConfig,
 ) -> anyhow::Result<MonitoringSnapshotCounts> {
     init_sqlite_schema(pool).await?;
 
-    let snapshot = fetch_monitoring_snapshot_from_sqlite(pool).await?;
-    let db = connect_turso_remote(url, auth_token).await?;
+    let snapshot = fetch_monitoring_snapshot_from_sqlite(pool, Some(sync_cfg)).await?;
+    let db = connect_turso_remote(&sync_cfg.url, &sync_cfg.auth_token).await?;
     let conn = db
         .connect()
         .context("failed to open Turso connection for monitoring snapshot sync")?;
@@ -296,6 +314,88 @@ pub async fn run_helpdesk_smoke(
         created_ticket,
         tickets_total: tickets.len(),
         operational_summary,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HelpdeskSyncSignature {
+    pub authorized_agents: usize,
+    pub agents: usize,
+    pub tickets: usize,
+    pub assignments: usize,
+    pub heartbeats: usize,
+    pub audit_events: usize,
+    pub max_authorized_updated_at: i64,
+    pub max_agent_updated_at: i64,
+    pub max_ticket_updated_at: i64,
+    pub max_assignment_updated_at: i64,
+    pub max_heartbeat_created_at: i64,
+    pub max_audit_created_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MonitoringSyncSignature {
+    pub outbox_events: usize,
+    pub session_events: usize,
+    pub session_presence: usize,
+    pub max_outbox_updated_at: i64,
+    pub max_session_event_created_at: i64,
+    pub max_session_presence_updated_at: i64,
+}
+
+pub async fn compute_helpdesk_sync_signature(
+    pool: &SqlitePool,
+    sync_cfg: &TursoSyncConfig,
+) -> anyhow::Result<HelpdeskSyncSignature> {
+    let snapshot = fetch_helpdesk_snapshot_from_sqlite(pool, Some(sync_cfg)).await?;
+    Ok(HelpdeskSyncSignature {
+        authorized_agents: snapshot.authorized_agents.len(),
+        agents: snapshot.agents.len(),
+        tickets: snapshot.tickets.len(),
+        assignments: snapshot.assignments.len(),
+        heartbeats: snapshot.heartbeats.len(),
+        audit_events: snapshot.audit_events.len(),
+        max_authorized_updated_at: snapshot
+            .authorized_agents
+            .iter()
+            .map(|row| row.updated_at)
+            .max()
+            .unwrap_or(0),
+        max_agent_updated_at: snapshot.agents.iter().map(|row| row.updated_at).max().unwrap_or(0),
+        max_ticket_updated_at: snapshot.tickets.iter().map(|row| row.updated_at).max().unwrap_or(0),
+        max_assignment_updated_at: snapshot
+            .assignments
+            .iter()
+            .map(|row| row.updated_at)
+            .max()
+            .unwrap_or(0),
+        max_heartbeat_created_at: snapshot.heartbeats.iter().map(|row| row.created_at).max().unwrap_or(0),
+        max_audit_created_at: snapshot.audit_events.iter().map(|row| row.created_at).max().unwrap_or(0),
+    })
+}
+
+pub async fn compute_monitoring_sync_signature(
+    pool: &SqlitePool,
+    sync_cfg: &TursoSyncConfig,
+) -> anyhow::Result<MonitoringSyncSignature> {
+    let snapshot = fetch_monitoring_snapshot_from_sqlite(pool, Some(sync_cfg)).await?;
+    Ok(MonitoringSyncSignature {
+        outbox_events: snapshot.outbox_events.len(),
+        session_events: snapshot.session_events.len(),
+        session_presence: snapshot.session_presence.len(),
+        max_outbox_updated_at: snapshot.outbox_events.iter().map(|row| row.updated_at).max().unwrap_or(0),
+        max_session_event_created_at: snapshot
+            .session_events
+            .iter()
+            .map(|row| row.created_at)
+            .max()
+            .unwrap_or(0),
+        max_session_presence_updated_at: snapshot
+            .session_presence
+            .iter()
+            .map(|row| row.updated_at)
+            .max()
+            .unwrap_or(0),
     })
 }
 
@@ -831,14 +931,17 @@ async fn count_turso_table(conn: &Connection, table: &str) -> anyhow::Result<usi
     }
 }
 
-async fn fetch_helpdesk_snapshot_from_sqlite(pool: &SqlitePool) -> anyhow::Result<HelpdeskSnapshot> {
+async fn fetch_helpdesk_snapshot_from_sqlite(
+    pool: &SqlitePool,
+    sync_cfg: Option<&TursoSyncConfig>,
+) -> anyhow::Result<HelpdeskSnapshot> {
     Ok(HelpdeskSnapshot {
         authorized_agents: fetch_sqlite_authorized_agents(pool).await?,
         agents: fetch_sqlite_agents(pool).await?,
         tickets: fetch_sqlite_tickets(pool).await?,
         assignments: fetch_sqlite_assignments(pool).await?,
-        heartbeats: fetch_sqlite_heartbeats(pool).await?,
-        audit_events: fetch_sqlite_audit_events(pool).await?,
+        heartbeats: fetch_sqlite_heartbeats(pool, sync_cfg).await?,
+        audit_events: fetch_sqlite_audit_events(pool, sync_cfg).await?,
     })
 }
 
@@ -1271,17 +1374,36 @@ async fn fetch_sqlite_assignments(pool: &SqlitePool) -> anyhow::Result<Vec<Assig
         .collect())
 }
 
-async fn fetch_sqlite_heartbeats(pool: &SqlitePool) -> anyhow::Result<Vec<HeartbeatRecord>> {
-    let rows = sqlx::query(
-        r#"
-        SELECT id, agent_id, status, created_at
-        FROM helpdesk_agent_heartbeats
-        ORDER BY id ASC
-        "#,
-    )
-    .fetch_all(pool)
-    .await
-    .context("failed to read SQLite helpdesk heartbeats")?;
+async fn fetch_sqlite_heartbeats(
+    pool: &SqlitePool,
+    sync_cfg: Option<&TursoSyncConfig>,
+) -> anyhow::Result<Vec<HeartbeatRecord>> {
+    let rows = if let Some(sync_cfg) = sync_cfg {
+        let cutoff = unix_millis_now() - sync_cfg.helpdesk_heartbeat_retention_ms;
+        sqlx::query(
+            r#"
+            SELECT id, agent_id, status, created_at
+            FROM helpdesk_agent_heartbeats
+            WHERE created_at >= ?1
+            ORDER BY id ASC
+            "#,
+        )
+        .bind(cutoff)
+        .fetch_all(pool)
+        .await
+        .context("failed to read retained SQLite helpdesk heartbeats")?
+    } else {
+        sqlx::query(
+            r#"
+            SELECT id, agent_id, status, created_at
+            FROM helpdesk_agent_heartbeats
+            ORDER BY id ASC
+            "#,
+        )
+        .fetch_all(pool)
+        .await
+        .context("failed to read SQLite helpdesk heartbeats")?
+    };
 
     Ok(rows
         .into_iter()
@@ -1294,17 +1416,36 @@ async fn fetch_sqlite_heartbeats(pool: &SqlitePool) -> anyhow::Result<Vec<Heartb
         .collect())
 }
 
-async fn fetch_sqlite_audit_events(pool: &SqlitePool) -> anyhow::Result<Vec<AuditEventRecord>> {
-    let rows = sqlx::query(
-        r#"
-        SELECT id, entity_type, entity_id, event_type, payload, created_at
-        FROM helpdesk_audit_events
-        ORDER BY id ASC
-        "#,
-    )
-    .fetch_all(pool)
-    .await
-    .context("failed to read SQLite helpdesk audit events")?;
+async fn fetch_sqlite_audit_events(
+    pool: &SqlitePool,
+    sync_cfg: Option<&TursoSyncConfig>,
+) -> anyhow::Result<Vec<AuditEventRecord>> {
+    let rows = if let Some(sync_cfg) = sync_cfg {
+        let cutoff = unix_millis_now() - sync_cfg.helpdesk_audit_retention_ms;
+        sqlx::query(
+            r#"
+            SELECT id, entity_type, entity_id, event_type, payload, created_at
+            FROM helpdesk_audit_events
+            WHERE created_at >= ?1
+            ORDER BY id ASC
+            "#,
+        )
+        .bind(cutoff)
+        .fetch_all(pool)
+        .await
+        .context("failed to read retained SQLite helpdesk audit events")?
+    } else {
+        sqlx::query(
+            r#"
+            SELECT id, entity_type, entity_id, event_type, payload, created_at
+            FROM helpdesk_audit_events
+            ORDER BY id ASC
+            "#,
+        )
+        .fetch_all(pool)
+        .await
+        .context("failed to read SQLite helpdesk audit events")?
+    };
 
     Ok(rows
         .into_iter()
@@ -1565,11 +1706,12 @@ async fn count_monitoring_rows_turso(
 
 async fn fetch_monitoring_snapshot_from_sqlite(
     pool: &SqlitePool,
+    sync_cfg: Option<&TursoSyncConfig>,
 ) -> anyhow::Result<MonitoringSnapshot> {
     Ok(MonitoringSnapshot {
-        outbox_events: fetch_sqlite_outbox_events(pool).await?,
-        session_events: fetch_sqlite_session_events(pool).await?,
-        session_presence: fetch_sqlite_session_presence(pool).await?,
+        outbox_events: fetch_sqlite_outbox_events(pool, sync_cfg).await?,
+        session_events: fetch_sqlite_session_events(pool, sync_cfg).await?,
+        session_presence: fetch_sqlite_session_presence(pool, sync_cfg).await?,
     })
 }
 
@@ -1778,17 +1920,36 @@ async fn apply_monitoring_snapshot_to_turso(
     Ok(())
 }
 
-async fn fetch_sqlite_outbox_events(pool: &SqlitePool) -> anyhow::Result<Vec<OutboxEventRow>> {
-    let rows = sqlx::query(
-        r#"
-        SELECT event_id, payload, status, attempts, next_attempt_at, created_at, updated_at, last_error
-        FROM outbox_events
-        ORDER BY created_at ASC, event_id ASC
-        "#,
-    )
-    .fetch_all(pool)
-    .await
-    .context("failed to read SQLite outbox events")?;
+async fn fetch_sqlite_outbox_events(
+    pool: &SqlitePool,
+    sync_cfg: Option<&TursoSyncConfig>,
+) -> anyhow::Result<Vec<OutboxEventRow>> {
+    let rows = if let Some(sync_cfg) = sync_cfg {
+        let cutoff = unix_millis_now() - sync_cfg.monitoring_outbox_retention_ms;
+        sqlx::query(
+            r#"
+            SELECT event_id, payload, status, attempts, next_attempt_at, created_at, updated_at, last_error
+            FROM outbox_events
+            WHERE updated_at >= ?1
+            ORDER BY created_at ASC, event_id ASC
+            "#,
+        )
+        .bind(cutoff)
+        .fetch_all(pool)
+        .await
+        .context("failed to read retained SQLite outbox events")?
+    } else {
+        sqlx::query(
+            r#"
+            SELECT event_id, payload, status, attempts, next_attempt_at, created_at, updated_at, last_error
+            FROM outbox_events
+            ORDER BY created_at ASC, event_id ASC
+            "#,
+        )
+        .fetch_all(pool)
+        .await
+        .context("failed to read SQLite outbox events")?
+    };
 
     Ok(rows
         .into_iter()
@@ -1805,17 +1966,36 @@ async fn fetch_sqlite_outbox_events(pool: &SqlitePool) -> anyhow::Result<Vec<Out
         .collect())
 }
 
-async fn fetch_sqlite_session_events(pool: &SqlitePool) -> anyhow::Result<Vec<SessionEventRow>> {
-    let rows = sqlx::query(
-        r#"
-        SELECT event_id, event_type, session_id, user_id, direction, timestamp, payload, created_at
-        FROM session_events
-        ORDER BY created_at ASC, event_id ASC
-        "#,
-    )
-    .fetch_all(pool)
-    .await
-    .context("failed to read SQLite session events")?;
+async fn fetch_sqlite_session_events(
+    pool: &SqlitePool,
+    sync_cfg: Option<&TursoSyncConfig>,
+) -> anyhow::Result<Vec<SessionEventRow>> {
+    let rows = if let Some(sync_cfg) = sync_cfg {
+        let cutoff = unix_millis_now() - sync_cfg.monitoring_session_event_retention_ms;
+        sqlx::query(
+            r#"
+            SELECT event_id, event_type, session_id, user_id, direction, timestamp, payload, created_at
+            FROM session_events
+            WHERE created_at >= ?1
+            ORDER BY created_at ASC, event_id ASC
+            "#,
+        )
+        .bind(cutoff)
+        .fetch_all(pool)
+        .await
+        .context("failed to read retained SQLite session events")?
+    } else {
+        sqlx::query(
+            r#"
+            SELECT event_id, event_type, session_id, user_id, direction, timestamp, payload, created_at
+            FROM session_events
+            ORDER BY created_at ASC, event_id ASC
+            "#,
+        )
+        .fetch_all(pool)
+        .await
+        .context("failed to read SQLite session events")?
+    };
 
     Ok(rows
         .into_iter()
@@ -1834,18 +2014,36 @@ async fn fetch_sqlite_session_events(pool: &SqlitePool) -> anyhow::Result<Vec<Se
 
 async fn fetch_sqlite_session_presence(
     pool: &SqlitePool,
+    sync_cfg: Option<&TursoSyncConfig>,
 ) -> anyhow::Result<Vec<SessionPresenceRow>> {
-    let rows = sqlx::query(
-        r#"
-        SELECT session_id, participant_id, display_name, avatar_url, is_active,
-               is_control_active, last_activity_at, updated_at
-        FROM session_presence
-        ORDER BY session_id ASC, participant_id ASC
-        "#,
-    )
-    .fetch_all(pool)
-    .await
-    .context("failed to read SQLite session presence")?;
+    let rows = if let Some(sync_cfg) = sync_cfg {
+        let cutoff = unix_millis_now() - sync_cfg.monitoring_presence_retention_ms;
+        sqlx::query(
+            r#"
+            SELECT session_id, participant_id, display_name, avatar_url, is_active,
+                   is_control_active, last_activity_at, updated_at
+            FROM session_presence
+            WHERE is_active = 1 OR updated_at >= ?1
+            ORDER BY session_id ASC, participant_id ASC
+            "#,
+        )
+        .bind(cutoff)
+        .fetch_all(pool)
+        .await
+        .context("failed to read retained SQLite session presence")?
+    } else {
+        sqlx::query(
+            r#"
+            SELECT session_id, participant_id, display_name, avatar_url, is_active,
+                   is_control_active, last_activity_at, updated_at
+            FROM session_presence
+            ORDER BY session_id ASC, participant_id ASC
+            "#,
+        )
+        .fetch_all(pool)
+        .await
+        .context("failed to read SQLite session presence")?
+    };
 
     Ok(rows
         .into_iter()
@@ -1948,4 +2146,20 @@ async fn fetch_turso_session_presence(conn: &Connection) -> anyhow::Result<Vec<S
         });
     }
     Ok(values)
+}
+
+fn env_u64(key: &str) -> Option<u64> {
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .and_then(|value| value.parse::<u64>().ok())
+}
+
+fn env_i64(key: &str) -> Option<i64> {
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .and_then(|value| value.parse::<i64>().ok())
 }
