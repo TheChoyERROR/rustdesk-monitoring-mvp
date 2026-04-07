@@ -338,6 +338,12 @@ pub struct HelpdeskTicketV1 {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub assigned_agent_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_agent_report: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_agent_report_by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_agent_report_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub opening_deadline_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -394,6 +400,12 @@ pub struct HelpdeskTicketOperationalUpdateRequestV1 {
     pub difficulty: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub estimated_minutes: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HelpdeskTicketAgentReportCreateRequestV1 {
+    pub agent_id: String,
+    pub note: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -513,6 +525,18 @@ impl HelpdeskTicketOperationalUpdateRequestV1 {
         }
         if self.difficulty.is_none() && self.estimated_minutes.is_none() {
             return Err(EventValidationError::EmptyHelpdeskOperationalUpdate);
+        }
+        Ok(())
+    }
+}
+
+impl HelpdeskTicketAgentReportCreateRequestV1 {
+    pub fn validate(&self) -> Result<(), EventValidationError> {
+        if self.agent_id.trim().is_empty() {
+            return Err(EventValidationError::EmptyField("agent_id"));
+        }
+        if self.note.trim().is_empty() {
+            return Err(EventValidationError::EmptyField("note"));
         }
         Ok(())
     }

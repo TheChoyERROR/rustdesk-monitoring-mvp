@@ -181,6 +181,9 @@ const SCHEMA_STATEMENTS: &[(&str, &str)] = &[
             summary TEXT,
             status TEXT NOT NULL,
             assigned_agent_id TEXT,
+            latest_agent_report TEXT,
+            latest_agent_report_by TEXT,
+            latest_agent_report_at INTEGER,
             opening_deadline_at INTEGER,
             created_at INTEGER NOT NULL,
             updated_at INTEGER NOT NULL
@@ -274,6 +277,9 @@ pub async fn init_sqlite_schema(pool: &SqlitePool) -> anyhow::Result<()> {
     ensure_sqlite_text_column(pool, "helpdesk_tickets", "description").await?;
     ensure_sqlite_text_column(pool, "helpdesk_tickets", "difficulty").await?;
     ensure_sqlite_integer_column(pool, "helpdesk_tickets", "estimated_minutes").await?;
+    ensure_sqlite_text_column(pool, "helpdesk_tickets", "latest_agent_report").await?;
+    ensure_sqlite_text_column(pool, "helpdesk_tickets", "latest_agent_report_by").await?;
+    ensure_sqlite_integer_column(pool, "helpdesk_tickets", "latest_agent_report_at").await?;
 
     Ok(())
 }
@@ -288,6 +294,9 @@ pub async fn init_libsql_schema(conn: &LibsqlConnection) -> anyhow::Result<()> {
     ensure_libsql_text_column(conn, "helpdesk_tickets", "description").await?;
     ensure_libsql_text_column(conn, "helpdesk_tickets", "difficulty").await?;
     ensure_libsql_integer_column(conn, "helpdesk_tickets", "estimated_minutes").await?;
+    ensure_libsql_text_column(conn, "helpdesk_tickets", "latest_agent_report").await?;
+    ensure_libsql_text_column(conn, "helpdesk_tickets", "latest_agent_report_by").await?;
+    ensure_libsql_integer_column(conn, "helpdesk_tickets", "latest_agent_report_at").await?;
 
     Ok(())
 }

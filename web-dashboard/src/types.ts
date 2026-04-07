@@ -126,6 +126,9 @@ export interface HelpdeskTicket {
   summary?: string | null;
   status: HelpdeskTicketStatus;
   assigned_agent_id?: string | null;
+  latest_agent_report?: string | null;
+  latest_agent_report_by?: string | null;
+  latest_agent_report_at?: string | null;
   opening_deadline_at?: string | null;
   created_at: string;
   updated_at: string;

@@ -835,6 +835,9 @@ export default function HelpdeskPage() {
                     {!ticket.title && ticket.summary ? (
                       <div className="table-subtle">{ticket.summary}</div>
                     ) : null}
+                    {ticket.latest_agent_report ? (
+                      <div className="table-subtle">Ultimo reporte: {ticket.latest_agent_report}</div>
+                    ) : null}
                   </td>
                   <td>
                     <strong>{ticket.client_display_name || ticket.client_id}</strong>

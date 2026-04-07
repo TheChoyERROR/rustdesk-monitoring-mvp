@@ -506,11 +506,14 @@ async fn create_helpdesk_ticket_remote(
             summary,
             status,
             assigned_agent_id,
+            latest_agent_report,
+            latest_agent_report_by,
+            latest_agent_report_at,
             opening_deadline_at,
             created_at,
             updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', NULL, NULL, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', NULL, NULL, NULL, NULL, NULL, ?, ?)
         "#,
         insert_params,
     )
@@ -570,6 +573,9 @@ pub async fn list_helpdesk_tickets_remote(
                 summary,
                 status,
                 assigned_agent_id,
+                latest_agent_report,
+                latest_agent_report_by,
+                latest_agent_report_at,
                 opening_deadline_at,
                 created_at,
                 updated_at
@@ -604,6 +610,9 @@ pub async fn get_helpdesk_ticket_remote(
                 summary,
                 status,
                 assigned_agent_id,
+                latest_agent_report,
+                latest_agent_report_by,
+                latest_agent_report_at,
                 opening_deadline_at,
                 created_at,
                 updated_at
@@ -706,7 +715,8 @@ async fn collect_helpdesk_tickets(rows: &mut Rows) -> anyhow::Result<Vec<Helpdes
 
 fn row_to_helpdesk_ticket_libsql(row: &libsql::Row) -> anyhow::Result<HelpdeskTicketV1> {
     let status: String = row.get(10)?;
-    let opening_deadline_at: Option<i64> = row.get(12)?;
+    let latest_agent_report_at: Option<i64> = row.get(14)?;
+    let opening_deadline_at: Option<i64> = row.get(15)?;
 
     Ok(HelpdeskTicketV1 {
         ticket_id: row.get(0)?,
@@ -723,9 +733,12 @@ fn row_to_helpdesk_ticket_libsql(row: &libsql::Row) -> anyhow::Result<HelpdeskTi
         summary: row.get(9)?,
         status: helpdesk_ticket_status_from_db(&status),
         assigned_agent_id: row.get(11)?,
+        latest_agent_report: row.get(12)?,
+        latest_agent_report_by: row.get(13)?,
+        latest_agent_report_at: latest_agent_report_at.map(millis_to_utc),
         opening_deadline_at: opening_deadline_at.map(millis_to_utc),
-        created_at: millis_to_utc(row.get(13)?),
-        updated_at: millis_to_utc(row.get(14)?),
+        created_at: millis_to_utc(row.get(16)?),
+        updated_at: millis_to_utc(row.get(17)?),
     })
 }
 
@@ -854,6 +867,9 @@ struct TicketRecord {
     summary: Option<String>,
     status: String,
     assigned_agent_id: Option<String>,
+    latest_agent_report: Option<String>,
+    latest_agent_report_by: Option<String>,
+    latest_agent_report_at: Option<i64>,
     opening_deadline_at: Option<i64>,
     created_at: i64,
     updated_at: i64,
@@ -1024,8 +1040,9 @@ async fn apply_helpdesk_snapshot_to_sqlite(
             INSERT INTO helpdesk_tickets (
                 ticket_id, client_id, client_display_name, device_id, requested_by,
                 title, description, difficulty, estimated_minutes, summary, status,
-                assigned_agent_id, opening_deadline_at, created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+                assigned_agent_id, latest_agent_report, latest_agent_report_by,
+                latest_agent_report_at, opening_deadline_at, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
             "#,
         )
         .bind(&row.ticket_id)
@@ -1040,6 +1057,9 @@ async fn apply_helpdesk_snapshot_to_sqlite(
         .bind(&row.summary)
         .bind(&row.status)
         .bind(&row.assigned_agent_id)
+        .bind(&row.latest_agent_report)
+        .bind(&row.latest_agent_report_by)
+        .bind(row.latest_agent_report_at)
         .bind(row.opening_deadline_at)
         .bind(row.created_at)
         .bind(row.updated_at)
@@ -1171,31 +1191,36 @@ async fn apply_helpdesk_snapshot_to_turso(
     }
 
     for row in &snapshot.tickets {
+        let ticket_params = vec![
+            Value::from(row.ticket_id.clone()),
+            Value::from(row.client_id.clone()),
+            optional_string_value(row.client_display_name.clone()),
+            optional_string_value(row.device_id.clone()),
+            optional_string_value(row.requested_by.clone()),
+            optional_string_value(row.title.clone()),
+            optional_string_value(row.description.clone()),
+            optional_string_value(row.difficulty.clone()),
+            optional_i64_value(row.estimated_minutes),
+            optional_string_value(row.summary.clone()),
+            Value::from(row.status.clone()),
+            optional_string_value(row.assigned_agent_id.clone()),
+            optional_string_value(row.latest_agent_report.clone()),
+            optional_string_value(row.latest_agent_report_by.clone()),
+            optional_i64_value(row.latest_agent_report_at),
+            optional_i64_value(row.opening_deadline_at),
+            Value::from(row.created_at),
+            Value::from(row.updated_at),
+        ];
         tx.execute(
             r#"
             INSERT INTO helpdesk_tickets (
                 ticket_id, client_id, client_display_name, device_id, requested_by,
                 title, description, difficulty, estimated_minutes, summary, status,
-                assigned_agent_id, opening_deadline_at, created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+                assigned_agent_id, latest_agent_report, latest_agent_report_by,
+                latest_agent_report_at, opening_deadline_at, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
             "#,
-            (
-                row.ticket_id.as_str(),
-                row.client_id.as_str(),
-                row.client_display_name.as_deref(),
-                row.device_id.as_deref(),
-                row.requested_by.as_deref(),
-                row.title.as_deref(),
-                row.description.as_deref(),
-                row.difficulty.as_deref(),
-                row.estimated_minutes,
-                row.summary.as_deref(),
-                row.status.as_str(),
-                row.assigned_agent_id.as_deref(),
-                row.opening_deadline_at,
-                row.created_at,
-                row.updated_at,
-            ),
+            ticket_params,
         )
         .await
         .with_context(|| format!("failed to sync helpdesk ticket '{}' to Turso", row.ticket_id))?;
@@ -1318,6 +1343,7 @@ async fn fetch_sqlite_tickets(pool: &SqlitePool) -> anyhow::Result<Vec<TicketRec
         r#"
         SELECT ticket_id, client_id, client_display_name, device_id, requested_by, title,
                description, difficulty, estimated_minutes, summary, status, assigned_agent_id,
+               latest_agent_report, latest_agent_report_by, latest_agent_report_at,
                opening_deadline_at, created_at, updated_at
         FROM helpdesk_tickets
         ORDER BY created_at ASC, ticket_id ASC
@@ -1342,6 +1368,9 @@ async fn fetch_sqlite_tickets(pool: &SqlitePool) -> anyhow::Result<Vec<TicketRec
             summary: row.get("summary"),
             status: row.get("status"),
             assigned_agent_id: row.get("assigned_agent_id"),
+            latest_agent_report: row.get("latest_agent_report"),
+            latest_agent_report_by: row.get("latest_agent_report_by"),
+            latest_agent_report_at: row.get("latest_agent_report_at"),
             opening_deadline_at: row.get("opening_deadline_at"),
             created_at: row.get("created_at"),
             updated_at: row.get("updated_at"),
@@ -1520,6 +1549,7 @@ async fn fetch_turso_tickets(conn: &Connection) -> anyhow::Result<Vec<TicketReco
             r#"
             SELECT ticket_id, client_id, client_display_name, device_id, requested_by, title,
                    description, difficulty, estimated_minutes, summary, status, assigned_agent_id,
+                   latest_agent_report, latest_agent_report_by, latest_agent_report_at,
                    opening_deadline_at, created_at, updated_at
             FROM helpdesk_tickets
             ORDER BY created_at ASC, ticket_id ASC
@@ -1544,9 +1574,12 @@ async fn fetch_turso_tickets(conn: &Connection) -> anyhow::Result<Vec<TicketReco
             summary: row.get(9)?,
             status: row.get(10)?,
             assigned_agent_id: row.get(11)?,
-            opening_deadline_at: row.get(12)?,
-            created_at: row.get(13)?,
-            updated_at: row.get(14)?,
+            latest_agent_report: row.get(12)?,
+            latest_agent_report_by: row.get(13)?,
+            latest_agent_report_at: row.get(14)?,
+            opening_deadline_at: row.get(15)?,
+            created_at: row.get(16)?,
+            updated_at: row.get(17)?,
         });
     }
     Ok(values)

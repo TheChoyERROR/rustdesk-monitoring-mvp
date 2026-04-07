@@ -27,13 +27,14 @@ use crate::metrics::Metrics;
 use crate::model::{
     AuthLoginRequestV1, AuthLoginResponseV1, AuthRoleV1, AuthUserV1, HelpdeskAgentPresenceUpdateV1,
     HelpdeskAgentStatus, HelpdeskAssignmentStartRequestV1, HelpdeskAuthorizedAgentUpsertRequestV1,
-    HelpdeskTicketAssignRequestV1, HelpdeskTicketCreateRequestV1,
+    HelpdeskTicketAgentReportCreateRequestV1, HelpdeskTicketAssignRequestV1,
+    HelpdeskTicketCreateRequestV1,
     HelpdeskTicketOperationalUpdateRequestV1, HelpdeskTicketResolveRequestV1,
     HelpdeskTicketSupervisorActionRequestV1, PaginatedResponseV1, SessionActorTypeV1,
     SessionEventType, SessionEventV1,
 };
 use crate::storage::{
-    assign_helpdesk_ticket, cancel_helpdesk_ticket, claim_due_events,
+    add_helpdesk_ticket_agent_report, assign_helpdesk_ticket, cancel_helpdesk_ticket, claim_due_events,
     cleanup_expired_dashboard_sessions, cleanup_failed_older_than, connect_sqlite,
     create_helpdesk_ticket, delete_dashboard_session, delete_helpdesk_authorized_agent,
     expire_stale_presence, get_dashboard_session_by_token, get_dashboard_summary,
@@ -283,6 +284,10 @@ pub async fn run(
         .route(
             "/api/v1/helpdesk/tickets/:ticket_id/operational",
             post(update_helpdesk_ticket_operational_handler),
+        )
+        .route(
+            "/api/v1/helpdesk/tickets/:ticket_id/report",
+            post(create_helpdesk_ticket_agent_report_handler),
         )
         .route(
             "/api/v1/helpdesk/tickets/:ticket_id/audit",
@@ -780,6 +785,42 @@ async fn update_helpdesk_ticket_operational_handler(
                 "failed to update helpdesk ticket operational fields"
             );
             internal_error()
+        }
+    }
+}
+
+async fn create_helpdesk_ticket_agent_report_handler(
+    State(state): State<AppState>,
+    AxumPath(ticket_id): AxumPath<String>,
+    Json(payload): Json<HelpdeskTicketAgentReportCreateRequestV1>,
+) -> impl IntoResponse {
+    let ticket_id = ticket_id.trim().to_string();
+    if ticket_id.is_empty() {
+        return bad_request("ticket_id cannot be empty");
+    }
+
+    if let Err(validation_error) = payload.validate() {
+        return bad_request(validation_error.to_string());
+    }
+
+    match add_helpdesk_ticket_agent_report(&state.pool, &ticket_id, &payload.agent_id, &payload.note)
+        .await
+    {
+        Ok(ticket) => (
+            StatusCode::OK,
+            Json(json!({
+                "ticket": ticket,
+            })),
+        )
+            .into_response(),
+        Err(err) => {
+            error!(
+                error = %err,
+                ticket_id,
+                agent_id = payload.agent_id,
+                "failed to create helpdesk agent report"
+            );
+            bad_request(err.to_string())
         }
     }
 }

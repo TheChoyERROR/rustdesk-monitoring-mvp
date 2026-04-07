@@ -1255,6 +1255,84 @@ pub async fn update_helpdesk_ticket_operational_fields(
     Ok(ticket)
 }
 
+pub async fn add_helpdesk_ticket_agent_report(
+    pool: &SqlitePool,
+    ticket_id: &str,
+    agent_id: &str,
+    note: &str,
+) -> anyhow::Result<HelpdeskTicketV1> {
+    let now_ms = unix_millis_now() as i64;
+    let ticket_id = ticket_id.trim();
+    let agent_id = agent_id.trim();
+    let normalized_note = normalize_optional_text(Some(note))
+        .context("agent report note cannot be empty")?;
+
+    let mut tx = pool
+        .begin()
+        .await
+        .context("failed to open helpdesk agent report transaction")?;
+
+    let current_ticket = get_helpdesk_ticket_tx(&mut tx, ticket_id)
+        .await?
+        .with_context(|| format!("helpdesk ticket '{}' not found before agent report", ticket_id))?;
+
+    if current_ticket.assigned_agent_id.as_deref() != Some(agent_id) {
+        anyhow::bail!("ticket is not currently assigned to this agent");
+    }
+
+    if !matches!(
+        current_ticket.status,
+        HelpdeskTicketStatus::Opening | HelpdeskTicketStatus::InProgress
+    ) {
+        anyhow::bail!("ticket is not active for agent reporting");
+    }
+
+    let agent = get_helpdesk_agent_tx(&mut tx, agent_id)
+        .await?
+        .with_context(|| format!("helpdesk agent '{}' not found before agent report", agent_id))?;
+
+    sqlx::query(
+        r#"
+        UPDATE helpdesk_tickets
+        SET latest_agent_report = ?2,
+            latest_agent_report_by = ?3,
+            latest_agent_report_at = ?4,
+            updated_at = ?4
+        WHERE ticket_id = ?1
+        "#,
+    )
+    .bind(ticket_id)
+    .bind(&normalized_note)
+    .bind(&agent.display_name)
+    .bind(now_ms)
+    .execute(&mut *tx)
+    .await
+    .with_context(|| format!("failed to store latest agent report for ticket '{}'", ticket_id))?;
+
+    insert_helpdesk_audit_event_tx(
+        &mut tx,
+        "ticket",
+        ticket_id,
+        "agent_report_added",
+        Some(serde_json::json!({
+            "agent_id": agent_id,
+            "agent_display_name": agent.display_name,
+            "note": normalized_note,
+        })),
+        now_ms,
+    )
+    .await?;
+
+    let ticket = get_helpdesk_ticket_tx(&mut tx, ticket_id)
+        .await?
+        .with_context(|| format!("helpdesk ticket '{}' not found after agent report", ticket_id))?;
+
+    tx.commit()
+        .await
+        .context("failed to commit helpdesk agent report transaction")?;
+    Ok(ticket)
+}
+
 pub async fn assign_helpdesk_ticket(
     pool: &SqlitePool,
     ticket_id: &str,
@@ -1356,6 +1434,9 @@ pub async fn list_helpdesk_tickets(pool: &SqlitePool) -> anyhow::Result<Vec<Help
             summary,
             status,
             assigned_agent_id,
+            latest_agent_report,
+            latest_agent_report_by,
+            latest_agent_report_at,
             opening_deadline_at,
             created_at,
             updated_at
@@ -1428,6 +1509,9 @@ pub async fn get_helpdesk_ticket(
             summary,
             status,
             assigned_agent_id,
+            latest_agent_report,
+            latest_agent_report_by,
+            latest_agent_report_at,
             opening_deadline_at,
             created_at,
             updated_at
@@ -3087,6 +3171,9 @@ async fn get_helpdesk_ticket_tx(
             summary,
             status,
             assigned_agent_id,
+            latest_agent_report,
+            latest_agent_report_by,
+            latest_agent_report_at,
             opening_deadline_at,
             created_at,
             updated_at
@@ -3244,6 +3331,11 @@ fn row_to_helpdesk_ticket(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<Helpde
         summary: row.get("summary"),
         status: helpdesk_ticket_status_from_db(&status),
         assigned_agent_id: row.get("assigned_agent_id"),
+        latest_agent_report: row.get("latest_agent_report"),
+        latest_agent_report_by: row.get("latest_agent_report_by"),
+        latest_agent_report_at: row
+            .get::<Option<i64>, _>("latest_agent_report_at")
+            .map(millis_to_utc),
         opening_deadline_at: opening_deadline_at.map(millis_to_utc),
         created_at: millis_to_utc(row.get("created_at")),
         updated_at: millis_to_utc(row.get("updated_at")),
@@ -3333,7 +3425,8 @@ mod tests {
     };
 
     use super::{
-        assign_helpdesk_ticket, cancel_helpdesk_ticket, connect_sqlite, create_helpdesk_ticket,
+        add_helpdesk_ticket_agent_report, assign_helpdesk_ticket, cancel_helpdesk_ticket,
+        connect_sqlite, create_helpdesk_ticket,
         expire_stale_presence, get_helpdesk_agent, get_helpdesk_agent_authorization_status,
         get_helpdesk_assignment_for_agent, get_helpdesk_operational_summary, get_helpdesk_ticket,
         get_session_presence, insert_event, list_active_session_presence,
@@ -4474,6 +4567,94 @@ mod tests {
 
         assert_eq!(updated.difficulty.as_deref(), Some("high"));
         assert_eq!(updated.estimated_minutes, Some(45));
+    }
+
+    #[tokio::test]
+    async fn agent_report_is_saved_on_ticket_and_visible_in_audit() {
+        let temp = tempdir().expect("create temp dir");
+        let db_path = temp.path().join("helpdesk-agent-report.db");
+        let pool = connect_sqlite(&db_path).await.expect("connect sqlite");
+        authorize_agent(&pool, "agent-report", "Agent Report").await;
+
+        upsert_helpdesk_agent_presence(
+            &pool,
+            &HelpdeskAgentPresenceUpdateV1 {
+                agent_id: "agent-report".to_string(),
+                display_name: Some("Agent Report".to_string()),
+                avatar_url: None,
+                status: HelpdeskAgentStatus::Available,
+            },
+        )
+        .await
+        .expect("upsert agent");
+
+        let ticket = create_helpdesk_ticket(
+            &pool,
+            &HelpdeskTicketCreateRequestV1 {
+                client_id: "client-report".to_string(),
+                client_display_name: Some("Cliente Reporte".to_string()),
+                device_id: None,
+                requested_by: Some("Cliente".to_string()),
+                title: Some("Need support".to_string()),
+                description: Some("First attempt".to_string()),
+                difficulty: None,
+                estimated_minutes: None,
+                summary: Some("Need support".to_string()),
+                preferred_agent_id: None,
+            },
+        )
+        .await
+        .expect("create ticket");
+
+        assign_helpdesk_ticket(
+            &pool,
+            &ticket.ticket_id,
+            Some("agent-report"),
+            Some("manual dispatch"),
+        )
+        .await
+        .expect("assign ticket");
+
+        start_helpdesk_ticket(&pool, "agent-report", &ticket.ticket_id)
+            .await
+            .expect("start assignment");
+
+        let updated = add_helpdesk_ticket_agent_report(
+            &pool,
+            &ticket.ticket_id,
+            "agent-report",
+            "VPN still failing after credential reset. Next agent should verify gateway policy and test with the backup profile.",
+        )
+        .await
+        .expect("add agent report");
+
+        assert!(updated
+            .latest_agent_report
+            .as_deref()
+            .unwrap_or_default()
+            .contains("backup profile"));
+        assert_eq!(updated.latest_agent_report_by.as_deref(), Some("Agent Report"));
+        assert!(updated.latest_agent_report_at.is_some());
+
+        let audit = list_helpdesk_ticket_audit_events(&pool, &ticket.ticket_id, 50)
+            .await
+            .expect("list audit");
+        assert!(audit.iter().any(|event| event.event_type == "agent_report_added"));
+
+        let requeued = requeue_helpdesk_ticket(
+            &pool,
+            &ticket.ticket_id,
+            HelpdeskAgentStatus::Available,
+            Some("handoff to another agent"),
+        )
+        .await
+        .expect("requeue ticket")
+        .0;
+        assert!(requeued
+            .latest_agent_report
+            .as_deref()
+            .unwrap_or_default()
+            .contains("gateway policy"));
     }
 
     #[tokio::test]

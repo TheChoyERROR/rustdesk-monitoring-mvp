@@ -396,6 +396,18 @@ export default function HelpdeskTicketDetailPage() {
                 <div>{ticket.summary}</div>
               </div>
             ) : null}
+            {ticket.latest_agent_report ? (
+              <div className="detail-block">
+                <label>Ultimo reporte de soporte</label>
+                <div>{ticket.latest_agent_report}</div>
+                <div className="table-subtle">
+                  {ticket.latest_agent_report_by || 'Agente'}
+                  {ticket.latest_agent_report_at
+                    ? ` · ${formatDateTime(ticket.latest_agent_report_at)}`
+                    : ''}
+                </div>
+              </div>
+            ) : null}
             {ticket.requested_by ? (
               <div className="detail-block">
                 <label>Solicitado por</label>
