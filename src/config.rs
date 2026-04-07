@@ -13,6 +13,8 @@ pub struct ServerConfig {
     pub retention: RetentionConfig,
     #[serde(default)]
     pub presence: PresenceConfig,
+    #[serde(default)]
+    pub monitoring: MonitoringConfig,
 }
 
 impl Default for ServerConfig {
@@ -22,6 +24,7 @@ impl Default for ServerConfig {
             worker: WorkerConfig::default(),
             retention: RetentionConfig::default(),
             presence: PresenceConfig::default(),
+            monitoring: MonitoringConfig::default(),
         }
     }
 }
@@ -33,6 +36,27 @@ impl ServerConfig {
         let cfg: Self = toml::from_str(&raw)
             .with_context(|| format!("invalid TOML in {}", path.display()))?;
         Ok(cfg)
+    }
+
+    pub fn apply_env_overrides(&mut self) {
+        if let Some(value) = env_bool("MONITORING_CAPTURE_NON_AGENT_EVENTS") {
+            self.monitoring.capture_non_agent_events = value;
+        }
+        if let Some(value) = env_u64("MONITORING_PARTICIPANT_ACTIVITY_MIN_INTERVAL_SECONDS") {
+            self.monitoring.participant_activity_min_interval_seconds = value;
+        }
+        if let Some(value) = env_u64("MONITORING_LOCAL_DELIVERED_OUTBOX_RETENTION_DAYS") {
+            self.monitoring.local_delivered_outbox_retention_days = value;
+        }
+        if let Some(value) = env_u64("MONITORING_LOCAL_SESSION_EVENT_RETENTION_DAYS") {
+            self.monitoring.local_session_event_retention_days = value;
+        }
+        if let Some(value) = env_u64("MONITORING_LOCAL_SESSION_PRESENCE_RETENTION_HOURS") {
+            self.monitoring.local_session_presence_retention_hours = value;
+        }
+        if let Some(value) = env_u64("MONITORING_LOCAL_AGENT_HEARTBEAT_RETENTION_DAYS") {
+            self.monitoring.local_agent_heartbeat_retention_days = value;
+        }
     }
 }
 
@@ -165,6 +189,39 @@ impl Default for PresenceConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MonitoringConfig {
+    #[serde(default = "default_capture_non_agent_events")]
+    pub capture_non_agent_events: bool,
+    #[serde(default = "default_participant_activity_min_interval_seconds")]
+    pub participant_activity_min_interval_seconds: u64,
+    #[serde(default = "default_local_delivered_outbox_retention_days")]
+    pub local_delivered_outbox_retention_days: u64,
+    #[serde(default = "default_local_session_event_retention_days")]
+    pub local_session_event_retention_days: u64,
+    #[serde(default = "default_local_session_presence_retention_hours")]
+    pub local_session_presence_retention_hours: u64,
+    #[serde(default = "default_local_agent_heartbeat_retention_days")]
+    pub local_agent_heartbeat_retention_days: u64,
+}
+
+impl Default for MonitoringConfig {
+    fn default() -> Self {
+        Self {
+            capture_non_agent_events: default_capture_non_agent_events(),
+            participant_activity_min_interval_seconds:
+                default_participant_activity_min_interval_seconds(),
+            local_delivered_outbox_retention_days:
+                default_local_delivered_outbox_retention_days(),
+            local_session_event_retention_days: default_local_session_event_retention_days(),
+            local_session_presence_retention_hours:
+                default_local_session_presence_retention_hours(),
+            local_agent_heartbeat_retention_days:
+                default_local_agent_heartbeat_retention_days(),
+        }
+    }
+}
+
 const fn default_timeout_ms() -> u64 {
     3_000
 }
@@ -207,4 +264,44 @@ const fn default_presence_stale_after_seconds() -> u64 {
 
 const fn default_presence_cleanup_interval_seconds() -> u64 {
     30
+}
+
+const fn default_capture_non_agent_events() -> bool {
+    false
+}
+
+const fn default_participant_activity_min_interval_seconds() -> u64 {
+    60
+}
+
+const fn default_local_delivered_outbox_retention_days() -> u64 {
+    1
+}
+
+const fn default_local_session_event_retention_days() -> u64 {
+    7
+}
+
+const fn default_local_session_presence_retention_hours() -> u64 {
+    24
+}
+
+const fn default_local_agent_heartbeat_retention_days() -> u64 {
+    7
+}
+
+fn env_bool(key: &str) -> Option<bool> {
+    let raw = std::env::var(key).ok()?;
+    let normalized = raw.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "1" | "true" | "yes" | "y" | "on" => Some(true),
+        "0" | "false" | "no" | "n" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn env_u64(key: &str) -> Option<u64> {
+    std::env::var(key)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
 }

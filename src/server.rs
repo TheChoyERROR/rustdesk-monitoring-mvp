@@ -35,7 +35,9 @@ use crate::model::{
 };
 use crate::storage::{
     add_helpdesk_ticket_agent_report, assign_helpdesk_ticket, cancel_helpdesk_ticket, claim_due_events,
-    cleanup_expired_dashboard_sessions, cleanup_failed_older_than, connect_sqlite,
+    cleanup_delivered_older_than, cleanup_expired_dashboard_sessions,
+    cleanup_failed_older_than, cleanup_helpdesk_agent_heartbeats_older_than,
+    cleanup_inactive_session_presence_older_than, cleanup_session_events_older_than, connect_sqlite,
     create_helpdesk_ticket, delete_dashboard_session, delete_helpdesk_authorized_agent,
     expire_stale_presence, get_dashboard_session_by_token, get_dashboard_summary,
     get_dashboard_user_by_username, get_helpdesk_agent_authorization_status,
@@ -44,7 +46,8 @@ use crate::storage::{
     list_helpdesk_authorized_agents, list_helpdesk_ticket_audit_events, list_helpdesk_tickets,
     mark_delivered, mark_failed, query_session_report_rows, query_timeline_events,
     reconcile_helpdesk_runtime, requeue_helpdesk_ticket,
-    reset_stuck_processing, resolve_helpdesk_ticket, schedule_retry, start_helpdesk_ticket,
+    reset_stuck_processing, resolve_helpdesk_ticket, schedule_retry, should_store_session_event,
+    start_helpdesk_ticket,
     unix_millis_now, update_helpdesk_ticket_operational_fields, upsert_dashboard_user,
     upsert_helpdesk_agent_presence, upsert_helpdesk_authorized_agent, EventQueryFilter,
     InsertOutcome, OutboxRecord,
@@ -126,6 +129,20 @@ pub async fn run(
         stale_after_seconds = config.presence.stale_after_seconds,
         cleanup_interval_seconds = config.presence.cleanup_interval_seconds,
         "presence cleanup configuration"
+    );
+    info!(
+        capture_non_agent_events = config.monitoring.capture_non_agent_events,
+        participant_activity_min_interval_seconds =
+            config.monitoring.participant_activity_min_interval_seconds,
+        local_delivered_outbox_retention_days =
+            config.monitoring.local_delivered_outbox_retention_days,
+        local_session_event_retention_days =
+            config.monitoring.local_session_event_retention_days,
+        local_session_presence_retention_hours =
+            config.monitoring.local_session_presence_retention_hours,
+        local_agent_heartbeat_retention_days =
+            config.monitoring.local_agent_heartbeat_retention_days,
+        "monitoring ingest and retention configuration"
     );
 
     let pool = connect_sqlite(database_path).await?;
@@ -1445,6 +1462,29 @@ async fn ingest_session_event(
         );
     }
 
+    match should_store_session_event(&state.pool, &event, &state.config.monitoring).await {
+        Ok(false) => {
+            return (
+                StatusCode::ACCEPTED,
+                Json(json!({
+                    "status": "ignored",
+                    "event_id": event.event_id,
+                    "reason": "event_filtered_by_monitoring_policy",
+                })),
+            );
+        }
+        Ok(true) => {}
+        Err(err) => {
+            error!(error = %err, "failed to apply monitoring ingest policy");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": "internal_error"
+                })),
+            );
+        }
+    }
+
     match insert_event(&state.pool, &event).await {
         Ok(InsertOutcome::Inserted) => {
             state.metrics.inc_events_received();
@@ -1812,7 +1852,7 @@ async fn cleanup_worker(state: AppState) {
         tokio::time::sleep(interval).await;
 
         let now_ms = unix_millis_now();
-        let retention_ms = state
+        let failed_retention_ms = state
             .config
             .retention
             .failed_retention_days
@@ -1820,12 +1860,84 @@ async fn cleanup_worker(state: AppState) {
             .saturating_mul(60)
             .saturating_mul(60)
             .saturating_mul(1_000);
-        let cutoff_ms = now_ms.saturating_sub(retention_ms);
+        let failed_cutoff_ms = now_ms.saturating_sub(failed_retention_ms);
 
-        match cleanup_failed_older_than(&state.pool, cutoff_ms).await {
+        match cleanup_failed_older_than(&state.pool, failed_cutoff_ms).await {
             Ok(deleted) if deleted > 0 => info!(deleted, "cleaned old failed outbox events"),
             Ok(_) => {}
             Err(err) => error!(error = %err, "failed to cleanup old failed outbox events"),
+        }
+
+        let delivered_retention_ms = state
+            .config
+            .monitoring
+            .local_delivered_outbox_retention_days
+            .saturating_mul(24)
+            .saturating_mul(60)
+            .saturating_mul(60)
+            .saturating_mul(1_000);
+        let delivered_cutoff_ms = now_ms.saturating_sub(delivered_retention_ms);
+
+        match cleanup_delivered_older_than(&state.pool, delivered_cutoff_ms).await {
+            Ok(deleted) if deleted > 0 => {
+                info!(deleted, "cleaned old delivered outbox events")
+            }
+            Ok(_) => {}
+            Err(err) => error!(error = %err, "failed to cleanup old delivered outbox events"),
+        }
+
+        let session_event_retention_ms = state
+            .config
+            .monitoring
+            .local_session_event_retention_days
+            .saturating_mul(24)
+            .saturating_mul(60)
+            .saturating_mul(60)
+            .saturating_mul(1_000);
+        let session_event_cutoff_ms = now_ms.saturating_sub(session_event_retention_ms);
+
+        match cleanup_session_events_older_than(&state.pool, session_event_cutoff_ms).await {
+            Ok(deleted) if deleted > 0 => info!(deleted, "cleaned old session events"),
+            Ok(_) => {}
+            Err(err) => error!(error = %err, "failed to cleanup old session events"),
+        }
+
+        let session_presence_retention_ms = state
+            .config
+            .monitoring
+            .local_session_presence_retention_hours
+            .saturating_mul(60)
+            .saturating_mul(60)
+            .saturating_mul(1_000);
+        let session_presence_cutoff_ms = now_ms.saturating_sub(session_presence_retention_ms);
+
+        match cleanup_inactive_session_presence_older_than(&state.pool, session_presence_cutoff_ms)
+            .await
+        {
+            Ok(deleted) if deleted > 0 => {
+                info!(deleted, "cleaned stale inactive session presence rows")
+            }
+            Ok(_) => {}
+            Err(err) => error!(error = %err, "failed to cleanup session presence rows"),
+        }
+
+        let heartbeat_retention_ms = state
+            .config
+            .monitoring
+            .local_agent_heartbeat_retention_days
+            .saturating_mul(24)
+            .saturating_mul(60)
+            .saturating_mul(60)
+            .saturating_mul(1_000);
+        let heartbeat_cutoff_ms = now_ms.saturating_sub(heartbeat_retention_ms);
+
+        match cleanup_helpdesk_agent_heartbeats_older_than(&state.pool, heartbeat_cutoff_ms).await
+        {
+            Ok(deleted) if deleted > 0 => {
+                info!(deleted, "cleaned stale helpdesk agent heartbeats")
+            }
+            Ok(_) => {}
+            Err(err) => error!(error = %err, "failed to cleanup helpdesk agent heartbeats"),
         }
 
         match cleanup_expired_dashboard_sessions(&state.pool, Utc::now()).await {

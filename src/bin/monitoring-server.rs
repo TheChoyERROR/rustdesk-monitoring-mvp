@@ -97,5 +97,7 @@ async fn main() -> anyhow::Result<()> {
         config.worker.concurrency = concurrency;
     }
 
+    config.apply_env_overrides();
+
     server::run(&args.bind, &args.database_path, config).await
 }

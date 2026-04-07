@@ -8,6 +8,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool, Transaction};
 use uuid::Uuid;
 
+use crate::config::MonitoringConfig;
 use crate::model::{
     AuthRoleV1, AuthUserV1, DashboardSummaryV1, HelpdeskAgentAuthorizationStatusV1,
     HelpdeskAgentPresenceUpdateV1, HelpdeskAgentStatus, HelpdeskAgentV1, HelpdeskAssignmentV1,
@@ -214,6 +215,22 @@ pub async fn insert_event(
     }
 }
 
+pub async fn should_store_session_event(
+    pool: &SqlitePool,
+    event: &SessionEventV1,
+    monitoring: &MonitoringConfig,
+) -> anyhow::Result<bool> {
+    if monitoring.capture_non_agent_events {
+        return should_store_participant_activity(pool, event, monitoring).await;
+    }
+
+    if !is_known_helpdesk_agent_id(pool, &event.user_id).await? {
+        return Ok(false);
+    }
+
+    should_store_participant_activity(pool, event, monitoring).await
+}
+
 pub async fn claim_due_events(
     pool: &SqlitePool,
     limit: usize,
@@ -385,6 +402,79 @@ pub async fn cleanup_failed_older_than(pool: &SqlitePool, cutoff_ms: u64) -> any
     .execute(pool)
     .await
     .context("failed to clean old failed events")?;
+
+    Ok(result.rows_affected())
+}
+
+pub async fn cleanup_delivered_older_than(
+    pool: &SqlitePool,
+    cutoff_ms: u64,
+) -> anyhow::Result<u64> {
+    let result = sqlx::query(
+        r#"
+        DELETE FROM outbox_events
+        WHERE status = 'delivered' AND updated_at < ?1
+        "#,
+    )
+    .bind(cutoff_ms as i64)
+    .execute(pool)
+    .await
+    .context("failed to delete old delivered outbox events")?;
+
+    Ok(result.rows_affected())
+}
+
+pub async fn cleanup_session_events_older_than(
+    pool: &SqlitePool,
+    cutoff_ms: u64,
+) -> anyhow::Result<u64> {
+    let result = sqlx::query(
+        r#"
+        DELETE FROM session_events
+        WHERE created_at < ?1
+        "#,
+    )
+    .bind(cutoff_ms as i64)
+    .execute(pool)
+    .await
+    .context("failed to delete old session events")?;
+
+    Ok(result.rows_affected())
+}
+
+pub async fn cleanup_inactive_session_presence_older_than(
+    pool: &SqlitePool,
+    cutoff_ms: u64,
+) -> anyhow::Result<u64> {
+    let result = sqlx::query(
+        r#"
+        DELETE FROM session_presence
+        WHERE updated_at < ?1
+          AND is_active = 0
+        "#,
+    )
+    .bind(cutoff_ms as i64)
+    .execute(pool)
+    .await
+    .context("failed to delete stale inactive session presence rows")?;
+
+    Ok(result.rows_affected())
+}
+
+pub async fn cleanup_helpdesk_agent_heartbeats_older_than(
+    pool: &SqlitePool,
+    cutoff_ms: u64,
+) -> anyhow::Result<u64> {
+    let result = sqlx::query(
+        r#"
+        DELETE FROM helpdesk_agent_heartbeats
+        WHERE created_at < ?1
+        "#,
+    )
+    .bind(cutoff_ms as i64)
+    .execute(pool)
+    .await
+    .context("failed to delete stale helpdesk agent heartbeats")?;
 
     Ok(result.rows_affected())
 }
@@ -2915,6 +3005,79 @@ fn push_helpdesk_client_match_clause(qb: &mut QueryBuilder<'_, Sqlite>, user_id_
     ));
 }
 
+async fn should_store_participant_activity(
+    pool: &SqlitePool,
+    event: &SessionEventV1,
+    monitoring: &MonitoringConfig,
+) -> anyhow::Result<bool> {
+    if event.event_type != SessionEventType::ParticipantActivity {
+        return Ok(true);
+    }
+
+    let min_interval_ms = monitoring
+        .participant_activity_min_interval_seconds
+        .saturating_mul(1_000) as i64;
+    if min_interval_ms <= 0 {
+        return Ok(true);
+    }
+
+    let actor = extract_presence_actor(event);
+    let normalized_participant_id = normalize_helpdesk_identity_id(&actor.participant_id);
+    if normalized_participant_id.is_empty() {
+        return Ok(true);
+    }
+
+    let last_activity_at = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT last_activity_at
+        FROM session_presence
+        WHERE session_id = ?1
+          AND REPLACE(TRIM(participant_id), ' ', '') = ?2
+        ORDER BY last_activity_at DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(&event.session_id)
+    .bind(normalized_participant_id)
+    .fetch_optional(pool)
+    .await
+    .context("failed to inspect previous participant activity timestamp")?;
+
+    let Some(last_activity_at) = last_activity_at else {
+        return Ok(true);
+    };
+
+    let event_ms = event.timestamp.timestamp_millis().max(0);
+    Ok(event_ms.saturating_sub(last_activity_at) >= min_interval_ms)
+}
+
+async fn is_known_helpdesk_agent_id(pool: &SqlitePool, user_id: &str) -> anyhow::Result<bool> {
+    let normalized_user_id = normalize_helpdesk_identity_id(user_id);
+    if normalized_user_id.is_empty() {
+        return Ok(false);
+    }
+
+    let exists = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT EXISTS(
+            SELECT 1
+            FROM helpdesk_authorized_agents haa
+            WHERE REPLACE(TRIM(haa.agent_id), ' ', '') = ?1
+            UNION
+            SELECT 1
+            FROM helpdesk_agents ha
+            WHERE REPLACE(TRIM(ha.agent_id), ' ', '') = ?1
+        )
+        "#,
+    )
+    .bind(normalized_user_id)
+    .fetch_one(pool)
+    .await
+    .context("failed to classify session actor against helpdesk agents")?;
+
+    Ok(exists != 0)
+}
+
 async fn load_session_actor_reference_index(
     pool: &SqlitePool,
 ) -> anyhow::Result<SessionActorReferenceIndex> {
@@ -3418,6 +3581,7 @@ mod tests {
     use tempfile::tempdir;
     use uuid::Uuid;
 
+    use crate::config::MonitoringConfig;
     use crate::model::{
         HelpdeskAgentPresenceUpdateV1, HelpdeskAgentStatus, HelpdeskAuthorizedAgentUpsertRequestV1,
         HelpdeskTicketCreateRequestV1, HelpdeskTicketStatus, SessionActorTypeV1,
@@ -3426,12 +3590,15 @@ mod tests {
 
     use super::{
         add_helpdesk_ticket_agent_report, assign_helpdesk_ticket, cancel_helpdesk_ticket,
+        cleanup_delivered_older_than, cleanup_helpdesk_agent_heartbeats_older_than,
+        cleanup_inactive_session_presence_older_than, cleanup_session_events_older_than,
         connect_sqlite, create_helpdesk_ticket,
         expire_stale_presence, get_helpdesk_agent, get_helpdesk_agent_authorization_status,
         get_helpdesk_assignment_for_agent, get_helpdesk_operational_summary, get_helpdesk_ticket,
         get_session_presence, insert_event, list_active_session_presence,
         list_helpdesk_ticket_audit_events, list_helpdesk_tickets, reconcile_helpdesk_runtime,
         query_timeline_events, requeue_helpdesk_ticket, resolve_helpdesk_ticket,
+        should_store_session_event,
         start_helpdesk_ticket, unix_millis_now, update_helpdesk_ticket_operational_fields,
         upsert_helpdesk_agent_presence, upsert_helpdesk_authorized_agent, EventQueryFilter,
         InsertOutcome,
@@ -3471,6 +3638,156 @@ mod tests {
 
         assert_eq!(first, InsertOutcome::Inserted);
         assert_eq!(second, InsertOutcome::Duplicate);
+    }
+
+    #[tokio::test]
+    async fn monitoring_policy_ignores_non_agent_session_events_by_default() {
+        let temp = tempdir().expect("create temp dir");
+        let db_path = temp.path().join("monitoring-policy.db");
+        let pool = connect_sqlite(&db_path).await.expect("connect sqlite");
+
+        let event = SessionEventV1 {
+            event_id: Uuid::new_v4(),
+            event_type: SessionEventType::SessionStarted,
+            session_id: "sess-non-agent".to_string(),
+            user_id: "client-plain".to_string(),
+            direction: SessionDirection::Outgoing,
+            timestamp: Utc::now(),
+            host_info: None,
+            meta: None,
+        };
+
+        let should_store = should_store_session_event(&pool, &event, &MonitoringConfig::default())
+            .await
+            .expect("apply monitoring policy");
+
+        assert!(!should_store);
+    }
+
+    #[tokio::test]
+    async fn participant_activity_is_sampled_for_agents() {
+        let temp = tempdir().expect("create temp dir");
+        let db_path = temp.path().join("participant-activity-sampling.db");
+        let pool = connect_sqlite(&db_path).await.expect("connect sqlite");
+
+        authorize_agent(&pool, "278084673", "Edward soporte").await;
+
+        let base_ts = Utc::now();
+        let first = SessionEventV1 {
+            event_id: Uuid::new_v4(),
+            event_type: SessionEventType::ParticipantActivity,
+            session_id: "sess-sampled".to_string(),
+            user_id: "278084673".to_string(),
+            direction: SessionDirection::Outgoing,
+            timestamp: base_ts,
+            host_info: None,
+            meta: Some(json!({
+                "participant_id": "278084673",
+            })),
+        };
+
+        let second = SessionEventV1 {
+            event_id: Uuid::new_v4(),
+            event_type: SessionEventType::ParticipantActivity,
+            session_id: "sess-sampled".to_string(),
+            user_id: "278084673".to_string(),
+            direction: SessionDirection::Outgoing,
+            timestamp: base_ts + chrono::Duration::seconds(30),
+            host_info: None,
+            meta: Some(json!({
+                "participant_id": "278084673",
+            })),
+        };
+
+        let third = SessionEventV1 {
+            event_id: Uuid::new_v4(),
+            event_type: SessionEventType::ParticipantActivity,
+            session_id: "sess-sampled".to_string(),
+            user_id: "278084673".to_string(),
+            direction: SessionDirection::Outgoing,
+            timestamp: base_ts + chrono::Duration::seconds(90),
+            host_info: None,
+            meta: Some(json!({
+                "participant_id": "278084673",
+            })),
+        };
+
+        assert!(
+            should_store_session_event(&pool, &first, &MonitoringConfig::default())
+                .await
+                .expect("first activity should be stored")
+        );
+        insert_event(&pool, &first).await.expect("insert first activity");
+
+        assert!(
+            !should_store_session_event(&pool, &second, &MonitoringConfig::default())
+                .await
+                .expect("second activity should be sampled out")
+        );
+        assert!(
+            should_store_session_event(&pool, &third, &MonitoringConfig::default())
+                .await
+                .expect("third activity should be stored")
+        );
+    }
+
+    #[tokio::test]
+    async fn monitoring_cleanup_removes_old_local_rows() {
+        let temp = tempdir().expect("create temp dir");
+        let db_path = temp.path().join("monitoring-cleanup.db");
+        let pool = connect_sqlite(&db_path).await.expect("connect sqlite");
+
+        authorize_agent(&pool, "278084673", "Edward soporte").await;
+        upsert_helpdesk_agent_presence(
+            &pool,
+            &HelpdeskAgentPresenceUpdateV1 {
+                agent_id: "278084673".to_string(),
+                display_name: Some("Edward soporte".to_string()),
+                avatar_url: None,
+                status: HelpdeskAgentStatus::Available,
+            },
+        )
+        .await
+        .expect("upsert agent presence");
+
+        let event = SessionEventV1 {
+            event_id: Uuid::new_v4(),
+            event_type: SessionEventType::SessionStarted,
+            session_id: "sess-cleanup".to_string(),
+            user_id: "278084673".to_string(),
+            direction: SessionDirection::Outgoing,
+            timestamp: Utc::now(),
+            host_info: None,
+            meta: None,
+        };
+        insert_event(&pool, &event).await.expect("insert session event");
+
+        let cutoff_ms = unix_millis_now() + 1_000;
+
+        assert_eq!(
+            cleanup_delivered_older_than(&pool, cutoff_ms)
+                .await
+                .expect("cleanup delivered"),
+            0
+        );
+        assert_eq!(
+            cleanup_session_events_older_than(&pool, cutoff_ms)
+                .await
+                .expect("cleanup session events"),
+            1
+        );
+        assert_eq!(
+            cleanup_inactive_session_presence_older_than(&pool, cutoff_ms)
+                .await
+                .expect("cleanup inactive presence"),
+            0
+        );
+        assert!(
+            cleanup_helpdesk_agent_heartbeats_older_than(&pool, cutoff_ms)
+                .await
+                .expect("cleanup agent heartbeats")
+                >= 1
+        );
     }
 
     #[tokio::test]
