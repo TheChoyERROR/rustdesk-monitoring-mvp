@@ -798,6 +798,459 @@ async fn get_session_presence_for_active_monitoring_backend(
     get_session_presence(&state.pool, session_id).await
 }
 
+async fn list_helpdesk_agents_for_active_backend(
+    state: &AppState,
+) -> anyhow::Result<Vec<crate::model::HelpdeskAgentV1>> {
+    if let Some(pool) = active_helpdesk_postgres_pool(state) {
+        match list_helpdesk_agents_pg(pool).await {
+            Ok(agents) => return Ok(agents),
+            Err(err) if state.sqlite_fallback_enabled => {
+                warn!(
+                    error = %err,
+                    "failed to list helpdesk agents from Postgres; falling back to SQLite"
+                );
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    list_helpdesk_agents(&state.pool).await
+}
+
+async fn list_helpdesk_authorized_agents_for_active_backend(
+    state: &AppState,
+) -> anyhow::Result<Vec<crate::model::HelpdeskAuthorizedAgentV1>> {
+    if let Some(pool) = active_helpdesk_postgres_pool(state) {
+        match list_helpdesk_authorized_agents_pg(pool).await {
+            Ok(agents) => return Ok(agents),
+            Err(err) if state.sqlite_fallback_enabled => {
+                warn!(
+                    error = %err,
+                    "failed to list authorized helpdesk agents from Postgres; falling back to SQLite"
+                );
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    list_helpdesk_authorized_agents(&state.pool).await
+}
+
+async fn upsert_helpdesk_authorized_agent_for_active_backend(
+    state: &AppState,
+    payload: &HelpdeskAuthorizedAgentUpsertRequestV1,
+) -> anyhow::Result<crate::model::HelpdeskAuthorizedAgentV1> {
+    if let Some(pool) = active_helpdesk_postgres_pool(state) {
+        match upsert_helpdesk_authorized_agent_pg(pool, payload).await {
+            Ok(agent) => return Ok(agent),
+            Err(err) if state.sqlite_fallback_enabled => {
+                warn!(
+                    error = %err,
+                    agent_id = payload.agent_id,
+                    "failed to upsert authorized helpdesk agent in Postgres; falling back to SQLite"
+                );
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    upsert_helpdesk_authorized_agent(&state.pool, payload).await
+}
+
+async fn delete_helpdesk_authorized_agent_for_active_backend(
+    state: &AppState,
+    agent_id: &str,
+) -> anyhow::Result<bool> {
+    if let Some(pool) = active_helpdesk_postgres_pool(state) {
+        match delete_helpdesk_authorized_agent_pg(pool, agent_id).await {
+            Ok(deleted) => return Ok(deleted),
+            Err(err) if state.sqlite_fallback_enabled => {
+                warn!(
+                    error = %err,
+                    agent_id,
+                    "failed to delete authorized helpdesk agent from Postgres; falling back to SQLite"
+                );
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    delete_helpdesk_authorized_agent(&state.pool, agent_id).await
+}
+
+async fn get_helpdesk_agent_authorization_for_active_backend(
+    state: &AppState,
+    agent_id: &str,
+) -> anyhow::Result<crate::model::HelpdeskAgentAuthorizationStatusV1> {
+    if let Some(pool) = active_helpdesk_postgres_pool(state) {
+        match get_helpdesk_agent_authorization_status_pg(pool, agent_id).await {
+            Ok(status) => return Ok(status),
+            Err(err) if state.sqlite_fallback_enabled => {
+                warn!(
+                    error = %err,
+                    agent_id,
+                    "failed to query helpdesk agent authorization from Postgres; falling back to SQLite"
+                );
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    get_helpdesk_agent_authorization_status(&state.pool, agent_id).await
+}
+
+async fn get_helpdesk_summary_for_active_backend(
+    state: &AppState,
+) -> anyhow::Result<crate::model::HelpdeskOperationalSummaryV1> {
+    if let Some(pool) = active_helpdesk_postgres_pool(state) {
+        match get_helpdesk_operational_summary_pg(pool).await {
+            Ok(summary) => return Ok(summary),
+            Err(err) if state.sqlite_fallback_enabled => {
+                warn!(
+                    error = %err,
+                    "failed to get helpdesk operational summary from Postgres; falling back to SQLite"
+                );
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    get_helpdesk_operational_summary(&state.pool).await
+}
+
+async fn upsert_helpdesk_agent_presence_for_active_backend(
+    state: &AppState,
+    payload: &HelpdeskAgentPresenceUpdateV1,
+) -> anyhow::Result<crate::model::HelpdeskAgentV1> {
+    if let Some(pool) = active_helpdesk_postgres_pool(state) {
+        match upsert_helpdesk_agent_presence_pg(pool, payload).await {
+            Ok(agent) => return Ok(agent),
+            Err(err) if state.sqlite_fallback_enabled => {
+                warn!(
+                    error = %err,
+                    agent_id = payload.agent_id,
+                    "failed to upsert helpdesk agent presence in Postgres; falling back to SQLite"
+                );
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    upsert_helpdesk_agent_presence(&state.pool, payload).await
+}
+
+async fn get_helpdesk_assignment_for_agent_for_active_backend(
+    state: &AppState,
+    agent_id: &str,
+) -> anyhow::Result<Option<crate::model::HelpdeskAssignmentV1>> {
+    if let Some(pool) = active_helpdesk_postgres_pool(state) {
+        match get_helpdesk_assignment_for_agent_pg(pool, agent_id).await {
+            Ok(assignment) => return Ok(assignment),
+            Err(err) if state.sqlite_fallback_enabled => {
+                warn!(
+                    error = %err,
+                    agent_id,
+                    "failed to get helpdesk assignment from Postgres; falling back to SQLite"
+                );
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    get_helpdesk_assignment_for_agent(&state.pool, agent_id).await
+}
+
+async fn start_helpdesk_assignment_for_active_backend(
+    state: &AppState,
+    agent_id: &str,
+    ticket_id: &str,
+) -> anyhow::Result<(
+    crate::model::HelpdeskTicketV1,
+    crate::model::HelpdeskAgentV1,
+)> {
+    if let Some(pool) = active_helpdesk_postgres_pool(state) {
+        match start_helpdesk_ticket_pg(pool, agent_id, ticket_id).await {
+            Ok(result) => return Ok(result),
+            Err(err) if state.sqlite_fallback_enabled => {
+                warn!(
+                    error = %err,
+                    agent_id,
+                    ticket_id,
+                    "failed to start helpdesk assignment in Postgres; falling back to SQLite"
+                );
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    start_helpdesk_ticket(&state.pool, agent_id, ticket_id).await
+}
+
+async fn list_helpdesk_tickets_for_active_backend(
+    state: &AppState,
+) -> anyhow::Result<Vec<crate::model::HelpdeskTicketV1>> {
+    if let Some(pool) = active_helpdesk_postgres_pool(state) {
+        match list_helpdesk_tickets_pg(pool).await {
+            Ok(tickets) => return Ok(tickets),
+            Err(err) if state.sqlite_fallback_enabled => {
+                warn!(
+                    error = %err,
+                    "failed to list helpdesk tickets from Postgres; falling back to SQLite"
+                );
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    list_helpdesk_tickets(&state.pool).await
+}
+
+async fn get_helpdesk_ticket_for_active_backend(
+    state: &AppState,
+    ticket_id: &str,
+) -> anyhow::Result<Option<crate::model::HelpdeskTicketV1>> {
+    if let Some(pool) = active_helpdesk_postgres_pool(state) {
+        match get_helpdesk_ticket_pg(pool, ticket_id).await {
+            Ok(ticket) => return Ok(ticket),
+            Err(err) if state.sqlite_fallback_enabled => {
+                warn!(
+                    error = %err,
+                    ticket_id,
+                    "failed to get helpdesk ticket from Postgres; falling back to SQLite"
+                );
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    get_helpdesk_ticket(&state.pool, ticket_id).await
+}
+
+async fn list_helpdesk_ticket_audit_for_active_backend(
+    state: &AppState,
+    ticket_id: &str,
+    limit: u64,
+) -> anyhow::Result<Vec<crate::model::HelpdeskAuditEventV1>> {
+    if let Some(pool) = active_helpdesk_postgres_pool(state) {
+        match list_helpdesk_ticket_audit_pg(pool, ticket_id).await {
+            Ok(events) => return Ok(events.into_iter().take(limit as usize).collect()),
+            Err(err) if state.sqlite_fallback_enabled => {
+                warn!(
+                    error = %err,
+                    ticket_id,
+                    "failed to list helpdesk ticket audit from Postgres; falling back to SQLite"
+                );
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    list_helpdesk_ticket_audit_events(&state.pool, ticket_id, limit).await
+}
+
+async fn create_helpdesk_ticket_for_active_backend(
+    state: &AppState,
+    payload: &HelpdeskTicketCreateRequestV1,
+) -> anyhow::Result<crate::model::HelpdeskTicketV1> {
+    if let Some(pool) = active_helpdesk_postgres_pool(state) {
+        match create_helpdesk_ticket_pg(pool, payload).await {
+            Ok(ticket) => return Ok(ticket),
+            Err(err) if state.sqlite_fallback_enabled => {
+                warn!(
+                    error = %err,
+                    client_id = payload.client_id,
+                    "failed to create helpdesk ticket in Postgres; falling back to SQLite"
+                );
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    create_helpdesk_ticket(&state.pool, payload).await
+}
+
+async fn assign_helpdesk_ticket_for_active_backend(
+    state: &AppState,
+    ticket_id: &str,
+    agent_id: Option<&str>,
+    reason: Option<&str>,
+) -> anyhow::Result<(
+    crate::model::HelpdeskTicketV1,
+    crate::model::HelpdeskAgentV1,
+)> {
+    if let Some(pool) = active_helpdesk_postgres_pool(state) {
+        match assign_helpdesk_ticket_pg(pool, ticket_id, agent_id, reason).await {
+            Ok(result) => return Ok(result),
+            Err(err) if state.sqlite_fallback_enabled => {
+                warn!(
+                    error = %err,
+                    ticket_id,
+                    agent_id,
+                    "failed to assign helpdesk ticket in Postgres; falling back to SQLite"
+                );
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    assign_helpdesk_ticket(&state.pool, ticket_id, agent_id, reason).await
+}
+
+async fn update_helpdesk_ticket_operational_for_active_backend(
+    state: &AppState,
+    ticket_id: &str,
+    difficulty: Option<&str>,
+    estimated_minutes: Option<u32>,
+) -> anyhow::Result<crate::model::HelpdeskTicketV1> {
+    if let Some(pool) = active_helpdesk_postgres_pool(state) {
+        match update_helpdesk_ticket_operational_fields_pg(
+            pool,
+            ticket_id,
+            difficulty,
+            estimated_minutes,
+        )
+        .await
+        {
+            Ok(ticket) => return Ok(ticket),
+            Err(err) if state.sqlite_fallback_enabled => {
+                warn!(
+                    error = %err,
+                    ticket_id,
+                    "failed to update helpdesk operational fields in Postgres; falling back to SQLite"
+                );
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    update_helpdesk_ticket_operational_fields(&state.pool, ticket_id, difficulty, estimated_minutes)
+        .await
+}
+
+async fn add_helpdesk_ticket_agent_report_for_active_backend(
+    state: &AppState,
+    ticket_id: &str,
+    agent_id: &str,
+    note: &str,
+) -> anyhow::Result<crate::model::HelpdeskTicketV1> {
+    if let Some(pool) = active_helpdesk_postgres_pool(state) {
+        match add_helpdesk_ticket_agent_report_pg(pool, ticket_id, agent_id, note).await {
+            Ok(ticket) => return Ok(ticket),
+            Err(err) if state.sqlite_fallback_enabled => {
+                warn!(
+                    error = %err,
+                    ticket_id,
+                    agent_id,
+                    "failed to add helpdesk agent report in Postgres; falling back to SQLite"
+                );
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    add_helpdesk_ticket_agent_report(&state.pool, ticket_id, agent_id, note).await
+}
+
+async fn resolve_helpdesk_ticket_for_active_backend(
+    state: &AppState,
+    ticket_id: &str,
+    agent_id: &str,
+    next_agent_status: HelpdeskAgentStatus,
+) -> anyhow::Result<(
+    crate::model::HelpdeskTicketV1,
+    crate::model::HelpdeskAgentV1,
+)> {
+    if let Some(pool) = active_helpdesk_postgres_pool(state) {
+        match resolve_helpdesk_ticket_pg(pool, ticket_id, agent_id, next_agent_status).await {
+            Ok(result) => return Ok(result),
+            Err(err) if state.sqlite_fallback_enabled => {
+                warn!(
+                    error = %err,
+                    ticket_id,
+                    agent_id,
+                    "failed to resolve helpdesk ticket in Postgres; falling back to SQLite"
+                );
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    resolve_helpdesk_ticket(&state.pool, ticket_id, agent_id, next_agent_status).await
+}
+
+async fn requeue_helpdesk_ticket_for_active_backend(
+    state: &AppState,
+    ticket_id: &str,
+    next_agent_status: HelpdeskAgentStatus,
+    reason: Option<&str>,
+) -> anyhow::Result<(
+    crate::model::HelpdeskTicketV1,
+    Option<crate::model::HelpdeskAgentV1>,
+)> {
+    if let Some(pool) = active_helpdesk_postgres_pool(state) {
+        match requeue_helpdesk_ticket_pg(pool, ticket_id, next_agent_status, reason).await {
+            Ok(result) => return Ok(result),
+            Err(err) if state.sqlite_fallback_enabled => {
+                warn!(
+                    error = %err,
+                    ticket_id,
+                    "failed to requeue helpdesk ticket in Postgres; falling back to SQLite"
+                );
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    requeue_helpdesk_ticket(&state.pool, ticket_id, next_agent_status, reason).await
+}
+
+async fn cancel_helpdesk_ticket_for_active_backend(
+    state: &AppState,
+    ticket_id: &str,
+    next_agent_status: HelpdeskAgentStatus,
+    reason: Option<&str>,
+) -> anyhow::Result<(
+    crate::model::HelpdeskTicketV1,
+    Option<crate::model::HelpdeskAgentV1>,
+)> {
+    if let Some(pool) = active_helpdesk_postgres_pool(state) {
+        match cancel_helpdesk_ticket_pg(pool, ticket_id, next_agent_status, reason).await {
+            Ok(result) => return Ok(result),
+            Err(err) if state.sqlite_fallback_enabled => {
+                warn!(
+                    error = %err,
+                    ticket_id,
+                    "failed to cancel helpdesk ticket in Postgres; falling back to SQLite"
+                );
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    cancel_helpdesk_ticket(&state.pool, ticket_id, next_agent_status, reason).await
+}
+
+async fn reconcile_helpdesk_runtime_for_active_backend(
+    state: &AppState,
+    stale_after_ms: i64,
+    now_ms: i64,
+) -> anyhow::Result<crate::storage::HelpdeskRuntimeReconcileResult> {
+    if let Some(pool) = active_helpdesk_postgres_pool(state) {
+        match reconcile_helpdesk_runtime_pg(pool, stale_after_ms, now_ms).await {
+            Ok(stats) => return Ok(stats),
+            Err(err) if state.sqlite_fallback_enabled => {
+                warn!(
+                    error = %err,
+                    "failed to reconcile helpdesk runtime in Postgres; falling back to SQLite"
+                );
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    reconcile_helpdesk_runtime(&state.pool, stale_after_ms, now_ms).await
+}
+
 async fn health_handler() -> impl IntoResponse {
     (StatusCode::OK, Json(json!({ "status": "ok" })))
 }
@@ -815,17 +1268,7 @@ async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 async fn list_helpdesk_agents_handler(State(state): State<AppState>) -> impl IntoResponse {
-    if let Some(pool) = active_helpdesk_postgres_pool(&state) {
-        return match list_helpdesk_agents_pg(pool).await {
-            Ok(agents) => (StatusCode::OK, Json(json!({ "agents": agents }))).into_response(),
-            Err(err) => {
-                error!(error = %err, "failed to list Postgres-backed helpdesk agents");
-                internal_error()
-            }
-        };
-    }
-
-    match list_helpdesk_agents(&state.pool).await {
+    match list_helpdesk_agents_for_active_backend(&state).await {
         Ok(agents) => (StatusCode::OK, Json(json!({ "agents": agents }))).into_response(),
         Err(err) => {
             error!(error = %err, "failed to list helpdesk agents");
@@ -837,17 +1280,7 @@ async fn list_helpdesk_agents_handler(State(state): State<AppState>) -> impl Int
 async fn list_helpdesk_authorized_agents_handler(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    if let Some(pool) = active_helpdesk_postgres_pool(&state) {
-        return match list_helpdesk_authorized_agents_pg(pool).await {
-            Ok(agents) => (StatusCode::OK, Json(json!({ "agents": agents }))).into_response(),
-            Err(err) => {
-                error!(error = %err, "failed to list Postgres-backed authorized helpdesk agents");
-                internal_error()
-            }
-        };
-    }
-
-    match list_helpdesk_authorized_agents(&state.pool).await {
+    match list_helpdesk_authorized_agents_for_active_backend(&state).await {
         Ok(agents) => (StatusCode::OK, Json(json!({ "agents": agents }))).into_response(),
         Err(err) => {
             error!(error = %err, "failed to list authorized helpdesk agents");
@@ -876,32 +1309,11 @@ async fn upsert_helpdesk_authorized_agent_handler(
     State(state): State<AppState>,
     Json(payload): Json<HelpdeskAuthorizedAgentUpsertRequestV1>,
 ) -> impl IntoResponse {
-    if let Some(pool) = active_helpdesk_postgres_pool(&state) {
-        if let Err(validation_error) = payload.validate() {
-            return bad_request(validation_error.to_string());
-        }
-
-        return match upsert_helpdesk_authorized_agent_pg(pool, &payload).await {
-            Ok(agent) => (StatusCode::OK, Json(json!({ "agent": agent }))).into_response(),
-            Err(err) => {
-                if err.to_string().contains("display name '") {
-                    return bad_request(err.to_string());
-                }
-                error!(
-                    error = %err,
-                    agent_id = payload.agent_id,
-                    "failed to upsert Postgres-backed authorized helpdesk agent"
-                );
-                internal_error()
-            }
-        };
-    }
-
     if let Err(validation_error) = payload.validate() {
         return bad_request(validation_error.to_string());
     }
 
-    match upsert_helpdesk_authorized_agent(&state.pool, &payload).await {
+    match upsert_helpdesk_authorized_agent_for_active_backend(&state, &payload).await {
         Ok(agent) => (StatusCode::OK, Json(json!({ "agent": agent }))).into_response(),
         Err(err) => {
             if err.to_string().contains("display name '") {
@@ -949,35 +1361,12 @@ async fn delete_helpdesk_authorized_agent_handler(
     State(state): State<AppState>,
     AxumPath(agent_id): AxumPath<String>,
 ) -> impl IntoResponse {
-    if let Some(pool) = active_helpdesk_postgres_pool(&state) {
-        let agent_id = agent_id.trim().to_string();
-        if agent_id.is_empty() {
-            return bad_request("agent_id cannot be empty");
-        }
-
-        return match delete_helpdesk_authorized_agent_pg(pool, &agent_id).await {
-            Ok(true) => StatusCode::NO_CONTENT.into_response(),
-            Ok(false) => (
-                StatusCode::NOT_FOUND,
-                Json(json!({
-                    "error": "not_found",
-                    "message": "Authorized agent was not found",
-                })),
-            )
-                .into_response(),
-            Err(err) => {
-                error!(error = %err, agent_id, "failed to delete Postgres-backed authorized helpdesk agent");
-                internal_error()
-            }
-        };
-    }
-
     let agent_id = agent_id.trim().to_string();
     if agent_id.is_empty() {
         return bad_request("agent_id cannot be empty");
     }
 
-    match delete_helpdesk_authorized_agent(&state.pool, &agent_id).await {
+    match delete_helpdesk_authorized_agent_for_active_backend(&state, &agent_id).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => (
             StatusCode::NOT_FOUND,
@@ -1033,19 +1422,7 @@ async fn get_helpdesk_agent_authorization_handler(
         return bad_request("agent_id cannot be empty");
     }
 
-    if let Some(pool) = active_helpdesk_postgres_pool(&state) {
-        return match get_helpdesk_agent_authorization_status_pg(pool, &agent_id).await {
-            Ok(status) => {
-                (StatusCode::OK, Json(json!({ "authorization": status }))).into_response()
-            }
-            Err(err) => {
-                error!(error = %err, agent_id, "failed to query Postgres-backed helpdesk agent authorization");
-                internal_error()
-            }
-        };
-    }
-
-    match get_helpdesk_agent_authorization_status(&state.pool, &agent_id).await {
+    match get_helpdesk_agent_authorization_for_active_backend(&state, &agent_id).await {
         Ok(status) => (StatusCode::OK, Json(json!({ "authorization": status }))).into_response(),
         Err(err) => {
             error!(error = %err, agent_id, "failed to query helpdesk agent authorization");
@@ -1055,17 +1432,7 @@ async fn get_helpdesk_agent_authorization_handler(
 }
 
 async fn get_helpdesk_summary_handler(State(state): State<AppState>) -> impl IntoResponse {
-    if let Some(pool) = active_helpdesk_postgres_pool(&state) {
-        return match get_helpdesk_operational_summary_pg(pool).await {
-            Ok(summary) => (StatusCode::OK, Json(summary)).into_response(),
-            Err(err) => {
-                error!(error = %err, "failed to get Postgres-backed helpdesk operational summary");
-                internal_error()
-            }
-        };
-    }
-
-    match get_helpdesk_operational_summary(&state.pool).await {
+    match get_helpdesk_summary_for_active_backend(&state).await {
         Ok(summary) => (StatusCode::OK, Json(summary)).into_response(),
         Err(err) => {
             error!(error = %err, "failed to get helpdesk operational summary");
@@ -1106,34 +1473,11 @@ async fn upsert_helpdesk_agent_presence_handler(
     State(state): State<AppState>,
     Json(payload): Json<HelpdeskAgentPresenceUpdateV1>,
 ) -> impl IntoResponse {
-    if let Some(pool) = active_helpdesk_postgres_pool(&state) {
-        if let Err(validation_error) = payload.validate() {
-            return bad_request(validation_error.to_string());
-        }
-
-        return match upsert_helpdesk_agent_presence_pg(pool, &payload).await {
-            Ok(agent) => (StatusCode::OK, Json(json!({ "agent": agent }))).into_response(),
-            Err(err) => {
-                if err
-                    .to_string()
-                    .contains("is not authorized for helpdesk operator mode")
-                {
-                    return forbidden(err.to_string());
-                }
-                if err.to_string().contains("display name '") {
-                    return bad_request(err.to_string());
-                }
-                error!(error = %err, agent_id = payload.agent_id, "failed to upsert Postgres-backed helpdesk agent presence");
-                internal_error()
-            }
-        };
-    }
-
     if let Err(validation_error) = payload.validate() {
         return bad_request(validation_error.to_string());
     }
 
-    match upsert_helpdesk_agent_presence(&state.pool, &payload).await {
+    match upsert_helpdesk_agent_presence_for_active_backend(&state, &payload).await {
         Ok(agent) => (StatusCode::OK, Json(json!({ "agent": agent }))).into_response(),
         Err(err) => {
             if err
@@ -1160,20 +1504,7 @@ async fn get_helpdesk_assignment_for_agent_handler(
         return bad_request("agent_id cannot be empty");
     }
 
-    if let Some(pool) = active_helpdesk_postgres_pool(&state) {
-        return match get_helpdesk_assignment_for_agent_pg(pool, &agent_id).await {
-            Ok(Some(assignment)) => {
-                (StatusCode::OK, Json(json!({ "assignment": assignment }))).into_response()
-            }
-            Ok(None) => (StatusCode::OK, Json(json!({ "assignment": null }))).into_response(),
-            Err(err) => {
-                error!(error = %err, agent_id, "failed to get Postgres-backed helpdesk assignment for agent");
-                internal_error()
-            }
-        };
-    }
-
-    match get_helpdesk_assignment_for_agent(&state.pool, &agent_id).await {
+    match get_helpdesk_assignment_for_agent_for_active_backend(&state, &agent_id).await {
         Ok(Some(assignment)) => {
             (StatusCode::OK, Json(json!({ "assignment": assignment }))).into_response()
         }
@@ -1190,37 +1521,12 @@ async fn start_helpdesk_assignment_handler(
     AxumPath(agent_id): AxumPath<String>,
     Json(payload): Json<HelpdeskAssignmentStartRequestV1>,
 ) -> impl IntoResponse {
-    if let Some(pool) = active_helpdesk_postgres_pool(&state) {
-        if let Err(validation_error) = payload.validate() {
-            return bad_request(validation_error.to_string());
-        }
-
-        return match start_helpdesk_ticket_pg(pool, &agent_id, &payload.ticket_id).await {
-            Ok((ticket, agent)) => (
-                StatusCode::OK,
-                Json(json!({
-                    "ticket": ticket,
-                    "agent": agent,
-                })),
-            )
-                .into_response(),
-            Err(err) => {
-                error!(
-                    error = %err,
-                    agent_id,
-                    ticket_id = payload.ticket_id,
-                    "failed to start Postgres-backed helpdesk assignment"
-                );
-                bad_request(err.to_string())
-            }
-        };
-    }
-
     if let Err(validation_error) = payload.validate() {
         return bad_request(validation_error.to_string());
     }
 
-    match start_helpdesk_ticket(&state.pool, &agent_id, &payload.ticket_id).await {
+    match start_helpdesk_assignment_for_active_backend(&state, &agent_id, &payload.ticket_id).await
+    {
         Ok((ticket, agent)) => (
             StatusCode::OK,
             Json(json!({
@@ -1242,17 +1548,7 @@ async fn start_helpdesk_assignment_handler(
 }
 
 async fn list_helpdesk_tickets_handler(State(state): State<AppState>) -> impl IntoResponse {
-    if let Some(pool) = active_helpdesk_postgres_pool(&state) {
-        return match list_helpdesk_tickets_pg(pool).await {
-            Ok(tickets) => (StatusCode::OK, Json(json!({ "tickets": tickets }))).into_response(),
-            Err(err) => {
-                error!(error = %err, "failed to list Postgres-backed helpdesk tickets");
-                internal_error()
-            }
-        };
-    }
-
-    match list_helpdesk_tickets(&state.pool).await {
+    match list_helpdesk_tickets_for_active_backend(&state).await {
         Ok(tickets) => (StatusCode::OK, Json(json!({ "tickets": tickets }))).into_response(),
         Err(err) => {
             error!(error = %err, "failed to list helpdesk tickets");
@@ -1284,25 +1580,7 @@ async fn get_helpdesk_ticket_handler(
         return bad_request("ticket_id cannot be empty");
     }
 
-    if let Some(pool) = active_helpdesk_postgres_pool(&state) {
-        return match get_helpdesk_ticket_pg(pool, &ticket_id).await {
-            Ok(Some(ticket)) => (StatusCode::OK, Json(json!({ "ticket": ticket }))).into_response(),
-            Ok(None) => (
-                StatusCode::NOT_FOUND,
-                Json(json!({
-                    "error": "ticket_not_found",
-                    "ticket_id": ticket_id,
-                })),
-            )
-                .into_response(),
-            Err(err) => {
-                error!(error = %err, ticket_id, "failed to get Postgres-backed helpdesk ticket");
-                internal_error()
-            }
-        };
-    }
-
-    match get_helpdesk_ticket(&state.pool, &ticket_id).await {
+    match get_helpdesk_ticket_for_active_backend(&state, &ticket_id).await {
         Ok(Some(ticket)) => (StatusCode::OK, Json(json!({ "ticket": ticket }))).into_response(),
         Ok(None) => (
             StatusCode::NOT_FOUND,
@@ -1360,24 +1638,7 @@ async fn list_helpdesk_ticket_audit_handler(
     }
 
     let limit = query.limit.unwrap_or(100).clamp(1, 500);
-    if let Some(pool) = active_helpdesk_postgres_pool(&state) {
-        return match list_helpdesk_ticket_audit_pg(pool, &ticket_id).await {
-            Ok(events) => (
-                StatusCode::OK,
-                Json(json!({
-                    "events": events.into_iter().take(limit as usize).collect::<Vec<_>>(),
-                    "ticket_id": ticket_id,
-                })),
-            )
-                .into_response(),
-            Err(err) => {
-                error!(error = %err, ticket_id, "failed to list Postgres-backed helpdesk ticket audit");
-                internal_error()
-            }
-        };
-    }
-
-    match list_helpdesk_ticket_audit_events(&state.pool, &ticket_id, limit).await {
+    match list_helpdesk_ticket_audit_for_active_backend(&state, &ticket_id, limit).await {
         Ok(events) => (
             StatusCode::OK,
             Json(json!({
@@ -1432,21 +1693,7 @@ async fn create_helpdesk_ticket_handler(
         return bad_request(validation_error.to_string());
     }
 
-    if let Some(pool) = active_helpdesk_postgres_pool(&state) {
-        return match create_helpdesk_ticket_pg(pool, &payload).await {
-            Ok(ticket) => (StatusCode::CREATED, Json(json!({ "ticket": ticket }))).into_response(),
-            Err(err) => {
-                error!(
-                    error = %err,
-                    client_id = payload.client_id,
-                    "failed to create Postgres-backed helpdesk ticket"
-                );
-                internal_error()
-            }
-        };
-    }
-
-    match create_helpdesk_ticket(&state.pool, &payload).await {
+    match create_helpdesk_ticket_for_active_backend(&state, &payload).await {
         Ok(ticket) => (StatusCode::CREATED, Json(json!({ "ticket": ticket }))).into_response(),
         Err(err) => {
             error!(error = %err, client_id = payload.client_id, "failed to create helpdesk ticket");
@@ -1536,37 +1783,8 @@ async fn assign_helpdesk_ticket_handler(
         return bad_request(validation_error.to_string());
     }
 
-    if let Some(pool) = active_helpdesk_postgres_pool(&state) {
-        return match assign_helpdesk_ticket_pg(
-            pool,
-            &ticket_id,
-            payload.agent_id.as_deref(),
-            payload.reason.as_deref(),
-        )
-        .await
-        {
-            Ok((ticket, agent)) => (
-                StatusCode::OK,
-                Json(json!({
-                    "ticket": ticket,
-                    "agent": agent,
-                })),
-            )
-                .into_response(),
-            Err(err) => {
-                error!(
-                    error = %err,
-                    ticket_id,
-                    agent_id = payload.agent_id,
-                    "failed to assign Postgres-backed helpdesk ticket"
-                );
-                bad_request(err.to_string())
-            }
-        };
-    }
-
-    match assign_helpdesk_ticket(
-        &state.pool,
+    match assign_helpdesk_ticket_for_active_backend(
+        &state,
         &ticket_id,
         payload.agent_id.as_deref(),
         payload.reason.as_deref(),
@@ -1657,41 +1875,8 @@ async fn update_helpdesk_ticket_operational_handler(
         return bad_request(validation_error.to_string());
     }
 
-    if let Some(pool) = active_helpdesk_postgres_pool(&state) {
-        return match update_helpdesk_ticket_operational_fields_pg(
-            pool,
-            &ticket_id,
-            payload.difficulty.as_deref(),
-            payload.estimated_minutes,
-        )
-        .await
-        {
-            Ok(ticket) => (
-                StatusCode::OK,
-                Json(json!({
-                    "ticket": ticket,
-                })),
-            )
-                .into_response(),
-            Err(err) => {
-                if err
-                    .to_string()
-                    .contains("can no longer be updated operationally")
-                {
-                    return bad_request(err.to_string());
-                }
-                error!(
-                    error = %err,
-                    ticket_id,
-                    "failed to update Postgres-backed helpdesk ticket operational fields"
-                );
-                internal_error()
-            }
-        };
-    }
-
-    match update_helpdesk_ticket_operational_fields(
-        &state.pool,
+    match update_helpdesk_ticket_operational_for_active_backend(
+        &state,
         &ticket_id,
         payload.difficulty.as_deref(),
         payload.estimated_minutes,
@@ -1776,36 +1961,8 @@ async fn create_helpdesk_ticket_agent_report_handler(
         return bad_request(validation_error.to_string());
     }
 
-    if let Some(pool) = active_helpdesk_postgres_pool(&state) {
-        return match add_helpdesk_ticket_agent_report_pg(
-            pool,
-            &ticket_id,
-            &payload.agent_id,
-            &payload.note,
-        )
-        .await
-        {
-            Ok(ticket) => (
-                StatusCode::OK,
-                Json(json!({
-                    "ticket": ticket,
-                })),
-            )
-                .into_response(),
-            Err(err) => {
-                error!(
-                    error = %err,
-                    ticket_id,
-                    agent_id = payload.agent_id,
-                    "failed to create Postgres-backed helpdesk agent report"
-                );
-                bad_request(err.to_string())
-            }
-        };
-    }
-
-    match add_helpdesk_ticket_agent_report(
-        &state.pool,
+    match add_helpdesk_ticket_agent_report_for_active_backend(
+        &state,
         &ticket_id,
         &payload.agent_id,
         &payload.note,
@@ -1882,37 +2039,8 @@ async fn resolve_helpdesk_ticket_handler(
         .next_agent_status
         .unwrap_or(HelpdeskAgentStatus::Available);
 
-    if let Some(pool) = active_helpdesk_postgres_pool(&state) {
-        return match resolve_helpdesk_ticket_pg(
-            pool,
-            &ticket_id,
-            &payload.agent_id,
-            next_agent_status,
-        )
-        .await
-        {
-            Ok((ticket, agent)) => (
-                StatusCode::OK,
-                Json(json!({
-                    "ticket": ticket,
-                    "agent": agent,
-                })),
-            )
-                .into_response(),
-            Err(err) => {
-                error!(
-                    error = %err,
-                    ticket_id,
-                    agent_id = payload.agent_id,
-                    "failed to resolve Postgres-backed helpdesk ticket"
-                );
-                bad_request(err.to_string())
-            }
-        };
-    }
-
-    match resolve_helpdesk_ticket(
-        &state.pool,
+    match resolve_helpdesk_ticket_for_active_backend(
+        &state,
         &ticket_id,
         &payload.agent_id,
         next_agent_status,
@@ -1992,32 +2120,8 @@ async fn requeue_helpdesk_ticket_handler(
         .next_agent_status
         .unwrap_or(HelpdeskAgentStatus::Available);
 
-    if let Some(pool) = active_helpdesk_postgres_pool(&state) {
-        return match requeue_helpdesk_ticket_pg(
-            pool,
-            &ticket_id,
-            next_agent_status,
-            payload.reason.as_deref(),
-        )
-        .await
-        {
-            Ok((ticket, agent)) => (
-                StatusCode::OK,
-                Json(json!({
-                    "ticket": ticket,
-                    "agent": agent,
-                })),
-            )
-                .into_response(),
-            Err(err) => {
-                error!(error = %err, ticket_id, "failed to requeue Postgres-backed helpdesk ticket");
-                bad_request(err.to_string())
-            }
-        };
-    }
-
-    match requeue_helpdesk_ticket(
-        &state.pool,
+    match requeue_helpdesk_ticket_for_active_backend(
+        &state,
         &ticket_id,
         next_agent_status,
         payload.reason.as_deref(),
@@ -2092,32 +2196,8 @@ async fn cancel_helpdesk_ticket_handler(
         .next_agent_status
         .unwrap_or(HelpdeskAgentStatus::Available);
 
-    if let Some(pool) = active_helpdesk_postgres_pool(&state) {
-        return match cancel_helpdesk_ticket_pg(
-            pool,
-            &ticket_id,
-            next_agent_status,
-            payload.reason.as_deref(),
-        )
-        .await
-        {
-            Ok((ticket, agent)) => (
-                StatusCode::OK,
-                Json(json!({
-                    "ticket": ticket,
-                    "agent": agent,
-                })),
-            )
-                .into_response(),
-            Err(err) => {
-                error!(error = %err, ticket_id, "failed to cancel Postgres-backed helpdesk ticket");
-                bad_request(err.to_string())
-            }
-        };
-    }
-
-    match cancel_helpdesk_ticket(
-        &state.pool,
+    match cancel_helpdesk_ticket_for_active_backend(
+        &state,
         &ticket_id,
         next_agent_status,
         payload.reason.as_deref(),
@@ -3520,21 +3600,12 @@ async fn helpdesk_reconcile_worker(state: AppState) {
     loop {
         tokio::time::sleep(interval).await;
 
-        let reconcile_result = if let Some(pool) = active_helpdesk_postgres_pool(&state) {
-            reconcile_helpdesk_runtime_pg(
-                pool,
-                HELPDESK_AGENT_STALE_AFTER_MS,
-                unix_millis_now() as i64,
-            )
-            .await
-        } else {
-            reconcile_helpdesk_runtime(
-                &state.pool,
-                HELPDESK_AGENT_STALE_AFTER_MS,
-                unix_millis_now() as i64,
-            )
-            .await
-        };
+        let reconcile_result = reconcile_helpdesk_runtime_for_active_backend(
+            &state,
+            HELPDESK_AGENT_STALE_AFTER_MS,
+            unix_millis_now() as i64,
+        )
+        .await;
 
         match reconcile_result {
             Ok(stats)
