@@ -44,6 +44,7 @@ async fn main() -> anyhow::Result<()> {
         &HelpdeskAuthorizedAgentUpsertRequestV1 {
             agent_id: agent_id.clone(),
             display_name: Some(agent_name.clone()),
+            rotate_agent_token: None,
         },
     )
     .await?;

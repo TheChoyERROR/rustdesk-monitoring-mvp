@@ -1,6 +1,8 @@
 use anyhow::Context;
 use clap::Parser;
-use rustdesk_monitoring_mvp::model::{HelpdeskAuthorizedAgentUpsertRequestV1, HelpdeskTicketCreateRequestV1};
+use rustdesk_monitoring_mvp::model::{
+    HelpdeskAuthorizedAgentUpsertRequestV1, HelpdeskTicketCreateRequestV1,
+};
 use rustdesk_monitoring_mvp::postgres::{connect_postgres, init_postgres_helpdesk_schema};
 use rustdesk_monitoring_mvp::postgres_helpdesk::{
     append_helpdesk_audit_event_pg, create_helpdesk_ticket_pg, get_helpdesk_ticket_pg,
@@ -39,6 +41,7 @@ async fn main() -> anyhow::Result<()> {
         &HelpdeskAuthorizedAgentUpsertRequestV1 {
             agent_id: agent_id.clone(),
             display_name: Some(display_name.clone()),
+            rotate_agent_token: None,
         },
     )
     .await?;

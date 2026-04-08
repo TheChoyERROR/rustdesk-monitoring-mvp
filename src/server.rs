@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, Request, State};
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -24,26 +24,29 @@ use tracing::{debug, error, info, warn};
 
 use crate::auth::{self, AuthSettings, DASHBOARD_SESSION_COOKIE};
 use crate::config::ServerConfig;
+use crate::helpdesk_agent_auth::HELPDESK_AGENT_TOKEN_HEADER;
 use crate::metrics::Metrics;
 use crate::model::{
     AuthLoginRequestV1, AuthLoginResponseV1, AuthRoleV1, AuthUserV1, HelpdeskAgentPresenceUpdateV1,
-    HelpdeskAgentStatus, HelpdeskAssignmentStartRequestV1, HelpdeskAuthorizedAgentUpsertRequestV1,
-    HelpdeskTicketAgentReportCreateRequestV1, HelpdeskTicketAssignRequestV1,
-    HelpdeskTicketCreateRequestV1, HelpdeskTicketOperationalUpdateRequestV1,
-    HelpdeskTicketResolveRequestV1, HelpdeskTicketSupervisorActionRequestV1, PaginatedResponseV1,
-    SessionActorTypeV1, SessionEventType, SessionEventV1,
+    HelpdeskAgentStatus, HelpdeskAssignmentStartRequestV1, HelpdeskAuthorizedAgentProvisioningV1,
+    HelpdeskAuthorizedAgentUpsertRequestV1, HelpdeskTicketAgentReportCreateRequestV1,
+    HelpdeskTicketAssignRequestV1, HelpdeskTicketCreateRequestV1,
+    HelpdeskTicketOperationalUpdateRequestV1, HelpdeskTicketResolveRequestV1,
+    HelpdeskTicketSupervisorActionRequestV1, PaginatedResponseV1, SessionActorTypeV1,
+    SessionEventType, SessionEventV1,
 };
 use crate::postgres::{connect_postgres, init_postgres_helpdesk_schema};
 use crate::postgres_helpdesk::{
     add_helpdesk_ticket_agent_report_pg, assign_helpdesk_ticket_pg, cancel_helpdesk_ticket_pg,
     create_helpdesk_ticket_pg, delete_helpdesk_authorized_agent_pg,
-    get_helpdesk_agent_authorization_status_pg, get_helpdesk_assignment_for_agent_pg,
-    get_helpdesk_operational_summary_pg, get_helpdesk_ticket_pg, list_helpdesk_agents_pg,
-    list_helpdesk_authorized_agents_pg, list_helpdesk_ticket_audit_pg, list_helpdesk_tickets_pg,
-    reconcile_helpdesk_runtime_pg, requeue_helpdesk_ticket_pg, resolve_helpdesk_ticket_pg,
-    should_store_session_event_pg, start_helpdesk_ticket_pg,
-    update_helpdesk_ticket_operational_fields_pg, upsert_helpdesk_agent_presence_pg,
-    upsert_helpdesk_authorized_agent_pg,
+    ensure_postgres_helpdesk_agent_auth_schema, get_helpdesk_agent_authorization_status_pg,
+    get_helpdesk_assignment_for_agent_pg, get_helpdesk_operational_summary_pg,
+    get_helpdesk_ticket_pg, list_helpdesk_agents_pg, list_helpdesk_authorized_agents_pg,
+    list_helpdesk_ticket_audit_pg, list_helpdesk_tickets_pg,
+    provision_helpdesk_authorized_agent_pg, reconcile_helpdesk_runtime_pg,
+    requeue_helpdesk_ticket_pg, resolve_helpdesk_ticket_pg, should_store_session_event_pg,
+    start_helpdesk_ticket_pg, update_helpdesk_ticket_operational_fields_pg,
+    upsert_helpdesk_agent_presence_pg, verify_helpdesk_agent_token_pg,
 };
 use crate::postgres_monitoring::{
     claim_due_events_pg, cleanup_delivered_older_than_pg, cleanup_failed_older_than_pg,
@@ -65,12 +68,12 @@ use crate::storage::{
     get_helpdesk_operational_summary, get_helpdesk_ticket, get_session_presence, insert_event,
     list_active_session_presence, list_helpdesk_agents, list_helpdesk_authorized_agents,
     list_helpdesk_ticket_audit_events, list_helpdesk_tickets, mark_delivered, mark_failed,
-    query_session_report_rows, query_timeline_events, reconcile_helpdesk_runtime,
-    requeue_helpdesk_ticket, reset_stuck_processing, resolve_helpdesk_ticket, schedule_retry,
-    should_store_session_event, start_helpdesk_ticket, unix_millis_now,
-    update_helpdesk_ticket_operational_fields, upsert_dashboard_user,
-    upsert_helpdesk_agent_presence, upsert_helpdesk_authorized_agent, EventQueryFilter,
-    InsertOutcome, OutboxRecord,
+    provision_helpdesk_authorized_agent, query_session_report_rows, query_timeline_events,
+    reconcile_helpdesk_runtime, requeue_helpdesk_ticket, reset_stuck_processing,
+    resolve_helpdesk_ticket, schedule_retry, should_store_session_event, start_helpdesk_ticket,
+    unix_millis_now, update_helpdesk_ticket_operational_fields, upsert_dashboard_user,
+    upsert_helpdesk_agent_presence, verify_helpdesk_agent_token, EventQueryFilter, InsertOutcome,
+    OutboxRecord,
 };
 use crate::turso::{
     compute_helpdesk_sync_signature, compute_monitoring_sync_signature,
@@ -205,15 +208,24 @@ pub async fn run(
         }) {
         Some(database_url) => match connect_postgres(&database_url).await {
             Ok(pool) => match init_postgres_helpdesk_schema(&pool).await {
-                Ok(()) => match init_postgres_monitoring_schema(&pool).await {
-                    Ok(()) => {
-                        info!("Postgres helpdesk and monitoring pools initialized");
-                        Some(pool)
-                    }
+                Ok(()) => match ensure_postgres_helpdesk_agent_auth_schema(&pool).await {
+                    Ok(()) => match init_postgres_monitoring_schema(&pool).await {
+                        Ok(()) => {
+                            info!("Postgres helpdesk and monitoring pools initialized");
+                            Some(pool)
+                        }
+                        Err(err) => {
+                            error!(
+                                error = %err,
+                                "failed to initialize Postgres monitoring schema; continuing without Postgres-backed monitoring runtime"
+                            );
+                            None
+                        }
+                    },
                     Err(err) => {
                         error!(
                             error = %err,
-                            "failed to initialize Postgres monitoring schema; continuing without Postgres-backed monitoring runtime"
+                            "failed to initialize Postgres helpdesk agent auth schema; continuing without Postgres-backed runtime"
                         );
                         None
                     }
@@ -798,25 +810,25 @@ async fn list_helpdesk_authorized_agents_for_active_backend(
     list_helpdesk_authorized_agents(&state.pool).await
 }
 
-async fn upsert_helpdesk_authorized_agent_for_active_backend(
+async fn provision_helpdesk_authorized_agent_for_active_backend(
     state: &AppState,
     payload: &HelpdeskAuthorizedAgentUpsertRequestV1,
-) -> anyhow::Result<crate::model::HelpdeskAuthorizedAgentV1> {
+) -> anyhow::Result<HelpdeskAuthorizedAgentProvisioningV1> {
     if let Some(pool) = active_helpdesk_postgres_pool(state) {
-        match upsert_helpdesk_authorized_agent_pg(pool, payload).await {
-            Ok(agent) => return Ok(agent),
+        match provision_helpdesk_authorized_agent_pg(pool, payload).await {
+            Ok(result) => return Ok(result),
             Err(err) if state.sqlite_fallback_enabled => {
                 warn!(
                     error = %err,
                     agent_id = payload.agent_id,
-                    "failed to upsert authorized helpdesk agent in Postgres; falling back to SQLite"
+                    "failed to provision authorized helpdesk agent in Postgres; falling back to SQLite"
                 );
             }
             Err(err) => return Err(err),
         }
     }
 
-    upsert_helpdesk_authorized_agent(&state.pool, payload).await
+    provision_helpdesk_authorized_agent(&state.pool, payload).await
 }
 
 async fn delete_helpdesk_authorized_agent_for_active_backend(
@@ -859,6 +871,28 @@ async fn get_helpdesk_agent_authorization_for_active_backend(
     }
 
     get_helpdesk_agent_authorization_status(&state.pool, agent_id).await
+}
+
+async fn verify_helpdesk_agent_token_for_active_backend(
+    state: &AppState,
+    agent_id: &str,
+    raw_token: &str,
+) -> anyhow::Result<bool> {
+    if let Some(pool) = active_helpdesk_postgres_pool(state) {
+        match verify_helpdesk_agent_token_pg(pool, agent_id, raw_token).await {
+            Ok(valid) => return Ok(valid),
+            Err(err) if state.sqlite_fallback_enabled => {
+                warn!(
+                    error = %err,
+                    agent_id,
+                    "failed to verify helpdesk agent token in Postgres; falling back to SQLite"
+                );
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    verify_helpdesk_agent_token(&state.pool, agent_id, raw_token).await
 }
 
 async fn get_helpdesk_summary_for_active_backend(
@@ -1263,8 +1297,15 @@ async fn upsert_helpdesk_authorized_agent_handler(
         return bad_request(validation_error.to_string());
     }
 
-    match upsert_helpdesk_authorized_agent_for_active_backend(&state, &payload).await {
-        Ok(agent) => (StatusCode::OK, Json(json!({ "agent": agent }))).into_response(),
+    match provision_helpdesk_authorized_agent_for_active_backend(&state, &payload).await {
+        Ok(provisioning) => (
+            StatusCode::OK,
+            Json(json!({
+                "agent": provisioning.agent,
+                "agent_token": provisioning.agent_token,
+            })),
+        )
+            .into_response(),
         Err(err) => {
             if err.to_string().contains("display name '") {
                 return bad_request(err.to_string());
@@ -1335,10 +1376,15 @@ async fn get_helpdesk_summary_handler(State(state): State<AppState>) -> impl Int
 
 async fn upsert_helpdesk_agent_presence_handler(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(payload): Json<HelpdeskAgentPresenceUpdateV1>,
 ) -> impl IntoResponse {
     if let Err(validation_error) = payload.validate() {
         return bad_request(validation_error.to_string());
+    }
+
+    if let Err(response) = require_helpdesk_agent_auth(&state, &headers, &payload.agent_id).await {
+        return response;
     }
 
     match upsert_helpdesk_agent_presence_for_active_backend(&state, &payload).await {
@@ -1361,11 +1407,16 @@ async fn upsert_helpdesk_agent_presence_handler(
 
 async fn get_helpdesk_assignment_for_agent_handler(
     State(state): State<AppState>,
+    headers: HeaderMap,
     AxumPath(agent_id): AxumPath<String>,
 ) -> impl IntoResponse {
     let agent_id = agent_id.trim().to_string();
     if agent_id.is_empty() {
         return bad_request("agent_id cannot be empty");
+    }
+
+    if let Err(response) = require_helpdesk_agent_auth(&state, &headers, &agent_id).await {
+        return response;
     }
 
     match get_helpdesk_assignment_for_agent_for_active_backend(&state, &agent_id).await {
@@ -1382,11 +1433,16 @@ async fn get_helpdesk_assignment_for_agent_handler(
 
 async fn start_helpdesk_assignment_handler(
     State(state): State<AppState>,
+    headers: HeaderMap,
     AxumPath(agent_id): AxumPath<String>,
     Json(payload): Json<HelpdeskAssignmentStartRequestV1>,
 ) -> impl IntoResponse {
     if let Err(validation_error) = payload.validate() {
         return bad_request(validation_error.to_string());
+    }
+
+    if let Err(response) = require_helpdesk_agent_auth(&state, &headers, &agent_id).await {
+        return response;
     }
 
     match start_helpdesk_assignment_for_active_backend(&state, &agent_id, &payload.ticket_id).await
@@ -1535,6 +1591,7 @@ async fn assign_helpdesk_ticket_handler(
 
 async fn update_helpdesk_ticket_operational_handler(
     State(state): State<AppState>,
+    headers: HeaderMap,
     AxumPath(ticket_id): AxumPath<String>,
     Json(payload): Json<HelpdeskTicketOperationalUpdateRequestV1>,
 ) -> impl IntoResponse {
@@ -1545,6 +1602,36 @@ async fn update_helpdesk_ticket_operational_handler(
 
     if let Err(validation_error) = payload.validate() {
         return bad_request(validation_error.to_string());
+    }
+
+    match authenticate_dashboard_from_headers(&state, &headers).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            let Some(agent_id) = payload
+                .agent_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                return unauthorized_message(
+                    "agent_id is required when updating ticket operational fields from the agent app",
+                );
+            };
+
+            if let Err(response) = require_helpdesk_agent_auth(&state, &headers, agent_id).await {
+                return response;
+            }
+
+            if let Err(err) =
+                ensure_helpdesk_agent_controls_ticket(&state, &ticket_id, agent_id).await
+            {
+                return forbidden(err.to_string());
+            }
+        }
+        Err(err) => {
+            error!(error = %err, "failed to validate dashboard session for operational update");
+            return internal_error();
+        }
     }
 
     match update_helpdesk_ticket_operational_for_active_backend(
@@ -1581,6 +1668,7 @@ async fn update_helpdesk_ticket_operational_handler(
 
 async fn create_helpdesk_ticket_agent_report_handler(
     State(state): State<AppState>,
+    headers: HeaderMap,
     AxumPath(ticket_id): AxumPath<String>,
     Json(payload): Json<HelpdeskTicketAgentReportCreateRequestV1>,
 ) -> impl IntoResponse {
@@ -1591,6 +1679,10 @@ async fn create_helpdesk_ticket_agent_report_handler(
 
     if let Err(validation_error) = payload.validate() {
         return bad_request(validation_error.to_string());
+    }
+
+    if let Err(response) = require_helpdesk_agent_auth(&state, &headers, &payload.agent_id).await {
+        return response;
     }
 
     match add_helpdesk_ticket_agent_report_for_active_backend(
@@ -1622,11 +1714,16 @@ async fn create_helpdesk_ticket_agent_report_handler(
 
 async fn resolve_helpdesk_ticket_handler(
     State(state): State<AppState>,
+    headers: HeaderMap,
     AxumPath(ticket_id): AxumPath<String>,
     Json(payload): Json<HelpdeskTicketResolveRequestV1>,
 ) -> impl IntoResponse {
     if let Err(validation_error) = payload.validate() {
         return bad_request(validation_error.to_string());
+    }
+
+    if let Err(response) = require_helpdesk_agent_auth(&state, &headers, &payload.agent_id).await {
+        return response;
     }
 
     let next_agent_status = payload
@@ -2133,6 +2230,104 @@ async fn require_dashboard_auth(
     (jar, response).into_response()
 }
 
+async fn authenticate_dashboard_from_headers(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> anyhow::Result<Option<AuthUserV1>> {
+    let Some(cookie_header) = headers.get(header::COOKIE) else {
+        return Ok(None);
+    };
+    let Ok(cookie_header) = cookie_header.to_str() else {
+        return Ok(None);
+    };
+    let Some(session_token) = find_cookie_value(cookie_header, DASHBOARD_SESSION_COOKIE) else {
+        return Ok(None);
+    };
+
+    let now = Utc::now();
+    if let Some(signed_session) =
+        auth::verify_dashboard_session_token(&state.auth, &session_token, now)
+    {
+        return Ok(Some(signed_session.user));
+    }
+
+    match get_dashboard_session_by_token(&state.pool, &session_token, now).await {
+        Ok(Some(record)) => Ok(Some(record.user)),
+        Ok(None) => Ok(None),
+        Err(err) => Err(err).context("failed to validate dashboard session from request headers"),
+    }
+}
+
+fn extract_helpdesk_agent_token(headers: &HeaderMap) -> Option<String> {
+    if let Some(raw_value) = headers
+        .get(HELPDESK_AGENT_TOKEN_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Some(raw_value.to_string());
+    }
+
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+async fn require_helpdesk_agent_auth(
+    state: &AppState,
+    headers: &HeaderMap,
+    agent_id: &str,
+) -> Result<(), Response> {
+    let Some(raw_token) = extract_helpdesk_agent_token(headers) else {
+        return Err(unauthorized_message(
+            "helpdesk agent token is required for this action",
+        ));
+    };
+
+    match verify_helpdesk_agent_token_for_active_backend(state, agent_id, &raw_token).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(forbidden(
+            "invalid helpdesk agent token for this RustDesk ID",
+        )),
+        Err(err) => {
+            error!(
+                error = %err,
+                agent_id,
+                "failed to verify helpdesk agent token"
+            );
+            Err(internal_error())
+        }
+    }
+}
+
+async fn ensure_helpdesk_agent_controls_ticket(
+    state: &AppState,
+    ticket_id: &str,
+    agent_id: &str,
+) -> anyhow::Result<()> {
+    let ticket = get_helpdesk_ticket_for_active_backend(state, ticket_id)
+        .await?
+        .with_context(|| format!("ticket '{}' was not found", ticket_id))?;
+
+    if ticket.assigned_agent_id.as_deref() != Some(agent_id) {
+        anyhow::bail!("ticket is not currently assigned to this agent");
+    }
+
+    if !matches!(
+        ticket.status,
+        crate::model::HelpdeskTicketStatus::Opening
+            | crate::model::HelpdeskTicketStatus::InProgress
+    ) {
+        anyhow::bail!("ticket is not active for this agent");
+    }
+
+    Ok(())
+}
+
 async fn list_presence_sessions_handler(State(state): State<AppState>) -> impl IntoResponse {
     match list_active_session_presence_for_active_monitoring_backend(&state).await {
         Ok(sessions) => (
@@ -2452,6 +2647,17 @@ fn unauthorized() -> Response {
         StatusCode::UNAUTHORIZED,
         Json(json!({
             "error": "unauthorized"
+        })),
+    )
+        .into_response()
+}
+
+fn unauthorized_message(message: impl Into<String>) -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({
+            "error": "unauthorized",
+            "message": message.into(),
         })),
     )
         .into_response()

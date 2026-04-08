@@ -9,10 +9,14 @@ use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool, Transaction};
 use uuid::Uuid;
 
 use crate::config::MonitoringConfig;
+use crate::helpdesk_agent_auth::{
+    generate_helpdesk_agent_token, hash_helpdesk_agent_token, helpdesk_agent_token_hint,
+};
 use crate::model::{
     AuthRoleV1, AuthUserV1, DashboardSummaryV1, HelpdeskAgentAuthorizationStatusV1,
     HelpdeskAgentPresenceUpdateV1, HelpdeskAgentStatus, HelpdeskAgentV1, HelpdeskAssignmentV1,
-    HelpdeskAuditEventV1, HelpdeskAuthorizedAgentUpsertRequestV1, HelpdeskAuthorizedAgentV1,
+    HelpdeskAuditEventV1, HelpdeskAuthorizedAgentProvisioningV1,
+    HelpdeskAuthorizedAgentUpsertRequestV1, HelpdeskAuthorizedAgentV1,
     HelpdeskOperationalSummaryV1, HelpdeskTicketCreateRequestV1, HelpdeskTicketStatus,
     HelpdeskTicketV1, PresenceParticipantV1, PresenceSessionSummaryV1, SessionActorTypeV1,
     SessionEventType, SessionEventV1, SessionPresenceV1, SessionReportRowV1, SessionTimelineItemV1,
@@ -1012,12 +1016,120 @@ pub async fn upsert_helpdesk_authorized_agent(
         })
 }
 
+pub async fn provision_helpdesk_authorized_agent(
+    pool: &SqlitePool,
+    payload: &HelpdeskAuthorizedAgentUpsertRequestV1,
+) -> anyhow::Result<HelpdeskAuthorizedAgentProvisioningV1> {
+    let now_ms = unix_millis_now() as i64;
+    let agent_id = normalize_helpdesk_agent_id(&payload.agent_id);
+    let existing_agent = get_helpdesk_authorized_agent(pool, &agent_id).await?;
+    let display_name = normalize_optional_text(payload.display_name.as_deref()).or_else(|| {
+        existing_agent
+            .as_ref()
+            .and_then(|agent| agent.display_name.clone())
+    });
+    ensure_helpdesk_agent_display_name_available(pool, &agent_id, display_name.as_deref()).await?;
+
+    let issued_token = generate_helpdesk_agent_token();
+    let token_hash = hash_helpdesk_agent_token(&issued_token);
+    let token_hint = helpdesk_agent_token_hint(&issued_token);
+
+    let mut tx = pool
+        .begin()
+        .await
+        .context("failed to open authorized helpdesk agent provisioning transaction")?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO helpdesk_authorized_agents (
+            agent_id,
+            display_name,
+            agent_token_hash,
+            agent_token_hint,
+            agent_token_rotated_at,
+            created_at,
+            updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        ON CONFLICT(agent_id) DO UPDATE SET
+            display_name = COALESCE(?2, helpdesk_authorized_agents.display_name),
+            agent_token_hash = ?3,
+            agent_token_hint = ?4,
+            agent_token_rotated_at = ?5,
+            updated_at = ?7
+        "#,
+    )
+    .bind(&agent_id)
+    .bind(display_name.as_deref())
+    .bind(&token_hash)
+    .bind(token_hint.as_deref())
+    .bind(now_ms)
+    .bind(now_ms)
+    .bind(now_ms)
+    .execute(&mut *tx)
+    .await
+    .with_context(|| {
+        format!(
+            "failed to provision authorized helpdesk agent '{}'",
+            agent_id
+        )
+    })?;
+
+    sqlx::query(
+        r#"
+        UPDATE helpdesk_agents
+        SET display_name = ?2,
+            updated_at = ?3
+        WHERE agent_id = ?1
+          AND ?2 IS NOT NULL
+        "#,
+    )
+    .bind(&agent_id)
+    .bind(display_name.as_deref())
+    .bind(now_ms)
+    .execute(&mut *tx)
+    .await
+    .with_context(|| {
+        format!(
+            "failed to align live helpdesk agent display name for '{}'",
+            agent_id
+        )
+    })?;
+
+    tx.commit()
+        .await
+        .context("failed to commit authorized helpdesk agent provisioning transaction")?;
+
+    delete_legacy_helpdesk_authorized_agent_variants(pool, &agent_id).await?;
+
+    let agent = get_helpdesk_authorized_agent(pool, &agent_id)
+        .await?
+        .with_context(|| {
+            format!(
+                "authorized helpdesk agent '{}' not found after provisioning",
+                agent_id
+            )
+        })?;
+
+    Ok(HelpdeskAuthorizedAgentProvisioningV1 {
+        agent,
+        agent_token: issued_token,
+    })
+}
+
 pub async fn list_helpdesk_authorized_agents(
     pool: &SqlitePool,
 ) -> anyhow::Result<Vec<HelpdeskAuthorizedAgentV1>> {
     let rows = sqlx::query(
         r#"
-        SELECT agent_id, display_name, created_at, updated_at
+        SELECT
+            agent_id,
+            display_name,
+            agent_token_hash,
+            agent_token_hint,
+            agent_token_rotated_at,
+            created_at,
+            updated_at
         FROM helpdesk_authorized_agents
         ORDER BY updated_at DESC, agent_id ASC
         "#,
@@ -1045,7 +1157,14 @@ pub async fn get_helpdesk_authorized_agent(
     let normalized_sql = normalized_helpdesk_agent_id_sql("agent_id");
     let query = format!(
         r#"
-        SELECT agent_id, display_name, created_at, updated_at
+        SELECT
+            agent_id,
+            display_name,
+            agent_token_hash,
+            agent_token_hint,
+            agent_token_rotated_at,
+            created_at,
+            updated_at
         FROM helpdesk_authorized_agents
         WHERE {normalized_sql} = ?1
         ORDER BY updated_at DESC, agent_id ASC
@@ -1070,8 +1189,47 @@ pub async fn get_helpdesk_agent_authorization_status(
     Ok(HelpdeskAgentAuthorizationStatusV1 {
         agent_id,
         authorized: authorized_agent.is_some(),
-        display_name: authorized_agent.and_then(|agent| agent.display_name),
+        display_name: authorized_agent
+            .as_ref()
+            .and_then(|agent| agent.display_name.clone()),
+        token_configured: authorized_agent
+            .as_ref()
+            .is_some_and(|agent| agent.token_configured),
+        token_hint: authorized_agent.and_then(|agent| agent.token_hint),
     })
+}
+
+pub async fn verify_helpdesk_agent_token(
+    pool: &SqlitePool,
+    agent_id: &str,
+    raw_token: &str,
+) -> anyhow::Result<bool> {
+    let normalized_agent_id = normalize_helpdesk_agent_id(agent_id);
+    let token_hash = hash_helpdesk_agent_token(raw_token);
+    let normalized_sql = normalized_helpdesk_agent_id_sql("agent_id");
+    let query = format!(
+        r#"
+        SELECT agent_token_hash
+        FROM helpdesk_authorized_agents
+        WHERE {normalized_sql} = ?1
+        ORDER BY updated_at DESC, agent_id ASC
+        LIMIT 1
+        "#
+    );
+
+    let stored_hash = sqlx::query_scalar::<_, Option<String>>(&query)
+        .bind(&normalized_agent_id)
+        .fetch_optional(pool)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to query helpdesk agent token hash for '{}'",
+                normalized_agent_id
+            )
+        })?
+        .flatten();
+
+    Ok(matches!(stored_hash.as_deref(), Some(value) if value == token_hash))
 }
 
 pub async fn delete_helpdesk_authorized_agent(
@@ -3446,9 +3604,17 @@ fn row_to_helpdesk_agent(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<Helpdes
 fn row_to_helpdesk_authorized_agent(
     row: sqlx::sqlite::SqliteRow,
 ) -> anyhow::Result<HelpdeskAuthorizedAgentV1> {
+    let rotated_at: Option<i64> = row.get("agent_token_rotated_at");
+    let token_hash: Option<String> = row.get("agent_token_hash");
     Ok(HelpdeskAuthorizedAgentV1 {
         agent_id: normalize_helpdesk_agent_id(&row.get::<String, _>("agent_id")),
         display_name: row.get("display_name"),
+        token_configured: token_hash
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty()),
+        token_hint: row.get("agent_token_hint"),
+        agent_token_rotated_at: rotated_at.map(millis_to_utc),
         created_at: millis_to_utc(row.get("created_at")),
         updated_at: millis_to_utc(row.get("updated_at")),
     })
@@ -3680,10 +3846,11 @@ mod tests {
         get_helpdesk_agent_authorization_status, get_helpdesk_assignment_for_agent,
         get_helpdesk_operational_summary, get_helpdesk_ticket, get_session_presence, insert_event,
         list_active_session_presence, list_helpdesk_ticket_audit_events, list_helpdesk_tickets,
-        query_timeline_events, reconcile_helpdesk_runtime, requeue_helpdesk_ticket,
-        resolve_helpdesk_ticket, should_store_session_event, start_helpdesk_ticket,
-        unix_millis_now, update_helpdesk_ticket_operational_fields, upsert_helpdesk_agent_presence,
-        upsert_helpdesk_authorized_agent, EventQueryFilter, InsertOutcome,
+        provision_helpdesk_authorized_agent, query_timeline_events, reconcile_helpdesk_runtime,
+        requeue_helpdesk_ticket, resolve_helpdesk_ticket, should_store_session_event,
+        start_helpdesk_ticket, unix_millis_now, update_helpdesk_ticket_operational_fields,
+        upsert_helpdesk_agent_presence, upsert_helpdesk_authorized_agent,
+        verify_helpdesk_agent_token, EventQueryFilter, InsertOutcome,
     };
 
     async fn authorize_agent(pool: &sqlx::SqlitePool, agent_id: &str, display_name: &str) {
@@ -3692,6 +3859,7 @@ mod tests {
             &HelpdeskAuthorizedAgentUpsertRequestV1 {
                 agent_id: agent_id.to_string(),
                 display_name: Some(display_name.to_string()),
+                rotate_agent_token: None,
             },
         )
         .await
@@ -3720,6 +3888,49 @@ mod tests {
 
         assert_eq!(first, InsertOutcome::Inserted);
         assert_eq!(second, InsertOutcome::Duplicate);
+    }
+
+    #[tokio::test]
+    async fn provisioned_agent_token_is_verified_and_status_exposes_hint() {
+        let temp = tempdir().expect("create temp dir");
+        let db_path = temp.path().join("helpdesk-agent-token.db");
+        let pool = connect_sqlite(&db_path).await.expect("connect sqlite");
+
+        let provisioning = provision_helpdesk_authorized_agent(
+            &pool,
+            &HelpdeskAuthorizedAgentUpsertRequestV1 {
+                agent_id: "agent-token-1".to_string(),
+                display_name: Some("Agent Token".to_string()),
+                rotate_agent_token: Some(true),
+            },
+        )
+        .await
+        .expect("provision agent");
+
+        assert!(provisioning.agent.token_configured);
+        assert!(provisioning.agent.token_hint.is_some());
+        assert!(provisioning.agent.agent_token_rotated_at.is_some());
+        assert!(
+            verify_helpdesk_agent_token(&pool, "agent-token-1", &provisioning.agent_token)
+                .await
+                .expect("verify issued token")
+        );
+        assert!(
+            !verify_helpdesk_agent_token(&pool, "agent-token-1", "wrong-token")
+                .await
+                .expect("reject wrong token")
+        );
+
+        let status = get_helpdesk_agent_authorization_status(&pool, "agent-token-1")
+            .await
+            .expect("get authorization status");
+        assert!(status.authorized);
+        assert!(status.token_configured);
+        assert!(status
+            .token_hint
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("..."));
     }
 
     #[tokio::test]
@@ -4162,6 +4373,7 @@ mod tests {
             &HelpdeskAuthorizedAgentUpsertRequestV1 {
                 agent_id: payload.agent_id.clone(),
                 display_name: Some("Authorized".to_string()),
+                rotate_agent_token: None,
             },
         )
         .await
@@ -4189,6 +4401,7 @@ mod tests {
             &HelpdeskAuthorizedAgentUpsertRequestV1 {
                 agent_id: "419 797 027".to_string(),
                 display_name: Some("Edward soporte".to_string()),
+                rotate_agent_token: None,
             },
         )
         .await
@@ -5072,6 +5285,7 @@ mod tests {
             &HelpdeskAuthorizedAgentUpsertRequestV1 {
                 agent_id: "agent-two".to_string(),
                 display_name: Some("Edward soporte".to_string()),
+                rotate_agent_token: None,
             },
         )
         .await

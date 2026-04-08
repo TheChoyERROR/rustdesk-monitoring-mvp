@@ -127,6 +127,14 @@ type CreateFeedback =
     }
   | null;
 
+type AgentTokenPanel =
+  | {
+      agentId: string;
+      displayName: string;
+      token: string;
+    }
+  | null;
+
 export default function HelpdeskPage() {
   const [summary, setSummary] = useState<HelpdeskOperationalSummary | null>(null);
   const [agents, setAgents] = useState<HelpdeskAgent[]>([]);
@@ -142,6 +150,7 @@ export default function HelpdeskPage() {
   const [createFeedback, setCreateFeedback] = useState<CreateFeedback>(null);
   const [authorizeBusy, setAuthorizeBusy] = useState(false);
   const [authorizeFeedback, setAuthorizeFeedback] = useState<CreateFeedback>(null);
+  const [latestAgentToken, setLatestAgentToken] = useState<AgentTokenPanel>(null);
   const [authorizedForm, setAuthorizedForm] = useState({
     agentId: '',
     displayName: '',
@@ -248,6 +257,7 @@ export default function HelpdeskPage() {
       event.preventDefault();
       setAuthorizeBusy(true);
       setAuthorizeFeedback(null);
+      setLatestAgentToken(null);
       setError(null);
 
       try {
@@ -261,13 +271,20 @@ export default function HelpdeskPage() {
             );
           }
         }
-        const agent = await apiHelpdeskAuthorizedAgentUpsert({
+        const provisioning = await apiHelpdeskAuthorizedAgentUpsert({
           agent_id: normalizedAgentId,
           display_name: authorizedForm.displayName.trim() || undefined,
+          rotate_agent_token: true,
         });
+        const agent = provisioning.agent;
         setAuthorizeFeedback({
           tone: 'success',
           message: `El equipo ${agent.agent_id} quedó habilitado para usar modo agente.`,
+        });
+        setLatestAgentToken({
+          agentId: agent.agent_id,
+          displayName: agent.display_name?.trim() || agent.agent_id,
+          token: provisioning.agent_token,
         });
         setAuthorizedForm({ agentId: '', displayName: '' });
         await load(true);
@@ -313,6 +330,64 @@ export default function HelpdeskPage() {
     },
     [load],
   );
+
+  const handleRegenerateAgentToken = useCallback(
+    async (authorizedAgent: HelpdeskAuthorizedAgent) => {
+      setAuthorizeBusy(true);
+      setAuthorizeFeedback(null);
+      setLatestAgentToken(null);
+      setError(null);
+
+      try {
+        const provisioning = await apiHelpdeskAuthorizedAgentUpsert({
+          agent_id: normalizeRustDeskId(authorizedAgent.agent_id),
+          display_name: authorizedAgent.display_name?.trim() || undefined,
+          rotate_agent_token: true,
+        });
+
+        setAuthorizeFeedback({
+          tone: 'success',
+          message: `Se regenero el token del agente ${provisioning.agent.agent_id}.`,
+        });
+        setLatestAgentToken({
+          agentId: provisioning.agent.agent_id,
+          displayName: provisioning.agent.display_name?.trim() || provisioning.agent.agent_id,
+          token: provisioning.agent_token,
+        });
+        await load(true);
+      } catch (regenerateError) {
+        setAuthorizeFeedback({
+          tone: 'error',
+          message:
+            regenerateError instanceof Error
+              ? regenerateError.message
+              : 'No se pudo regenerar el token del agente.',
+        });
+      } finally {
+        setAuthorizeBusy(false);
+      }
+    },
+    [load],
+  );
+
+  const handleCopyAgentToken = useCallback(async () => {
+    if (!latestAgentToken) {
+      return;
+    }
+
+    try {
+      await navigator.clipboard.writeText(latestAgentToken.token);
+      setAuthorizeFeedback({
+        tone: 'success',
+        message: `Token copiado para ${latestAgentToken.displayName}.`,
+      });
+    } catch {
+      setAuthorizeFeedback({
+        tone: 'error',
+        message: 'No se pudo copiar el token automaticamente. Copialo manualmente.',
+      });
+    }
+  }, [latestAgentToken]);
 
   const handleCreateTicket = useCallback(
     async (event: FormEvent<HTMLFormElement>) => {
@@ -514,6 +589,27 @@ export default function HelpdeskPage() {
           </div>
         </form>
 
+        {latestAgentToken ? (
+          <div className="panel stack">
+            <div>
+              <h3>Token del agente</h3>
+              <p className="activity-summary-line">
+                Copialo ahora y pegalo en la app RustDesk del agente. Por seguridad solo se muestra
+                completo en este momento.
+              </p>
+            </div>
+            <textarea readOnly rows={3} value={latestAgentToken.token} />
+            <div className="filter-actions">
+              <button type="button" className="btn secondary" onClick={() => void handleCopyAgentToken()}>
+                Copiar token
+              </button>
+              <p className="activity-summary-line">
+                Agente: <strong>{latestAgentToken.displayName}</strong> ({latestAgentToken.agentId})
+              </p>
+            </div>
+          </div>
+        ) : null}
+
         {authorizedAgents.length === 0 ? (
           <p>Aún no hay equipos autorizados como agentes.</p>
         ) : (
@@ -521,6 +617,7 @@ export default function HelpdeskPage() {
             <thead>
               <tr>
                 <th>Agente autorizado</th>
+                <th>Token</th>
                 <th>Estado actual</th>
                 <th>Autorizado desde</th>
                 <th></th>
@@ -542,6 +639,20 @@ export default function HelpdeskPage() {
                       <div className="table-subtle">{authorizedAgent.agent_id}</div>
                     </td>
                     <td>
+                      {authorizedAgent.token_configured ? (
+                        <>
+                          <strong>{authorizedAgent.token_hint ?? 'Configurado'}</strong>
+                          <div className="table-subtle">
+                            {authorizedAgent.agent_token_rotated_at
+                              ? `Rotado ${formatDateTime(authorizedAgent.agent_token_rotated_at)}`
+                              : 'Token activo'}
+                          </div>
+                        </>
+                      ) : (
+                        <span className="status-pill status-warn">Falta token</span>
+                      )}
+                    </td>
+                    <td>
                       {liveAgent ? (
                         <span className={`status-pill ${statusClass(liveAgent.status)}`}>
                           {statusLabel(liveAgent.status)}
@@ -552,14 +663,24 @@ export default function HelpdeskPage() {
                     </td>
                     <td>{formatDateTime(authorizedAgent.created_at)}</td>
                     <td>
-                      <button
-                        type="button"
-                        className="btn secondary"
-                        disabled={authorizeBusy}
-                        onClick={() => void handleRemoveAuthorizedAgent(authorizedAgent.agent_id)}
-                      >
-                        Quitar
-                      </button>
+                      <div className="filter-actions">
+                        <button
+                          type="button"
+                          className="btn secondary"
+                          disabled={authorizeBusy}
+                          onClick={() => void handleRegenerateAgentToken(authorizedAgent)}
+                        >
+                          Regenerar token
+                        </button>
+                        <button
+                          type="button"
+                          className="btn secondary"
+                          disabled={authorizeBusy}
+                          onClick={() => void handleRemoveAuthorizedAgent(authorizedAgent.agent_id)}
+                        >
+                          Quitar
+                        </button>
+                      </div>
                     </td>
                   </tr>
                 );

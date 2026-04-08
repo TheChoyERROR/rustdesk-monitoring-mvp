@@ -160,6 +160,9 @@ const SCHEMA_STATEMENTS: &[(&str, &str)] = &[
         CREATE TABLE IF NOT EXISTS helpdesk_authorized_agents (
             agent_id TEXT PRIMARY KEY,
             display_name TEXT,
+            agent_token_hash TEXT,
+            agent_token_hint TEXT,
+            agent_token_rotated_at INTEGER,
             created_at INTEGER NOT NULL,
             updated_at INTEGER NOT NULL
         )
@@ -273,6 +276,10 @@ pub async fn init_sqlite_schema(pool: &SqlitePool) -> anyhow::Result<()> {
     }
 
     ensure_sqlite_text_column(pool, "helpdesk_agents", "avatar_url").await?;
+    ensure_sqlite_text_column(pool, "helpdesk_authorized_agents", "agent_token_hash").await?;
+    ensure_sqlite_text_column(pool, "helpdesk_authorized_agents", "agent_token_hint").await?;
+    ensure_sqlite_integer_column(pool, "helpdesk_authorized_agents", "agent_token_rotated_at")
+        .await?;
     ensure_sqlite_text_column(pool, "helpdesk_tickets", "title").await?;
     ensure_sqlite_text_column(pool, "helpdesk_tickets", "description").await?;
     ensure_sqlite_text_column(pool, "helpdesk_tickets", "difficulty").await?;
@@ -290,6 +297,10 @@ pub async fn init_libsql_schema(conn: &LibsqlConnection) -> anyhow::Result<()> {
     }
 
     ensure_libsql_text_column(conn, "helpdesk_agents", "avatar_url").await?;
+    ensure_libsql_text_column(conn, "helpdesk_authorized_agents", "agent_token_hash").await?;
+    ensure_libsql_text_column(conn, "helpdesk_authorized_agents", "agent_token_hint").await?;
+    ensure_libsql_integer_column(conn, "helpdesk_authorized_agents", "agent_token_rotated_at")
+        .await?;
     ensure_libsql_text_column(conn, "helpdesk_tickets", "title").await?;
     ensure_libsql_text_column(conn, "helpdesk_tickets", "description").await?;
     ensure_libsql_text_column(conn, "helpdesk_tickets", "difficulty").await?;

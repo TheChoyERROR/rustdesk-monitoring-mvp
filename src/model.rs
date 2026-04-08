@@ -272,6 +272,11 @@ pub struct HelpdeskAuthorizedAgentV1 {
     pub agent_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+    pub token_configured: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_hint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_token_rotated_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -281,6 +286,14 @@ pub struct HelpdeskAuthorizedAgentUpsertRequestV1 {
     pub agent_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rotate_agent_token: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HelpdeskAuthorizedAgentProvisioningV1 {
+    pub agent: HelpdeskAuthorizedAgentV1,
+    pub agent_token: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -289,6 +302,9 @@ pub struct HelpdeskAgentAuthorizationStatusV1 {
     pub authorized: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+    pub token_configured: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_hint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -396,6 +412,8 @@ pub struct HelpdeskTicketAssignRequestV1 {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HelpdeskTicketOperationalUpdateRequestV1 {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub difficulty: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -515,6 +533,11 @@ impl HelpdeskTicketAssignRequestV1 {
 
 impl HelpdeskTicketOperationalUpdateRequestV1 {
     pub fn validate(&self) -> Result<(), EventValidationError> {
+        if let Some(agent_id) = &self.agent_id {
+            if agent_id.trim().is_empty() {
+                return Err(EventValidationError::EmptyField("agent_id"));
+            }
+        }
         if let Some(difficulty) = &self.difficulty {
             if difficulty.trim().is_empty() {
                 return Err(EventValidationError::EmptyField("difficulty"));

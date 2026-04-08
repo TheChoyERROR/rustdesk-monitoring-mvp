@@ -6,16 +6,34 @@ use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 use crate::config::MonitoringConfig;
+use crate::helpdesk_agent_auth::{
+    generate_helpdesk_agent_token, hash_helpdesk_agent_token, helpdesk_agent_token_hint,
+};
 use crate::model::{
     HelpdeskAgentAuthorizationStatusV1, HelpdeskAgentPresenceUpdateV1, HelpdeskAgentStatus,
     HelpdeskAgentV1, HelpdeskAssignmentV1, HelpdeskAuditEventV1,
-    HelpdeskAuthorizedAgentUpsertRequestV1, HelpdeskAuthorizedAgentV1,
-    HelpdeskOperationalSummaryV1, HelpdeskTicketCreateRequestV1, HelpdeskTicketStatus,
-    HelpdeskTicketV1, SessionEventType, SessionEventV1,
+    HelpdeskAuthorizedAgentProvisioningV1, HelpdeskAuthorizedAgentUpsertRequestV1,
+    HelpdeskAuthorizedAgentV1, HelpdeskOperationalSummaryV1, HelpdeskTicketCreateRequestV1,
+    HelpdeskTicketStatus, HelpdeskTicketV1, SessionEventType, SessionEventV1,
 };
 use crate::storage::HelpdeskRuntimeReconcileResult;
 
 const HELPDESK_OPENING_WINDOW_MS: i64 = 30_000;
+
+pub async fn ensure_postgres_helpdesk_agent_auth_schema(pool: &PgPool) -> Result<()> {
+    for statement in [
+        "ALTER TABLE helpdesk_authorized_agents ADD COLUMN IF NOT EXISTS agent_token_hash TEXT",
+        "ALTER TABLE helpdesk_authorized_agents ADD COLUMN IF NOT EXISTS agent_token_hint TEXT",
+        "ALTER TABLE helpdesk_authorized_agents ADD COLUMN IF NOT EXISTS agent_token_rotated_at BIGINT",
+    ] {
+        sqlx::query(statement)
+            .execute(pool)
+            .await
+            .context("failed to apply Postgres helpdesk agent auth schema change")?;
+    }
+    Ok(())
+}
+
 pub async fn upsert_helpdesk_authorized_agent_pg(
     pool: &PgPool,
     payload: &HelpdeskAuthorizedAgentUpsertRequestV1,
@@ -33,7 +51,14 @@ pub async fn upsert_helpdesk_authorized_agent_pg(
         ON CONFLICT (agent_id) DO UPDATE SET
             display_name = COALESCE($2, helpdesk_authorized_agents.display_name),
             updated_at = $4
-        RETURNING agent_id, display_name, created_at, updated_at
+        RETURNING
+            agent_id,
+            display_name,
+            agent_token_hash,
+            agent_token_hint,
+            agent_token_rotated_at,
+            created_at,
+            updated_at
         "#,
     )
     .bind(&agent_id)
@@ -68,12 +93,109 @@ pub async fn upsert_helpdesk_authorized_agent_pg(
     row_to_helpdesk_authorized_agent_pg(row)
 }
 
+pub async fn provision_helpdesk_authorized_agent_pg(
+    pool: &PgPool,
+    payload: &HelpdeskAuthorizedAgentUpsertRequestV1,
+) -> Result<HelpdeskAuthorizedAgentProvisioningV1> {
+    let agent_id = normalize_helpdesk_agent_id(&payload.agent_id);
+    let existing_agent = get_helpdesk_authorized_agent_pg(pool, &agent_id).await?;
+    let display_name = normalize_optional_text(payload.display_name.as_deref()).or_else(|| {
+        existing_agent
+            .as_ref()
+            .and_then(|agent| agent.display_name.clone())
+    });
+    ensure_helpdesk_agent_display_name_available_pg(pool, &agent_id, display_name.as_deref())
+        .await?;
+
+    let now_ms = unix_millis_now();
+    let issued_token = generate_helpdesk_agent_token();
+    let token_hash = hash_helpdesk_agent_token(&issued_token);
+    let token_hint = helpdesk_agent_token_hint(&issued_token);
+
+    let row = sqlx::query(
+        r#"
+        INSERT INTO helpdesk_authorized_agents (
+            agent_id,
+            display_name,
+            agent_token_hash,
+            agent_token_hint,
+            agent_token_rotated_at,
+            created_at,
+            updated_at
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        ON CONFLICT (agent_id) DO UPDATE SET
+            display_name = COALESCE($2, helpdesk_authorized_agents.display_name),
+            agent_token_hash = $3,
+            agent_token_hint = $4,
+            agent_token_rotated_at = $5,
+            updated_at = $7
+        RETURNING
+            agent_id,
+            display_name,
+            agent_token_hash,
+            agent_token_hint,
+            agent_token_rotated_at,
+            created_at,
+            updated_at
+        "#,
+    )
+    .bind(&agent_id)
+    .bind(display_name.as_deref())
+    .bind(&token_hash)
+    .bind(token_hint.as_deref())
+    .bind(now_ms)
+    .bind(now_ms)
+    .bind(now_ms)
+    .fetch_one(pool)
+    .await
+    .with_context(|| {
+        format!(
+            "failed to provision Postgres authorized agent '{}'",
+            agent_id
+        )
+    })?;
+
+    sqlx::query(
+        r#"
+        UPDATE helpdesk_agents
+        SET display_name = $2,
+            updated_at = $3
+        WHERE agent_id = $1
+          AND $2 IS NOT NULL
+        "#,
+    )
+    .bind(&agent_id)
+    .bind(display_name.as_deref())
+    .bind(now_ms)
+    .execute(pool)
+    .await
+    .with_context(|| {
+        format!(
+            "failed to align Postgres live helpdesk agent display name for '{}'",
+            agent_id
+        )
+    })?;
+
+    Ok(HelpdeskAuthorizedAgentProvisioningV1 {
+        agent: row_to_helpdesk_authorized_agent_pg(row)?,
+        agent_token: issued_token,
+    })
+}
+
 pub async fn list_helpdesk_authorized_agents_pg(
     pool: &PgPool,
 ) -> Result<Vec<HelpdeskAuthorizedAgentV1>> {
     let rows = sqlx::query(
         r#"
-        SELECT agent_id, display_name, created_at, updated_at
+        SELECT
+            agent_id,
+            display_name,
+            agent_token_hash,
+            agent_token_hint,
+            agent_token_rotated_at,
+            created_at,
+            updated_at
         FROM helpdesk_authorized_agents
         ORDER BY created_at ASC, agent_id ASC
         "#,
@@ -274,8 +396,43 @@ pub async fn get_helpdesk_agent_authorization_status_pg(
     Ok(HelpdeskAgentAuthorizationStatusV1 {
         agent_id,
         authorized: authorized_agent.is_some(),
-        display_name: authorized_agent.and_then(|agent| agent.display_name),
+        display_name: authorized_agent
+            .as_ref()
+            .and_then(|agent| agent.display_name.clone()),
+        token_configured: authorized_agent
+            .as_ref()
+            .is_some_and(|agent| agent.token_configured),
+        token_hint: authorized_agent.and_then(|agent| agent.token_hint),
     })
+}
+
+pub async fn verify_helpdesk_agent_token_pg(
+    pool: &PgPool,
+    agent_id: &str,
+    raw_token: &str,
+) -> Result<bool> {
+    let normalized_agent_id = normalize_helpdesk_agent_id(agent_id);
+    let token_hash = hash_helpdesk_agent_token(raw_token);
+    let stored_hash = sqlx::query_scalar::<_, Option<String>>(
+        r#"
+        SELECT agent_token_hash
+        FROM helpdesk_authorized_agents
+        WHERE agent_id = $1
+        LIMIT 1
+        "#,
+    )
+    .bind(&normalized_agent_id)
+    .fetch_optional(pool)
+    .await
+    .with_context(|| {
+        format!(
+            "failed to query Postgres helpdesk agent token hash for '{}'",
+            normalized_agent_id
+        )
+    })?
+    .flatten();
+
+    Ok(matches!(stored_hash.as_deref(), Some(value) if value == token_hash))
 }
 
 pub async fn upsert_helpdesk_agent_presence_pg(
@@ -1843,7 +2000,14 @@ async fn get_helpdesk_authorized_agent_pg(
     let agent_id = normalize_helpdesk_agent_id(agent_id);
     let row = sqlx::query(
         r#"
-        SELECT agent_id, display_name, created_at, updated_at
+        SELECT
+            agent_id,
+            display_name,
+            agent_token_hash,
+            agent_token_hint,
+            agent_token_rotated_at,
+            created_at,
+            updated_at
         FROM helpdesk_authorized_agents
         WHERE agent_id = $1
         LIMIT 1
@@ -2063,9 +2227,17 @@ async fn assign_helpdesk_ticket_to_agent_pg_tx(
 }
 
 fn row_to_helpdesk_authorized_agent_pg(row: PgRow) -> Result<HelpdeskAuthorizedAgentV1> {
+    let rotated_at: Option<i64> = row.get("agent_token_rotated_at");
+    let token_hash: Option<String> = row.get("agent_token_hash");
     Ok(HelpdeskAuthorizedAgentV1 {
         agent_id: normalize_helpdesk_agent_id(&row.get::<String, _>("agent_id")),
         display_name: row.get("display_name"),
+        token_configured: token_hash
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty()),
+        token_hint: row.get("agent_token_hint"),
+        agent_token_rotated_at: rotated_at.map(millis_to_utc),
         created_at: millis_to_utc(row.get("created_at")),
         updated_at: millis_to_utc(row.get("updated_at")),
     })

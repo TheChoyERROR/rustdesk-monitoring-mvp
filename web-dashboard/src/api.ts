@@ -5,6 +5,7 @@ import type {
   HelpdeskAuditEvent,
   HelpdeskAgent,
   HelpdeskAuthorizedAgent,
+  HelpdeskAuthorizedAgentProvisioning,
   HelpdeskOperationalSummary,
   HelpdeskTicket,
   PaginatedResponse,
@@ -164,19 +165,19 @@ export async function apiHelpdeskTickets(): Promise<HelpdeskTicket[]> {
 export interface HelpdeskAuthorizedAgentUpsertBody {
   agent_id: string;
   display_name?: string;
+  rotate_agent_token?: boolean;
 }
 
 export async function apiHelpdeskAuthorizedAgentUpsert(
   body: HelpdeskAuthorizedAgentUpsertBody,
-): Promise<HelpdeskAuthorizedAgent> {
-  const response = await request<{ agent: HelpdeskAuthorizedAgent }>(
+): Promise<HelpdeskAuthorizedAgentProvisioning> {
+  return request<HelpdeskAuthorizedAgentProvisioning>(
     `${helpdeskBasePath()}/agent-authorizations`,
     {
       method: 'POST',
       body: JSON.stringify(body),
     },
   );
-  return response.agent;
 }
 
 export async function apiHelpdeskAuthorizedAgentDelete(agentId: string): Promise<void> {

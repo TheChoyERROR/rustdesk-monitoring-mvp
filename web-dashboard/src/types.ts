@@ -112,8 +112,16 @@ export interface HelpdeskAgent {
 export interface HelpdeskAuthorizedAgent {
   agent_id: string;
   display_name?: string | null;
+  token_configured: boolean;
+  token_hint?: string | null;
+  agent_token_rotated_at?: string | null;
   created_at: string;
   updated_at: string;
+}
+
+export interface HelpdeskAuthorizedAgentProvisioning {
+  agent: HelpdeskAuthorizedAgent;
+  agent_token: string;
 }
 
 export interface HelpdeskTicket {

@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod client;
 pub mod config;
+pub mod helpdesk_agent_auth;
 pub mod metrics;
 pub mod model;
 pub mod postgres;
