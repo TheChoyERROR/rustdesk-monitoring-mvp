@@ -4,6 +4,7 @@ pub mod config;
 pub mod metrics;
 pub mod model;
 pub mod postgres;
+pub mod postgres_helpdesk;
 pub mod schema;
 pub mod server;
 pub mod storage;

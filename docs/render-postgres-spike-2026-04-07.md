@@ -8,13 +8,17 @@ Este spike deja preparado un primer camino controlado hacia Render Postgres sin 
 - smoke test real contra Render Postgres
 - bootstrap de schema `helpdesk` en Postgres
 - import inicial de datos `helpdesk` desde SQLite local
+- storage minimo de `helpdesk` sobre Postgres
+- smoke CRUD real de `helpdesk` sobre Render Postgres
 
 ## Archivos
 
 - [Cargo.toml](/C:/Users/Choy/Desktop/rustdesk-monitoring-mvp/Cargo.toml)
 - [src/postgres.rs](/C:/Users/Choy/Desktop/rustdesk-monitoring-mvp/src/postgres.rs)
+- [src/postgres_helpdesk.rs](/C:/Users/Choy/Desktop/rustdesk-monitoring-mvp/src/postgres_helpdesk.rs)
 - [src/bin/render-postgres-smoke.rs](/C:/Users/Choy/Desktop/rustdesk-monitoring-mvp/src/bin/render-postgres-smoke.rs)
 - [src/bin/render-postgres-helpdesk-bootstrap.rs](/C:/Users/Choy/Desktop/rustdesk-monitoring-mvp/src/bin/render-postgres-helpdesk-bootstrap.rs)
+- [src/bin/render-postgres-helpdesk-crud-smoke.rs](/C:/Users/Choy/Desktop/rustdesk-monitoring-mvp/src/bin/render-postgres-helpdesk-crud-smoke.rs)
 
 ## Validado
 
@@ -25,12 +29,14 @@ Se valido contra la base Free creada en Render:
 - creacion de tabla de prueba OK
 - insercion de fila de prueba OK
 - bootstrap del schema de helpdesk OK
+- CRUD real de `helpdesk` OK
 
 Salida observada:
 
 ```text
 Render Postgres OK: select_one=1, smoke_rows=2
 Render Postgres helpdesk bootstrap OK: authorized_agents=0, agents=0, tickets=0, assignments=0, heartbeats=0, audit_events=0
+Render Postgres helpdesk CRUD OK: authorized_agents=1, tickets=1, fetched_ticket=<uuid>, audit_events=2
 ```
 
 ## Como usar
@@ -49,6 +55,13 @@ $env:DATABASE_URL="<external-database-url>"
 cargo run --quiet --bin render-postgres-helpdesk-bootstrap -- --sqlite-path .\data\outbox.db
 ```
 
+### 3. Smoke CRUD de helpdesk
+
+```powershell
+$env:DATABASE_URL="<external-database-url>"
+cargo run --quiet --bin render-postgres-helpdesk-crud-smoke
+```
+
 Notas:
 
 - para pruebas locales usa la `External Database URL`
@@ -60,9 +73,10 @@ Notas:
 - no cambia el backend principal a Postgres
 - no migra `session_events`, `session_presence` ni `outbox_events`
 - no reemplaza `SqlitePool` en `monitoring-server`
+- no integra aun las rutas Axum reales con Postgres
 
 ## Siguiente fase recomendada
 
 1. crear storage Postgres solo para `helpdesk`
-2. leer/escribir tickets/agentes desde Postgres en un modo aislado
+2. integrar lectura/escritura real de tickets/agentes desde Postgres en un modo aislado
 3. dejar sesiones y webhook aun en SQLite hasta validar bien el corte
