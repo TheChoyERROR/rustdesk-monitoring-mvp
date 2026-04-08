@@ -498,10 +498,6 @@ pub async fn run(
             post(create_helpdesk_ticket_agent_report_handler),
         )
         .route(
-            "/api/v1/helpdesk/tickets/:ticket_id/audit",
-            get(list_helpdesk_ticket_audit_handler),
-        )
-        .route(
             "/api/v1/helpdesk/tickets/:ticket_id/resolve",
             post(resolve_helpdesk_ticket_handler),
         )
