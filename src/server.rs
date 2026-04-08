@@ -193,56 +193,6 @@ pub async fn run(
     .await
     .context("failed to seed dashboard supervisor user")?;
 
-    let mut helpdesk_turso = TursoSyncConfig::from_env();
-    if let Some(sync_cfg) = helpdesk_turso.clone() {
-        match initialize_helpdesk_turso_bridge(&pool, &sync_cfg).await {
-            Ok(summary) => {
-                info!(
-                    mode = summary.mode,
-                    local_rows = summary.local_counts.total_rows(),
-                    remote_rows = summary.remote_counts.total_rows(),
-                    local_tickets = summary.local_counts.tickets,
-                    remote_tickets = summary.remote_counts.tickets,
-                    "helpdesk Turso bridge initialized"
-                );
-
-                match initialize_monitoring_turso_bridge(&pool, &sync_cfg).await {
-                    Ok(monitoring_summary) => {
-                        info!(
-                            mode = monitoring_summary.mode,
-                            local_rows = monitoring_summary.local_counts.total_rows(),
-                            remote_rows = monitoring_summary.remote_counts.total_rows(),
-                            local_session_events = monitoring_summary.local_counts.session_events,
-                            remote_session_events = monitoring_summary.remote_counts.session_events,
-                            local_presence_rows = monitoring_summary.local_counts.session_presence,
-                            remote_presence_rows =
-                                monitoring_summary.remote_counts.session_presence,
-                            local_outbox_rows = monitoring_summary.local_counts.outbox_events,
-                            remote_outbox_rows = monitoring_summary.remote_counts.outbox_events,
-                            "monitoring Turso bridge initialized"
-                        );
-                    }
-                    Err(err) => {
-                        error!(
-                            error = %err,
-                            "failed to initialize Turso monitoring bridge; continuing with local SQLite only"
-                        );
-                        helpdesk_turso = None;
-                    }
-                }
-            }
-            Err(err) => {
-                error!(
-                    error = %err,
-                    "failed to initialize Turso helpdesk bridge; continuing with local SQLite only"
-                );
-                helpdesk_turso = None;
-            }
-        }
-    } else {
-        info!("Turso bridges disabled; TURSO_DATABASE_URL/TURSO_AUTH_TOKEN not set");
-    }
-
     let metrics = Arc::new(Metrics::default());
     let dispatcher = WebhookDispatcher::new(config.webhook.clone())?;
     let helpdesk_postgres = match env::var("HELPDESK_POSTGRES_DATABASE_URL")
@@ -263,7 +213,7 @@ pub async fn run(
                     Err(err) => {
                         error!(
                             error = %err,
-                            "failed to initialize Postgres monitoring schema; continuing without Postgres-backed monitoring routes"
+                            "failed to initialize Postgres monitoring schema; continuing without Postgres-backed monitoring runtime"
                         );
                         None
                     }
@@ -271,7 +221,7 @@ pub async fn run(
                 Err(err) => {
                     error!(
                         error = %err,
-                        "failed to initialize Postgres helpdesk schema; continuing without Postgres helpdesk routes"
+                        "failed to initialize Postgres helpdesk schema; continuing without Postgres-backed helpdesk runtime"
                     );
                     None
                 }
@@ -279,13 +229,13 @@ pub async fn run(
             Err(err) => {
                 error!(
                     error = %err,
-                    "failed to initialize helpdesk Postgres pool; continuing without Postgres helpdesk routes"
+                    "failed to initialize Postgres runtime pool; continuing without Postgres-backed runtime"
                 );
                 None
             }
         },
         None => {
-            info!("helpdesk Postgres routes disabled; HELPDESK_POSTGRES_DATABASE_URL/DATABASE_URL not set");
+            info!("Postgres runtime disabled; HELPDESK_POSTGRES_DATABASE_URL/DATABASE_URL not set");
             None
         }
     };
@@ -352,6 +302,63 @@ pub async fn run(
         }
     };
 
+    let mut helpdesk_turso = TursoSyncConfig::from_env();
+    if helpdesk_backend == HelpdeskBackend::Postgres
+        || monitoring_backend == MonitoringBackend::Postgres
+    {
+        if helpdesk_turso.is_some() {
+            info!("Turso bridges disabled because Postgres is the active runtime backend");
+        }
+        helpdesk_turso = None;
+    } else if let Some(sync_cfg) = helpdesk_turso.clone() {
+        match initialize_helpdesk_turso_bridge(&pool, &sync_cfg).await {
+            Ok(summary) => {
+                info!(
+                    mode = summary.mode,
+                    local_rows = summary.local_counts.total_rows(),
+                    remote_rows = summary.remote_counts.total_rows(),
+                    local_tickets = summary.local_counts.tickets,
+                    remote_tickets = summary.remote_counts.tickets,
+                    "helpdesk Turso bridge initialized"
+                );
+
+                match initialize_monitoring_turso_bridge(&pool, &sync_cfg).await {
+                    Ok(monitoring_summary) => {
+                        info!(
+                            mode = monitoring_summary.mode,
+                            local_rows = monitoring_summary.local_counts.total_rows(),
+                            remote_rows = monitoring_summary.remote_counts.total_rows(),
+                            local_session_events = monitoring_summary.local_counts.session_events,
+                            remote_session_events = monitoring_summary.remote_counts.session_events,
+                            local_presence_rows = monitoring_summary.local_counts.session_presence,
+                            remote_presence_rows =
+                                monitoring_summary.remote_counts.session_presence,
+                            local_outbox_rows = monitoring_summary.local_counts.outbox_events,
+                            remote_outbox_rows = monitoring_summary.remote_counts.outbox_events,
+                            "monitoring Turso bridge initialized"
+                        );
+                    }
+                    Err(err) => {
+                        error!(
+                            error = %err,
+                            "failed to initialize Turso monitoring bridge; continuing with local SQLite only"
+                        );
+                        helpdesk_turso = None;
+                    }
+                }
+            }
+            Err(err) => {
+                error!(
+                    error = %err,
+                    "failed to initialize Turso helpdesk bridge; continuing with local SQLite only"
+                );
+                helpdesk_turso = None;
+            }
+        }
+    } else {
+        info!("Turso bridges disabled; TURSO_DATABASE_URL/TURSO_AUTH_TOKEN not set");
+    }
+
     let circuit_breaker = Arc::new(CircuitBreaker::new(
         config.worker.circuit_breaker_threshold,
         config.worker.circuit_breaker_cooldown_ms,
@@ -382,6 +389,11 @@ pub async fn run(
         .route("/api/v1/auth/me", get(auth_me_handler))
         .route("/api/v1/dashboard/summary", get(dashboard_summary_handler))
         .route("/api/v1/events", get(events_list_handler))
+        .route("/api/v1/helpdesk/agents", get(list_helpdesk_agents_handler))
+        .route(
+            "/api/v1/helpdesk/summary",
+            get(get_helpdesk_summary_handler),
+        )
         .route(
             "/api/v1/helpdesk/agent-authorizations",
             get(list_helpdesk_authorized_agents_handler)
@@ -392,100 +404,8 @@ pub async fn run(
             axum::routing::delete(delete_helpdesk_authorized_agent_handler),
         )
         .route(
-            "/api/v1/postgres/helpdesk/agent-authorizations",
-            get(list_helpdesk_authorized_agents_pg_handler)
-                .post(upsert_helpdesk_authorized_agent_pg_handler),
-        )
-        .route(
-            "/api/v1/postgres/helpdesk/agent-authorizations/:agent_id",
-            axum::routing::delete(delete_helpdesk_authorized_agent_pg_handler),
-        )
-        .route(
-            "/api/v1/postgres/helpdesk/agents",
-            get(list_helpdesk_agents_pg_handler),
-        )
-        .route(
-            "/api/v1/postgres/helpdesk/summary",
-            get(get_helpdesk_summary_pg_handler),
-        )
-        .route(
-            "/api/v1/postgres/helpdesk/tickets",
-            get(list_helpdesk_tickets_pg_handler).post(create_helpdesk_ticket_pg_handler),
-        )
-        .route(
-            "/api/v1/postgres/helpdesk/tickets/:ticket_id",
-            get(get_helpdesk_ticket_pg_handler),
-        )
-        .route(
-            "/api/v1/postgres/helpdesk/tickets/:ticket_id/assign",
-            post(assign_helpdesk_ticket_pg_handler),
-        )
-        .route(
-            "/api/v1/postgres/helpdesk/tickets/:ticket_id/operational",
-            post(update_helpdesk_ticket_operational_pg_handler),
-        )
-        .route(
-            "/api/v1/postgres/helpdesk/tickets/:ticket_id/report",
-            post(create_helpdesk_ticket_agent_report_pg_handler),
-        )
-        .route(
-            "/api/v1/postgres/helpdesk/tickets/:ticket_id/audit",
-            get(list_helpdesk_ticket_audit_pg_handler),
-        )
-        .route(
-            "/api/v1/postgres/helpdesk/tickets/:ticket_id/resolve",
-            post(resolve_helpdesk_ticket_pg_handler),
-        )
-        .route(
-            "/api/v1/postgres/helpdesk/tickets/:ticket_id/requeue",
-            post(requeue_helpdesk_ticket_pg_handler),
-        )
-        .route(
-            "/api/v1/postgres/helpdesk/tickets/:ticket_id/cancel",
-            post(cancel_helpdesk_ticket_pg_handler),
-        )
-        .route(
-            "/api/v1/sessions/:session_id/timeline",
-            get(session_timeline_handler),
-        )
-        .route(
-            "/api/v1/reports/sessions.csv",
-            get(sessions_report_csv_handler),
-        )
-        .route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            require_dashboard_auth,
-        ));
-
-    let mut router = Router::new()
-        .route("/health", get(health_handler))
-        .route("/metrics", get(metrics_handler))
-        .route("/api/v1/auth/login", post(auth_login_handler))
-        .route("/api/v1/auth/logout", post(auth_logout_handler))
-        .route("/api/v1/helpdesk/agents", get(list_helpdesk_agents_handler))
-        .route(
-            "/api/v1/helpdesk/agents/presence",
-            post(upsert_helpdesk_agent_presence_handler),
-        )
-        .route(
-            "/api/v1/helpdesk/agents/:agent_id/authorization",
-            get(get_helpdesk_agent_authorization_handler),
-        )
-        .route(
-            "/api/v1/helpdesk/summary",
-            get(get_helpdesk_summary_handler),
-        )
-        .route(
-            "/api/v1/helpdesk/agents/:agent_id/assignment",
-            get(get_helpdesk_assignment_for_agent_handler),
-        )
-        .route(
-            "/api/v1/helpdesk/agents/:agent_id/assignment/start",
-            post(start_helpdesk_assignment_handler),
-        )
-        .route(
             "/api/v1/helpdesk/tickets",
-            get(list_helpdesk_tickets_handler).post(create_helpdesk_ticket_handler),
+            get(list_helpdesk_tickets_handler),
         )
         .route(
             "/api/v1/helpdesk/tickets/:ticket_id",
@@ -496,20 +416,8 @@ pub async fn run(
             post(assign_helpdesk_ticket_handler),
         )
         .route(
-            "/api/v1/helpdesk/tickets/:ticket_id/operational",
-            post(update_helpdesk_ticket_operational_handler),
-        )
-        .route(
-            "/api/v1/helpdesk/tickets/:ticket_id/report",
-            post(create_helpdesk_ticket_agent_report_handler),
-        )
-        .route(
             "/api/v1/helpdesk/tickets/:ticket_id/audit",
             get(list_helpdesk_ticket_audit_handler),
-        )
-        .route(
-            "/api/v1/helpdesk/tickets/:ticket_id/resolve",
-            post(resolve_helpdesk_ticket_handler),
         )
         .route(
             "/api/v1/helpdesk/tickets/:ticket_id/requeue",
@@ -530,6 +438,60 @@ pub async fn run(
         .route(
             "/api/v1/sessions/:session_id/presence/stream",
             get(stream_session_presence_handler),
+        )
+        .route(
+            "/api/v1/sessions/:session_id/timeline",
+            get(session_timeline_handler),
+        )
+        .route(
+            "/api/v1/reports/sessions.csv",
+            get(sessions_report_csv_handler),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_dashboard_auth,
+        ));
+
+    let mut router = Router::new()
+        .route("/health", get(health_handler))
+        .route("/metrics", get(metrics_handler))
+        .route("/api/v1/auth/login", post(auth_login_handler))
+        .route("/api/v1/auth/logout", post(auth_logout_handler))
+        .route(
+            "/api/v1/helpdesk/agents/presence",
+            post(upsert_helpdesk_agent_presence_handler),
+        )
+        .route(
+            "/api/v1/helpdesk/agents/:agent_id/authorization",
+            get(get_helpdesk_agent_authorization_handler),
+        )
+        .route(
+            "/api/v1/helpdesk/agents/:agent_id/assignment",
+            get(get_helpdesk_assignment_for_agent_handler),
+        )
+        .route(
+            "/api/v1/helpdesk/agents/:agent_id/assignment/start",
+            post(start_helpdesk_assignment_handler),
+        )
+        .route(
+            "/api/v1/helpdesk/tickets",
+            post(create_helpdesk_ticket_handler),
+        )
+        .route(
+            "/api/v1/helpdesk/tickets/:ticket_id/operational",
+            post(update_helpdesk_ticket_operational_handler),
+        )
+        .route(
+            "/api/v1/helpdesk/tickets/:ticket_id/report",
+            post(create_helpdesk_ticket_agent_report_handler),
+        )
+        .route(
+            "/api/v1/helpdesk/tickets/:ticket_id/audit",
+            get(list_helpdesk_ticket_audit_handler),
+        )
+        .route(
+            "/api/v1/helpdesk/tickets/:ticket_id/resolve",
+            post(resolve_helpdesk_ticket_handler),
         )
         .route(
             "/api/v1/session-events",
@@ -1052,8 +1014,12 @@ async fn create_helpdesk_ticket_for_active_backend(
     state: &AppState,
     payload: &HelpdeskTicketCreateRequestV1,
 ) -> anyhow::Result<crate::model::HelpdeskTicketV1> {
+    let mut sanitized_payload = payload.clone();
+    sanitized_payload.difficulty = None;
+    sanitized_payload.estimated_minutes = None;
+
     if let Some(pool) = active_helpdesk_postgres_pool(state) {
-        match create_helpdesk_ticket_pg(pool, payload).await {
+        match create_helpdesk_ticket_pg(pool, &sanitized_payload).await {
             Ok(ticket) => return Ok(ticket),
             Err(err) if state.sqlite_fallback_enabled => {
                 warn!(
@@ -1066,7 +1032,7 @@ async fn create_helpdesk_ticket_for_active_backend(
         }
     }
 
-    create_helpdesk_ticket(&state.pool, payload).await
+    create_helpdesk_ticket(&state.pool, &sanitized_payload).await
 }
 
 async fn assign_helpdesk_ticket_for_active_backend(
@@ -1289,22 +1255,6 @@ async fn list_helpdesk_authorized_agents_handler(
     }
 }
 
-async fn list_helpdesk_authorized_agents_pg_handler(
-    State(state): State<AppState>,
-) -> impl IntoResponse {
-    let Some(pool) = state.helpdesk_postgres.as_ref() else {
-        return service_unavailable("helpdesk_postgres_not_configured");
-    };
-
-    match list_helpdesk_authorized_agents_pg(pool).await {
-        Ok(agents) => (StatusCode::OK, Json(json!({ "agents": agents }))).into_response(),
-        Err(err) => {
-            error!(error = %err, "failed to list Postgres authorized helpdesk agents");
-            internal_error()
-        }
-    }
-}
-
 async fn upsert_helpdesk_authorized_agent_handler(
     State(state): State<AppState>,
     Json(payload): Json<HelpdeskAuthorizedAgentUpsertRequestV1>,
@@ -1323,34 +1273,6 @@ async fn upsert_helpdesk_authorized_agent_handler(
                 error = %err,
                 agent_id = payload.agent_id,
                 "failed to upsert authorized helpdesk agent"
-            );
-            internal_error()
-        }
-    }
-}
-
-async fn upsert_helpdesk_authorized_agent_pg_handler(
-    State(state): State<AppState>,
-    Json(payload): Json<HelpdeskAuthorizedAgentUpsertRequestV1>,
-) -> impl IntoResponse {
-    let Some(pool) = state.helpdesk_postgres.as_ref() else {
-        return service_unavailable("helpdesk_postgres_not_configured");
-    };
-
-    if let Err(validation_error) = payload.validate() {
-        return bad_request(validation_error.to_string());
-    }
-
-    match upsert_helpdesk_authorized_agent_pg(pool, &payload).await {
-        Ok(agent) => (StatusCode::OK, Json(json!({ "agent": agent }))).into_response(),
-        Err(err) => {
-            if err.to_string().contains("display name '") {
-                return bad_request(err.to_string());
-            }
-            error!(
-                error = %err,
-                agent_id = payload.agent_id,
-                "failed to upsert Postgres authorized helpdesk agent"
             );
             internal_error()
         }
@@ -1383,36 +1305,6 @@ async fn delete_helpdesk_authorized_agent_handler(
     }
 }
 
-async fn delete_helpdesk_authorized_agent_pg_handler(
-    State(state): State<AppState>,
-    AxumPath(agent_id): AxumPath<String>,
-) -> impl IntoResponse {
-    let Some(pool) = state.helpdesk_postgres.as_ref() else {
-        return service_unavailable("helpdesk_postgres_not_configured");
-    };
-
-    let agent_id = agent_id.trim().to_string();
-    if agent_id.is_empty() {
-        return bad_request("agent_id cannot be empty");
-    }
-
-    match delete_helpdesk_authorized_agent_pg(pool, &agent_id).await {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => (
-            StatusCode::NOT_FOUND,
-            Json(json!({
-                "error": "not_found",
-                "message": "Authorized agent was not found",
-            })),
-        )
-            .into_response(),
-        Err(err) => {
-            error!(error = %err, agent_id, "failed to delete Postgres authorized helpdesk agent");
-            internal_error()
-        }
-    }
-}
-
 async fn get_helpdesk_agent_authorization_handler(
     State(state): State<AppState>,
     AxumPath(agent_id): AxumPath<String>,
@@ -1436,34 +1328,6 @@ async fn get_helpdesk_summary_handler(State(state): State<AppState>) -> impl Int
         Ok(summary) => (StatusCode::OK, Json(summary)).into_response(),
         Err(err) => {
             error!(error = %err, "failed to get helpdesk operational summary");
-            internal_error()
-        }
-    }
-}
-
-async fn get_helpdesk_summary_pg_handler(State(state): State<AppState>) -> impl IntoResponse {
-    let Some(pool) = state.helpdesk_postgres.as_ref() else {
-        return service_unavailable("helpdesk_postgres_not_configured");
-    };
-
-    match get_helpdesk_operational_summary_pg(pool).await {
-        Ok(summary) => (StatusCode::OK, Json(summary)).into_response(),
-        Err(err) => {
-            error!(error = %err, "failed to get Postgres helpdesk operational summary");
-            internal_error()
-        }
-    }
-}
-
-async fn list_helpdesk_agents_pg_handler(State(state): State<AppState>) -> impl IntoResponse {
-    let Some(pool) = state.helpdesk_postgres.as_ref() else {
-        return service_unavailable("helpdesk_postgres_not_configured");
-    };
-
-    match list_helpdesk_agents_pg(pool).await {
-        Ok(agents) => (StatusCode::OK, Json(json!({ "agents": agents }))).into_response(),
-        Err(err) => {
-            error!(error = %err, "failed to list Postgres helpdesk agents");
             internal_error()
         }
     }
@@ -1557,20 +1421,6 @@ async fn list_helpdesk_tickets_handler(State(state): State<AppState>) -> impl In
     }
 }
 
-async fn list_helpdesk_tickets_pg_handler(State(state): State<AppState>) -> impl IntoResponse {
-    let Some(pool) = state.helpdesk_postgres.as_ref() else {
-        return service_unavailable("helpdesk_postgres_not_configured");
-    };
-
-    match list_helpdesk_tickets_pg(pool).await {
-        Ok(tickets) => (StatusCode::OK, Json(json!({ "tickets": tickets }))).into_response(),
-        Err(err) => {
-            error!(error = %err, "failed to list Postgres helpdesk tickets");
-            internal_error()
-        }
-    }
-}
-
 async fn get_helpdesk_ticket_handler(
     State(state): State<AppState>,
     AxumPath(ticket_id): AxumPath<String>,
@@ -1592,36 +1442,6 @@ async fn get_helpdesk_ticket_handler(
             .into_response(),
         Err(err) => {
             error!(error = %err, ticket_id, "failed to get helpdesk ticket");
-            internal_error()
-        }
-    }
-}
-
-async fn get_helpdesk_ticket_pg_handler(
-    State(state): State<AppState>,
-    AxumPath(ticket_id): AxumPath<String>,
-) -> impl IntoResponse {
-    let Some(pool) = state.helpdesk_postgres.as_ref() else {
-        return service_unavailable("helpdesk_postgres_not_configured");
-    };
-
-    let ticket_id = ticket_id.trim().to_string();
-    if ticket_id.is_empty() {
-        return bad_request("ticket_id cannot be empty");
-    }
-
-    match get_helpdesk_ticket_pg(pool, &ticket_id).await {
-        Ok(Some(ticket)) => (StatusCode::OK, Json(json!({ "ticket": ticket }))).into_response(),
-        Ok(None) => (
-            StatusCode::NOT_FOUND,
-            Json(json!({
-                "error": "ticket_not_found",
-                "ticket_id": ticket_id,
-            })),
-        )
-            .into_response(),
-        Err(err) => {
-            error!(error = %err, ticket_id, "failed to get Postgres helpdesk ticket");
             internal_error()
         }
     }
@@ -1654,37 +1474,6 @@ async fn list_helpdesk_ticket_audit_handler(
     }
 }
 
-async fn list_helpdesk_ticket_audit_pg_handler(
-    State(state): State<AppState>,
-    AxumPath(ticket_id): AxumPath<String>,
-    Query(query): Query<HelpdeskAuditQuery>,
-) -> impl IntoResponse {
-    let Some(pool) = state.helpdesk_postgres.as_ref() else {
-        return service_unavailable("helpdesk_postgres_not_configured");
-    };
-
-    let ticket_id = ticket_id.trim().to_string();
-    if ticket_id.is_empty() {
-        return bad_request("ticket_id cannot be empty");
-    }
-
-    let limit = query.limit.unwrap_or(100).clamp(1, 500) as usize;
-    match list_helpdesk_ticket_audit_pg(pool, &ticket_id).await {
-        Ok(events) => (
-            StatusCode::OK,
-            Json(json!({
-                "events": events.into_iter().take(limit).collect::<Vec<_>>(),
-                "ticket_id": ticket_id,
-            })),
-        )
-            .into_response(),
-        Err(err) => {
-            error!(error = %err, ticket_id, "failed to list Postgres helpdesk ticket audit");
-            internal_error()
-        }
-    }
-}
-
 async fn create_helpdesk_ticket_handler(
     State(state): State<AppState>,
     Json(payload): Json<HelpdeskTicketCreateRequestV1>,
@@ -1698,73 +1487,6 @@ async fn create_helpdesk_ticket_handler(
         Err(err) => {
             error!(error = %err, client_id = payload.client_id, "failed to create helpdesk ticket");
             internal_error()
-        }
-    }
-}
-
-async fn create_helpdesk_ticket_pg_handler(
-    State(state): State<AppState>,
-    Json(payload): Json<HelpdeskTicketCreateRequestV1>,
-) -> impl IntoResponse {
-    let Some(pool) = state.helpdesk_postgres.as_ref() else {
-        return service_unavailable("helpdesk_postgres_not_configured");
-    };
-
-    if let Err(validation_error) = payload.validate() {
-        return bad_request(validation_error.to_string());
-    }
-
-    match create_helpdesk_ticket_pg(pool, &payload).await {
-        Ok(ticket) => (StatusCode::CREATED, Json(json!({ "ticket": ticket }))).into_response(),
-        Err(err) => {
-            error!(error = %err, "failed to create Postgres helpdesk ticket");
-            internal_error()
-        }
-    }
-}
-
-async fn assign_helpdesk_ticket_pg_handler(
-    State(state): State<AppState>,
-    AxumPath(ticket_id): AxumPath<String>,
-    Json(payload): Json<HelpdeskTicketAssignRequestV1>,
-) -> impl IntoResponse {
-    let Some(pool) = state.helpdesk_postgres.as_ref() else {
-        return service_unavailable("helpdesk_postgres_not_configured");
-    };
-
-    let ticket_id = ticket_id.trim().to_string();
-    if ticket_id.is_empty() {
-        return bad_request("ticket_id cannot be empty");
-    }
-
-    if let Err(validation_error) = payload.validate() {
-        return bad_request(validation_error.to_string());
-    }
-
-    match assign_helpdesk_ticket_pg(
-        pool,
-        &ticket_id,
-        payload.agent_id.as_deref(),
-        payload.reason.as_deref(),
-    )
-    .await
-    {
-        Ok((ticket, agent)) => (
-            StatusCode::OK,
-            Json(json!({
-                "ticket": ticket,
-                "agent": agent,
-            })),
-        )
-            .into_response(),
-        Err(err) => {
-            error!(
-                error = %err,
-                ticket_id,
-                agent_id = payload.agent_id,
-                "failed to assign Postgres helpdesk ticket"
-            );
-            bad_request(err.to_string())
         }
     }
 }
@@ -1807,56 +1529,6 @@ async fn assign_helpdesk_ticket_handler(
                 "failed to assign helpdesk ticket"
             );
             bad_request(err.to_string())
-        }
-    }
-}
-
-async fn update_helpdesk_ticket_operational_pg_handler(
-    State(state): State<AppState>,
-    AxumPath(ticket_id): AxumPath<String>,
-    Json(payload): Json<HelpdeskTicketOperationalUpdateRequestV1>,
-) -> impl IntoResponse {
-    let Some(pool) = state.helpdesk_postgres.as_ref() else {
-        return service_unavailable("helpdesk_postgres_not_configured");
-    };
-
-    let ticket_id = ticket_id.trim().to_string();
-    if ticket_id.is_empty() {
-        return bad_request("ticket_id cannot be empty");
-    }
-
-    if let Err(validation_error) = payload.validate() {
-        return bad_request(validation_error.to_string());
-    }
-
-    match update_helpdesk_ticket_operational_fields_pg(
-        pool,
-        &ticket_id,
-        payload.difficulty.as_deref(),
-        payload.estimated_minutes,
-    )
-    .await
-    {
-        Ok(ticket) => (
-            StatusCode::OK,
-            Json(json!({
-                "ticket": ticket,
-            })),
-        )
-            .into_response(),
-        Err(err) => {
-            if err
-                .to_string()
-                .contains("can no longer be updated operationally")
-            {
-                return bad_request(err.to_string());
-            }
-            error!(
-                error = %err,
-                ticket_id,
-                "failed to update Postgres helpdesk ticket operational fields"
-            );
-            internal_error()
         }
     }
 }
@@ -1907,46 +1579,6 @@ async fn update_helpdesk_ticket_operational_handler(
     }
 }
 
-async fn create_helpdesk_ticket_agent_report_pg_handler(
-    State(state): State<AppState>,
-    AxumPath(ticket_id): AxumPath<String>,
-    Json(payload): Json<HelpdeskTicketAgentReportCreateRequestV1>,
-) -> impl IntoResponse {
-    let Some(pool) = state.helpdesk_postgres.as_ref() else {
-        return service_unavailable("helpdesk_postgres_not_configured");
-    };
-
-    let ticket_id = ticket_id.trim().to_string();
-    if ticket_id.is_empty() {
-        return bad_request("ticket_id cannot be empty");
-    }
-
-    if let Err(validation_error) = payload.validate() {
-        return bad_request(validation_error.to_string());
-    }
-
-    match add_helpdesk_ticket_agent_report_pg(pool, &ticket_id, &payload.agent_id, &payload.note)
-        .await
-    {
-        Ok(ticket) => (
-            StatusCode::OK,
-            Json(json!({
-                "ticket": ticket,
-            })),
-        )
-            .into_response(),
-        Err(err) => {
-            error!(
-                error = %err,
-                ticket_id,
-                agent_id = payload.agent_id,
-                "failed to create Postgres helpdesk agent report"
-            );
-            bad_request(err.to_string())
-        }
-    }
-}
-
 async fn create_helpdesk_ticket_agent_report_handler(
     State(state): State<AppState>,
     AxumPath(ticket_id): AxumPath<String>,
@@ -1982,44 +1614,6 @@ async fn create_helpdesk_ticket_agent_report_handler(
                 ticket_id,
                 agent_id = payload.agent_id,
                 "failed to create helpdesk agent report"
-            );
-            bad_request(err.to_string())
-        }
-    }
-}
-
-async fn resolve_helpdesk_ticket_pg_handler(
-    State(state): State<AppState>,
-    AxumPath(ticket_id): AxumPath<String>,
-    Json(payload): Json<HelpdeskTicketResolveRequestV1>,
-) -> impl IntoResponse {
-    let Some(pool) = state.helpdesk_postgres.as_ref() else {
-        return service_unavailable("helpdesk_postgres_not_configured");
-    };
-
-    if let Err(validation_error) = payload.validate() {
-        return bad_request(validation_error.to_string());
-    }
-
-    let next_agent_status = payload
-        .next_agent_status
-        .unwrap_or(HelpdeskAgentStatus::Available);
-
-    match resolve_helpdesk_ticket_pg(pool, &ticket_id, &payload.agent_id, next_agent_status).await {
-        Ok((ticket, agent)) => (
-            StatusCode::OK,
-            Json(json!({
-                "ticket": ticket,
-                "agent": agent,
-            })),
-        )
-            .into_response(),
-        Err(err) => {
-            error!(
-                error = %err,
-                ticket_id,
-                agent_id = payload.agent_id,
-                "failed to resolve Postgres helpdesk ticket"
             );
             bad_request(err.to_string())
         }
@@ -2067,46 +1661,6 @@ async fn resolve_helpdesk_ticket_handler(
     }
 }
 
-async fn requeue_helpdesk_ticket_pg_handler(
-    State(state): State<AppState>,
-    AxumPath(ticket_id): AxumPath<String>,
-    Json(payload): Json<HelpdeskTicketSupervisorActionRequestV1>,
-) -> impl IntoResponse {
-    let Some(pool) = state.helpdesk_postgres.as_ref() else {
-        return service_unavailable("helpdesk_postgres_not_configured");
-    };
-
-    if let Err(validation_error) = payload.validate() {
-        return bad_request(validation_error.to_string());
-    }
-
-    let next_agent_status = payload
-        .next_agent_status
-        .unwrap_or(HelpdeskAgentStatus::Available);
-
-    match requeue_helpdesk_ticket_pg(
-        pool,
-        &ticket_id,
-        next_agent_status,
-        payload.reason.as_deref(),
-    )
-    .await
-    {
-        Ok((ticket, agent)) => (
-            StatusCode::OK,
-            Json(json!({
-                "ticket": ticket,
-                "agent": agent,
-            })),
-        )
-            .into_response(),
-        Err(err) => {
-            error!(error = %err, ticket_id, "failed to requeue Postgres helpdesk ticket");
-            bad_request(err.to_string())
-        }
-    }
-}
-
 async fn requeue_helpdesk_ticket_handler(
     State(state): State<AppState>,
     AxumPath(ticket_id): AxumPath<String>,
@@ -2138,46 +1692,6 @@ async fn requeue_helpdesk_ticket_handler(
             .into_response(),
         Err(err) => {
             error!(error = %err, ticket_id, "failed to requeue helpdesk ticket");
-            bad_request(err.to_string())
-        }
-    }
-}
-
-async fn cancel_helpdesk_ticket_pg_handler(
-    State(state): State<AppState>,
-    AxumPath(ticket_id): AxumPath<String>,
-    Json(payload): Json<HelpdeskTicketSupervisorActionRequestV1>,
-) -> impl IntoResponse {
-    let Some(pool) = state.helpdesk_postgres.as_ref() else {
-        return service_unavailable("helpdesk_postgres_not_configured");
-    };
-
-    if let Err(validation_error) = payload.validate() {
-        return bad_request(validation_error.to_string());
-    }
-
-    let next_agent_status = payload
-        .next_agent_status
-        .unwrap_or(HelpdeskAgentStatus::Available);
-
-    match cancel_helpdesk_ticket_pg(
-        pool,
-        &ticket_id,
-        next_agent_status,
-        payload.reason.as_deref(),
-    )
-    .await
-    {
-        Ok((ticket, agent)) => (
-            StatusCode::OK,
-            Json(json!({
-                "ticket": ticket,
-                "agent": agent,
-            })),
-        )
-            .into_response(),
-        Err(err) => {
-            error!(error = %err, ticket_id, "failed to cancel Postgres helpdesk ticket");
             bad_request(err.to_string())
         }
     }
@@ -2949,16 +2463,6 @@ fn forbidden(message: impl Into<String>) -> Response {
         Json(json!({
             "error": "forbidden",
             "message": message.into(),
-        })),
-    )
-        .into_response()
-}
-
-fn service_unavailable(code: impl Into<String>) -> Response {
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(json!({
-            "error": code.into(),
         })),
     )
         .into_response()

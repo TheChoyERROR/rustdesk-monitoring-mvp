@@ -151,8 +151,6 @@ export default function HelpdeskPage() {
     clientDisplayName: '',
     title: '',
     description: '',
-    difficulty: 'medium',
-    estimatedMinutes: '30',
     preferredAgentId: 'auto',
   });
 
@@ -335,8 +333,6 @@ export default function HelpdeskPage() {
           client_display_name: createForm.clientDisplayName.trim() || undefined,
           title: createForm.title.trim() || undefined,
           description: createForm.description.trim() || undefined,
-          difficulty: createForm.difficulty.trim() || undefined,
-          estimated_minutes: Number.parseInt(createForm.estimatedMinutes.trim(), 10) || undefined,
           summary: createForm.title.trim() || undefined,
           preferred_agent_id: preferredAgentId,
         });
@@ -373,7 +369,6 @@ export default function HelpdeskPage() {
           clientDisplayName: '',
           title: '',
           description: '',
-          estimatedMinutes: '30',
         }));
         await load(true);
       } catch (createError) {
@@ -578,8 +573,8 @@ export default function HelpdeskPage() {
         <div>
           <h2>Crear ticket</h2>
           <p className="activity-summary-line">
-            Crea el ticket desde la web usando el RustDesk ID de la maquina. Ahora puedes registrar
-            titulo, descripcion, dificultad y tiempo estimado antes de despacharlo.
+            Crea el ticket desde la web usando el RustDesk ID de la maquina.
+            La dificultad y el tiempo estimado se definen despues por el supervisor o el agente.
           </p>
           <p className="activity-summary-line">
             Agentes disponibles ahora: <strong>{availableAgents.length}</strong>
@@ -643,41 +638,6 @@ export default function HelpdeskPage() {
                   setCreateForm((current) => ({ ...current, title: event.target.value }))
                 }
                 placeholder="No puede abrir el sistema contable"
-                required
-              />
-            </div>
-            <div>
-              <label htmlFor="helpdesk-difficulty">Dificultad</label>
-              <select
-                id="helpdesk-difficulty"
-                value={createForm.difficulty}
-                onChange={(event) =>
-                  setCreateForm((current) => ({
-                    ...current,
-                    difficulty: event.target.value,
-                  }))
-                }
-              >
-                <option value="low">Baja</option>
-                <option value="medium">Media</option>
-                <option value="high">Alta</option>
-              </select>
-            </div>
-            <div>
-              <label htmlFor="helpdesk-estimated">Tiempo aprox. (min)</label>
-              <input
-                id="helpdesk-estimated"
-                type="number"
-                min="1"
-                step="1"
-                value={createForm.estimatedMinutes}
-                onChange={(event) =>
-                  setCreateForm((current) => ({
-                    ...current,
-                    estimatedMinutes: event.target.value,
-                  }))
-                }
-                placeholder="30"
                 required
               />
             </div>
