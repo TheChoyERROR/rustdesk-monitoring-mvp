@@ -36,8 +36,10 @@ use crate::model::{
 };
 use crate::postgres::{connect_postgres, init_postgres_helpdesk_schema};
 use crate::postgres_helpdesk::{
-    create_helpdesk_ticket_pg, get_helpdesk_ticket_pg, list_helpdesk_authorized_agents_pg,
-    list_helpdesk_ticket_audit_pg, list_helpdesk_tickets_pg, upsert_helpdesk_authorized_agent_pg,
+    create_helpdesk_ticket_pg, delete_helpdesk_authorized_agent_pg,
+    get_helpdesk_operational_summary_pg, get_helpdesk_ticket_pg, list_helpdesk_agents_pg,
+    list_helpdesk_authorized_agents_pg, list_helpdesk_ticket_audit_pg, list_helpdesk_tickets_pg,
+    upsert_helpdesk_authorized_agent_pg,
 };
 use crate::storage::{
     add_helpdesk_ticket_agent_report, assign_helpdesk_ticket, cancel_helpdesk_ticket, claim_due_events,
@@ -293,6 +295,18 @@ pub async fn run(
             "/api/v1/postgres/helpdesk/agent-authorizations",
             get(list_helpdesk_authorized_agents_pg_handler)
                 .post(upsert_helpdesk_authorized_agent_pg_handler),
+        )
+        .route(
+            "/api/v1/postgres/helpdesk/agent-authorizations/:agent_id",
+            axum::routing::delete(delete_helpdesk_authorized_agent_pg_handler),
+        )
+        .route(
+            "/api/v1/postgres/helpdesk/agents",
+            get(list_helpdesk_agents_pg_handler),
+        )
+        .route(
+            "/api/v1/postgres/helpdesk/summary",
+            get(get_helpdesk_summary_pg_handler),
         )
         .route(
             "/api/v1/postgres/helpdesk/tickets",
@@ -636,6 +650,36 @@ async fn delete_helpdesk_authorized_agent_handler(
     }
 }
 
+async fn delete_helpdesk_authorized_agent_pg_handler(
+    State(state): State<AppState>,
+    AxumPath(agent_id): AxumPath<String>,
+) -> impl IntoResponse {
+    let Some(pool) = state.helpdesk_postgres.as_ref() else {
+        return service_unavailable("helpdesk_postgres_not_configured");
+    };
+
+    let agent_id = agent_id.trim().to_string();
+    if agent_id.is_empty() {
+        return bad_request("agent_id cannot be empty");
+    }
+
+    match delete_helpdesk_authorized_agent_pg(pool, &agent_id).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "error": "not_found",
+                "message": "Authorized agent was not found",
+            })),
+        )
+            .into_response(),
+        Err(err) => {
+            error!(error = %err, agent_id, "failed to delete Postgres authorized helpdesk agent");
+            internal_error()
+        }
+    }
+}
+
 async fn get_helpdesk_agent_authorization_handler(
     State(state): State<AppState>,
     AxumPath(agent_id): AxumPath<String>,
@@ -659,6 +703,34 @@ async fn get_helpdesk_summary_handler(State(state): State<AppState>) -> impl Int
         Ok(summary) => (StatusCode::OK, Json(summary)).into_response(),
         Err(err) => {
             error!(error = %err, "failed to get helpdesk operational summary");
+            internal_error()
+        }
+    }
+}
+
+async fn get_helpdesk_summary_pg_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let Some(pool) = state.helpdesk_postgres.as_ref() else {
+        return service_unavailable("helpdesk_postgres_not_configured");
+    };
+
+    match get_helpdesk_operational_summary_pg(pool).await {
+        Ok(summary) => (StatusCode::OK, Json(summary)).into_response(),
+        Err(err) => {
+            error!(error = %err, "failed to get Postgres helpdesk operational summary");
+            internal_error()
+        }
+    }
+}
+
+async fn list_helpdesk_agents_pg_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let Some(pool) = state.helpdesk_postgres.as_ref() else {
+        return service_unavailable("helpdesk_postgres_not_configured");
+    };
+
+    match list_helpdesk_agents_pg(pool).await {
+        Ok(agents) => (StatusCode::OK, Json(json!({ "agents": agents }))).into_response(),
+        Err(err) => {
+            error!(error = %err, "failed to list Postgres helpdesk agents");
             internal_error()
         }
     }

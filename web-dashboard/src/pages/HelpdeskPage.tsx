@@ -9,6 +9,8 @@ import {
   apiHelpdeskCreateTicket,
   apiHelpdeskSummary,
   apiHelpdeskTickets,
+  getHelpdeskBackendMode,
+  type HelpdeskBackendMode,
 } from '../api';
 import { formatDateTime } from '../lib/time';
 import type {
@@ -128,6 +130,8 @@ type CreateFeedback =
   | null;
 
 export default function HelpdeskPage() {
+  const [helpdeskBackendMode, setHelpdeskBackendMode] =
+    useState<HelpdeskBackendMode>(getHelpdeskBackendMode());
   const [summary, setSummary] = useState<HelpdeskOperationalSummary | null>(null);
   const [agents, setAgents] = useState<HelpdeskAgent[]>([]);
   const [authorizedAgents, setAuthorizedAgents] = useState<HelpdeskAuthorizedAgent[]>([]);
@@ -188,11 +192,35 @@ export default function HelpdeskPage() {
   }, [load]);
 
   useEffect(() => {
+    const syncMode = () => {
+      setHelpdeskBackendMode(getHelpdeskBackendMode());
+    };
+
+    const onStorage = (event: StorageEvent) => {
+      if (event.key === 'helpdesk_backend_mode') {
+        syncMode();
+      }
+    };
+
+    window.addEventListener('helpdesk-backend-mode-changed', syncMode);
+    window.addEventListener('storage', onStorage);
+
+    return () => {
+      window.removeEventListener('helpdesk-backend-mode-changed', syncMode);
+      window.removeEventListener('storage', onStorage);
+    };
+  }, []);
+
+  useEffect(() => {
     const timer = window.setInterval(() => {
       void load(true);
     }, 5000);
     return () => window.clearInterval(timer);
-  }, [load]);
+  }, [load, helpdeskBackendMode]);
+
+  useEffect(() => {
+    void load();
+  }, [helpdeskBackendMode, load]);
 
   const filteredTickets = useMemo(() => {
     return tickets.filter((ticket) => ticketFilter === 'all' || ticket.status === ticketFilter);
@@ -240,6 +268,21 @@ export default function HelpdeskPage() {
       setCreateForm((current) => ({ ...current, preferredAgentId: 'auto' }));
     }
   }, [availableAgents, createForm.preferredAgentId]);
+
+  useEffect(() => {
+    if (helpdeskBackendMode !== 'postgres') {
+      return;
+    }
+
+    setCreateForm((current) =>
+      current.preferredAgentId === 'auto'
+        ? current
+        : {
+            ...current,
+            preferredAgentId: 'auto',
+          },
+    );
+  }, [helpdeskBackendMode]);
 
   const activeQueue = summary
     ? summary.tickets_new + summary.tickets_queued + summary.tickets_opening
@@ -335,11 +378,14 @@ export default function HelpdeskPage() {
           client_display_name: createForm.clientDisplayName.trim() || undefined,
           title: createForm.title.trim() || undefined,
           description: createForm.description.trim() || undefined,
-          difficulty: createForm.difficulty.trim() || undefined,
+          difficulty:
+            helpdeskBackendMode === 'postgres' ? undefined : createForm.difficulty.trim() || undefined,
           estimated_minutes:
-            Number.parseInt(createForm.estimatedMinutes.trim(), 10) || undefined,
+            helpdeskBackendMode === 'postgres'
+              ? undefined
+              : Number.parseInt(createForm.estimatedMinutes.trim(), 10) || undefined,
           summary: createForm.title.trim() || undefined,
-          preferred_agent_id: preferredAgentId,
+          preferred_agent_id: helpdeskBackendMode === 'postgres' ? undefined : preferredAgentId,
         });
 
         const assignedAgentId = ticket.assigned_agent_id?.trim() || '';
@@ -386,7 +432,7 @@ export default function HelpdeskPage() {
         setCreateBusy(false);
       }
     },
-    [agents, createForm, load],
+    [agents, createForm, helpdeskBackendMode, load],
   );
 
   return (
@@ -396,6 +442,12 @@ export default function HelpdeskPage() {
           <h2>Operacion Helpdesk</h2>
           <p className="activity-summary-line">
             Cola activa, agentes y tickets en tiempo real.
+          </p>
+          <p className="activity-summary-line">
+            Backend activo:{' '}
+            <strong>
+              {helpdeskBackendMode === 'postgres' ? 'Postgres experimental' : 'SQLite actual'}
+            </strong>
           </p>
         </div>
         <button type="button" className="btn primary" onClick={() => void load()} disabled={refreshing}>
@@ -585,6 +637,12 @@ export default function HelpdeskPage() {
           <p className="activity-summary-line">
             Agentes disponibles ahora: <strong>{availableAgents.length}</strong>
           </p>
+          {helpdeskBackendMode === 'postgres' ? (
+            <p className="activity-summary-line">
+              En modo Postgres solo estamos probando autorizaciones, resumen, listado y creacion
+              basica de tickets. El despacho y los campos operativos siguen en SQLite.
+            </p>
+          ) : null}
         </div>
 
         <form className="stack" onSubmit={(event) => void handleCreateTicket(event)}>
@@ -620,6 +678,7 @@ export default function HelpdeskPage() {
               <select
                 id="helpdesk-preferred-agent"
                 value={createForm.preferredAgentId}
+                disabled={helpdeskBackendMode === 'postgres'}
                 onChange={(event) =>
                   setCreateForm((current) => ({
                     ...current,
@@ -652,6 +711,7 @@ export default function HelpdeskPage() {
               <select
                 id="helpdesk-difficulty"
                 value={createForm.difficulty}
+                disabled={helpdeskBackendMode === 'postgres'}
                 onChange={(event) =>
                   setCreateForm((current) => ({
                     ...current,
@@ -672,6 +732,7 @@ export default function HelpdeskPage() {
                 min="1"
                 step="1"
                 value={createForm.estimatedMinutes}
+                disabled={helpdeskBackendMode === 'postgres'}
                 onChange={(event) =>
                   setCreateForm((current) => ({
                     ...current,

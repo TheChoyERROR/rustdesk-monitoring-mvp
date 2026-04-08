@@ -15,6 +15,12 @@ import type {
   SessionEventType,
 } from './types';
 
+export type HelpdeskBackendMode = 'sqlite' | 'postgres';
+
+const HELP_DESK_BACKEND_MODE_KEY = 'helpdesk_backend_mode';
+const DEFAULT_HELPDESK_BACKEND_MODE: HelpdeskBackendMode =
+  import.meta.env.VITE_HELPDESK_BACKEND === 'postgres' ? 'postgres' : 'sqlite';
+
 class ApiError extends Error {
   status: number;
   payload: unknown;
@@ -50,6 +56,36 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return payload as T;
 }
 
+function readStoredHelpdeskBackendMode(): HelpdeskBackendMode | null {
+  if (typeof window === 'undefined') {
+    return null;
+  }
+
+  const rawValue = window.localStorage.getItem(HELP_DESK_BACKEND_MODE_KEY);
+  return rawValue === 'postgres' || rawValue === 'sqlite' ? rawValue : null;
+}
+
+export function getHelpdeskBackendMode(): HelpdeskBackendMode {
+  return readStoredHelpdeskBackendMode() ?? DEFAULT_HELPDESK_BACKEND_MODE;
+}
+
+export function isHelpdeskPostgresModeEnabled(): boolean {
+  return getHelpdeskBackendMode() === 'postgres';
+}
+
+export function setHelpdeskBackendMode(mode: HelpdeskBackendMode) {
+  if (typeof window === 'undefined') {
+    return;
+  }
+
+  window.localStorage.setItem(HELP_DESK_BACKEND_MODE_KEY, mode);
+  window.dispatchEvent(
+    new CustomEvent('helpdesk-backend-mode-changed', {
+      detail: { mode },
+    }),
+  );
+}
+
 function buildQuery(params: Record<string, unknown>): string {
   const search = new URLSearchParams();
   Object.entries(params).forEach(([key, value]) => {
@@ -63,6 +99,22 @@ function buildQuery(params: Record<string, unknown>): string {
   });
   const output = search.toString();
   return output ? `?${output}` : '';
+}
+
+function helpdeskBasePath(): string {
+  return isHelpdeskPostgresModeEnabled() ? '/api/v1/postgres/helpdesk' : '/api/v1/helpdesk';
+}
+
+function ensureSqliteOnlyHelpdeskAction(action: string) {
+  if (!isHelpdeskPostgresModeEnabled()) {
+    return;
+  }
+
+  throw new ApiError(
+    `${action} todavia no esta habilitado en el modo experimental Postgres.`,
+    400,
+    { error: 'postgres_helpdesk_action_not_supported' },
+  );
 }
 
 export async function apiLogin(body: AuthLoginRequest): Promise<AuthLoginResponse> {
@@ -137,23 +189,23 @@ export async function apiPresenceSessions(): Promise<PresenceSessionSummary[]> {
 }
 
 export async function apiHelpdeskSummary(): Promise<HelpdeskOperationalSummary> {
-  return request<HelpdeskOperationalSummary>('/api/v1/helpdesk/summary');
+  return request<HelpdeskOperationalSummary>(`${helpdeskBasePath()}/summary`);
 }
 
 export async function apiHelpdeskAgents(): Promise<HelpdeskAgent[]> {
-  const response = await request<{ agents: HelpdeskAgent[] }>('/api/v1/helpdesk/agents');
+  const response = await request<{ agents: HelpdeskAgent[] }>(`${helpdeskBasePath()}/agents`);
   return response.agents;
 }
 
 export async function apiHelpdeskAuthorizedAgents(): Promise<HelpdeskAuthorizedAgent[]> {
   const response = await request<{ agents: HelpdeskAuthorizedAgent[] }>(
-    '/api/v1/helpdesk/agent-authorizations',
+    `${helpdeskBasePath()}/agent-authorizations`,
   );
   return response.agents;
 }
 
 export async function apiHelpdeskTickets(): Promise<HelpdeskTicket[]> {
-  const response = await request<{ tickets: HelpdeskTicket[] }>('/api/v1/helpdesk/tickets');
+  const response = await request<{ tickets: HelpdeskTicket[] }>(`${helpdeskBasePath()}/tickets`);
   return response.tickets;
 }
 
@@ -166,7 +218,7 @@ export async function apiHelpdeskAuthorizedAgentUpsert(
   body: HelpdeskAuthorizedAgentUpsertBody,
 ): Promise<HelpdeskAuthorizedAgent> {
   const response = await request<{ agent: HelpdeskAuthorizedAgent }>(
-    '/api/v1/helpdesk/agent-authorizations',
+    `${helpdeskBasePath()}/agent-authorizations`,
     {
       method: 'POST',
       body: JSON.stringify(body),
@@ -176,7 +228,7 @@ export async function apiHelpdeskAuthorizedAgentUpsert(
 }
 
 export async function apiHelpdeskAuthorizedAgentDelete(agentId: string): Promise<void> {
-  await request<null>(`/api/v1/helpdesk/agent-authorizations/${encodeURIComponent(agentId)}`, {
+  await request<null>(`${helpdeskBasePath()}/agent-authorizations/${encodeURIComponent(agentId)}`, {
     method: 'DELETE',
   });
 }
@@ -195,7 +247,7 @@ export interface HelpdeskCreateTicketBody {
 }
 
 export async function apiHelpdeskCreateTicket(body: HelpdeskCreateTicketBody): Promise<HelpdeskTicket> {
-  const response = await request<{ ticket: HelpdeskTicket }>('/api/v1/helpdesk/tickets', {
+  const response = await request<{ ticket: HelpdeskTicket }>(`${helpdeskBasePath()}/tickets`, {
     method: 'POST',
     body: JSON.stringify(body),
   });
@@ -205,7 +257,7 @@ export async function apiHelpdeskCreateTicket(body: HelpdeskCreateTicketBody): P
 export async function apiHelpdeskTicket(ticketId: string): Promise<HelpdeskTicket | null> {
   try {
     const response = await request<{ ticket: HelpdeskTicket }>(
-      `/api/v1/helpdesk/tickets/${encodeURIComponent(ticketId)}`,
+      `${helpdeskBasePath()}/tickets/${encodeURIComponent(ticketId)}`,
     );
     return response.ticket;
   } catch (error) {
@@ -221,7 +273,7 @@ export async function apiHelpdeskTicketAudit(
   limit = 100,
 ): Promise<HelpdeskAuditEvent[]> {
   const response = await request<{ events: HelpdeskAuditEvent[] }>(
-    `/api/v1/helpdesk/tickets/${encodeURIComponent(ticketId)}/audit${buildQuery({ limit })}`,
+    `${helpdeskBasePath()}/tickets/${encodeURIComponent(ticketId)}/audit${buildQuery({ limit })}`,
   );
   return response.events;
 }
@@ -240,6 +292,7 @@ export async function apiHelpdeskTicketAssign(
   ticketId: string,
   body: HelpdeskTicketAssignBody,
 ): Promise<HelpdeskTicket> {
+  ensureSqliteOnlyHelpdeskAction('El despacho manual');
   const response = await request<{ ticket: HelpdeskTicket }>(
     `/api/v1/helpdesk/tickets/${encodeURIComponent(ticketId)}/assign`,
     {
@@ -259,6 +312,7 @@ export async function apiHelpdeskTicketUpdateOperational(
   ticketId: string,
   body: HelpdeskTicketOperationalBody,
 ): Promise<HelpdeskTicket> {
+  ensureSqliteOnlyHelpdeskAction('La actualizacion de campos operativos');
   const response = await request<{ ticket: HelpdeskTicket }>(
     `/api/v1/helpdesk/tickets/${encodeURIComponent(ticketId)}/operational`,
     {
@@ -273,6 +327,7 @@ export async function apiHelpdeskTicketRequeue(
   ticketId: string,
   body: HelpdeskSupervisorActionBody,
 ): Promise<HelpdeskTicket | null> {
+  ensureSqliteOnlyHelpdeskAction('La recola de tickets');
   const response = await request<{ ticket: HelpdeskTicket | null }>(
     `/api/v1/helpdesk/tickets/${encodeURIComponent(ticketId)}/requeue`,
     {
@@ -287,6 +342,7 @@ export async function apiHelpdeskTicketCancel(
   ticketId: string,
   body: HelpdeskSupervisorActionBody,
 ): Promise<HelpdeskTicket | null> {
+  ensureSqliteOnlyHelpdeskAction('La cancelacion de tickets');
   const response = await request<{ ticket: HelpdeskTicket | null }>(
     `/api/v1/helpdesk/tickets/${encodeURIComponent(ticketId)}/cancel`,
     {

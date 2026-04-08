@@ -6,8 +6,10 @@ use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 use crate::model::{
-    HelpdeskAuditEventV1, HelpdeskAuthorizedAgentUpsertRequestV1, HelpdeskAuthorizedAgentV1,
-    HelpdeskTicketCreateRequestV1, HelpdeskTicketStatus, HelpdeskTicketV1,
+    HelpdeskAgentStatus, HelpdeskAgentV1, HelpdeskAuditEventV1,
+    HelpdeskAuthorizedAgentUpsertRequestV1, HelpdeskAuthorizedAgentV1,
+    HelpdeskOperationalSummaryV1, HelpdeskTicketCreateRequestV1, HelpdeskTicketStatus,
+    HelpdeskTicketV1,
 };
 pub async fn upsert_helpdesk_authorized_agent_pg(
     pool: &PgPool,
@@ -52,6 +54,103 @@ pub async fn list_helpdesk_authorized_agents_pg(pool: &PgPool) -> Result<Vec<Hel
     .context("failed to list Postgres authorized agents")?;
 
     rows.into_iter().map(row_to_helpdesk_authorized_agent_pg).collect()
+}
+
+pub async fn delete_helpdesk_authorized_agent_pg(pool: &PgPool, agent_id: &str) -> Result<bool> {
+    let result = sqlx::query(
+        r#"
+        DELETE FROM helpdesk_authorized_agents
+        WHERE agent_id = $1
+        "#,
+    )
+    .bind(normalize_helpdesk_agent_id(agent_id))
+    .execute(pool)
+    .await
+    .with_context(|| format!("failed to delete Postgres authorized agent '{}'", agent_id))?;
+
+    Ok(result.rows_affected() > 0)
+}
+
+pub async fn list_helpdesk_agents_pg(pool: &PgPool) -> Result<Vec<HelpdeskAgentV1>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT agent_id, display_name, avatar_url, status, current_ticket_id, last_heartbeat_at, updated_at
+        FROM helpdesk_agents
+        ORDER BY created_at ASC, agent_id ASC
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .context("failed to list Postgres helpdesk agents")?;
+
+    rows.into_iter().map(row_to_helpdesk_agent_pg).collect()
+}
+
+pub async fn get_helpdesk_operational_summary_pg(pool: &PgPool) -> Result<HelpdeskOperationalSummaryV1> {
+    let ticket_rows = sqlx::query(
+        r#"
+        SELECT status, COUNT(*) AS count
+        FROM helpdesk_tickets
+        GROUP BY status
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .context("failed to query Postgres helpdesk ticket summary")?;
+
+    let agent_rows = sqlx::query(
+        r#"
+        SELECT status, COUNT(*) AS count
+        FROM helpdesk_agents
+        GROUP BY status
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .context("failed to query Postgres helpdesk agent summary")?;
+
+    let mut summary = HelpdeskOperationalSummaryV1 {
+        tickets_new: 0,
+        tickets_queued: 0,
+        tickets_opening: 0,
+        tickets_in_progress: 0,
+        tickets_resolved: 0,
+        tickets_cancelled: 0,
+        tickets_failed: 0,
+        agents_offline: 0,
+        agents_available: 0,
+        agents_opening: 0,
+        agents_busy: 0,
+        agents_away: 0,
+    };
+
+    for row in ticket_rows {
+        let status: String = row.get("status");
+        let count = i64_to_u64(row.get("count"));
+        match helpdesk_ticket_status_from_db(&status) {
+            HelpdeskTicketStatus::New => summary.tickets_new = count,
+            HelpdeskTicketStatus::Queued | HelpdeskTicketStatus::Assigned => summary.tickets_queued = count,
+            HelpdeskTicketStatus::Opening => summary.tickets_opening = count,
+            HelpdeskTicketStatus::InProgress => summary.tickets_in_progress = count,
+            HelpdeskTicketStatus::Resolved => summary.tickets_resolved = count,
+            HelpdeskTicketStatus::Cancelled => summary.tickets_cancelled = count,
+            HelpdeskTicketStatus::Failed => summary.tickets_failed = count,
+        }
+    }
+
+    for row in agent_rows {
+        let status: String = row.get("status");
+        let count = i64_to_u64(row.get("count"));
+        match helpdesk_agent_status_from_db(&status) {
+            HelpdeskAgentStatus::Offline => summary.agents_offline = count,
+            HelpdeskAgentStatus::Available => summary.agents_available = count,
+            HelpdeskAgentStatus::Opening => summary.agents_opening = count,
+            HelpdeskAgentStatus::Busy => summary.agents_busy = count,
+            HelpdeskAgentStatus::Away => summary.agents_away = count,
+        }
+    }
+
+    Ok(summary)
 }
 
 pub async fn create_helpdesk_ticket_pg(
@@ -237,6 +336,19 @@ fn row_to_helpdesk_ticket_pg(row: PgRow) -> Result<HelpdeskTicketV1> {
     })
 }
 
+fn row_to_helpdesk_agent_pg(row: PgRow) -> Result<HelpdeskAgentV1> {
+    let status: String = row.get("status");
+    Ok(HelpdeskAgentV1 {
+        agent_id: row.get("agent_id"),
+        display_name: row.get("display_name"),
+        avatar_url: row.get("avatar_url"),
+        status: helpdesk_agent_status_from_db(&status),
+        current_ticket_id: row.get("current_ticket_id"),
+        last_heartbeat_at: millis_to_utc(row.get("last_heartbeat_at")),
+        updated_at: millis_to_utc(row.get("updated_at")),
+    })
+}
+
 fn row_to_helpdesk_audit_event_pg(row: PgRow) -> Result<HelpdeskAuditEventV1> {
     let payload: Option<String> = row.get("payload");
     Ok(HelpdeskAuditEventV1 {
@@ -344,4 +456,18 @@ fn helpdesk_ticket_status_from_db(raw: &str) -> HelpdeskTicketStatus {
         "failed" => HelpdeskTicketStatus::Failed,
         _ => HelpdeskTicketStatus::New,
     }
+}
+
+fn helpdesk_agent_status_from_db(raw: &str) -> HelpdeskAgentStatus {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "available" => HelpdeskAgentStatus::Available,
+        "opening" => HelpdeskAgentStatus::Opening,
+        "busy" => HelpdeskAgentStatus::Busy,
+        "away" => HelpdeskAgentStatus::Away,
+        _ => HelpdeskAgentStatus::Offline,
+    }
+}
+
+fn i64_to_u64(value: i64) -> u64 {
+    u64::try_from(value.max(0)).unwrap_or(0)
 }

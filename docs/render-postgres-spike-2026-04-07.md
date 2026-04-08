@@ -59,11 +59,39 @@ DATABASE_URL=<database-url>
 Con eso el servidor habilita rutas protegidas por dashboard auth:
 
 - `GET/POST /api/v1/postgres/helpdesk/agent-authorizations`
+- `DELETE /api/v1/postgres/helpdesk/agent-authorizations/:agent_id`
+- `GET /api/v1/postgres/helpdesk/agents`
+- `GET /api/v1/postgres/helpdesk/summary`
 - `GET/POST /api/v1/postgres/helpdesk/tickets`
 - `GET /api/v1/postgres/helpdesk/tickets/:ticket_id`
 - `GET /api/v1/postgres/helpdesk/tickets/:ticket_id/audit`
 
 Si Postgres no esta configurado, esas rutas responden `503`.
+
+## Como probarlo desde la web
+
+Una vez desplegado el backend con `HELPDESK_POSTGRES_DATABASE_URL` o `DATABASE_URL` apuntando a
+Render Postgres:
+
+1. entra al dashboard web
+2. usa el toggle del header `Helpdesk: SQLite / Postgres`
+3. cambia a `Postgres`
+4. entra a `Helpdesk`
+
+En este modo experimental ya deberias poder:
+
+- ver resumen de helpdesk desde Postgres
+- listar agentes autorizados desde Postgres
+- autorizar y quitar agentes autorizados en Postgres
+- crear tickets basicos en Postgres
+- listar tickets y ver su detalle/auditoria
+
+Todavia no se mueve a Postgres:
+
+- despacho manual
+- recola/cancelacion
+- actualizacion de campos operativos
+- runtime de agentes, sesiones y webhook
 
 ## Como usar
 

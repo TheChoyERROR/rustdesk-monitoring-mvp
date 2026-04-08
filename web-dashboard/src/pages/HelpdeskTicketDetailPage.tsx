@@ -9,6 +9,8 @@ import {
   apiHelpdeskTicketCancel,
   apiHelpdeskTicketRequeue,
   apiHelpdeskTicketUpdateOperational,
+  getHelpdeskBackendMode,
+  type HelpdeskBackendMode,
 } from '../api';
 import { formatDateTime } from '../lib/time';
 import type {
@@ -92,6 +94,8 @@ export default function HelpdeskTicketDetailPage() {
   const { ticketId = '' } = useParams();
   const decodedTicketId = useMemo(() => decodeURIComponent(ticketId), [ticketId]);
 
+  const [helpdeskBackendMode, setHelpdeskBackendMode] =
+    useState<HelpdeskBackendMode>(getHelpdeskBackendMode());
   const [ticket, setTicket] = useState<HelpdeskTicket | null>(null);
   const [agents, setAgents] = useState<HelpdeskAgent[]>([]);
   const [audit, setAudit] = useState<HelpdeskAuditEvent[]>([]);
@@ -135,11 +139,35 @@ export default function HelpdeskTicketDetailPage() {
   }, [load]);
 
   useEffect(() => {
+    const syncMode = () => {
+      setHelpdeskBackendMode(getHelpdeskBackendMode());
+    };
+
+    const onStorage = (event: StorageEvent) => {
+      if (event.key === 'helpdesk_backend_mode') {
+        syncMode();
+      }
+    };
+
+    window.addEventListener('helpdesk-backend-mode-changed', syncMode);
+    window.addEventListener('storage', onStorage);
+
+    return () => {
+      window.removeEventListener('helpdesk-backend-mode-changed', syncMode);
+      window.removeEventListener('storage', onStorage);
+    };
+  }, []);
+
+  useEffect(() => {
     const timer = window.setInterval(() => {
       void load(true);
     }, 5000);
     return () => window.clearInterval(timer);
-  }, [load]);
+  }, [load, helpdeskBackendMode]);
+
+  useEffect(() => {
+    void load();
+  }, [helpdeskBackendMode, load]);
 
   const availableAgents = useMemo(() => {
     return agents.filter((agent) => agent.status === 'available');
@@ -168,6 +196,12 @@ export default function HelpdeskTicketDetailPage() {
           </p>
           <h2>{ticket ? ticketHeadline(ticket) : decodedTicketId}</h2>
           {ticket ? <p className="activity-summary-line">{ticket.ticket_id}</p> : null}
+          <p className="activity-summary-line">
+            Backend activo:{' '}
+            <strong>
+              {helpdeskBackendMode === 'postgres' ? 'Postgres experimental' : 'SQLite actual'}
+            </strong>
+          </p>
         </div>
         <button type="button" className="btn secondary" onClick={() => void load()} disabled={refreshing}>
           {refreshing ? 'Actualizando...' : 'Refrescar'}
@@ -181,6 +215,16 @@ export default function HelpdeskTicketDetailPage() {
 
       {ticket && (
         <>
+          {helpdeskBackendMode === 'postgres' ? (
+            <div className="panel">
+              <p className="activity-summary-line">
+                Este ticket se esta leyendo desde el flujo experimental de Postgres. Por ahora el
+                dashboard solo permite consulta, auditoria y creacion basica; despacho, recola,
+                cancelacion y campos operativos siguen viviendo en SQLite.
+              </p>
+            </div>
+          ) : null}
+
           <div className="panel">
             <div className="detail-actions">
               <div className="filter-grid">
@@ -189,6 +233,7 @@ export default function HelpdeskTicketDetailPage() {
                   <select
                     id="ticket-dispatch-agent"
                     value={dispatchAgentId}
+                    disabled={helpdeskBackendMode === 'postgres'}
                     onChange={(event) => setDispatchAgentId(event.target.value)}
                   >
                     <option value="">Selecciona un agente</option>
@@ -204,6 +249,7 @@ export default function HelpdeskTicketDetailPage() {
                   <select
                     id="ticket-next-agent-status"
                     value={nextAgentStatus}
+                    disabled={helpdeskBackendMode === 'postgres'}
                     onChange={(event) => setNextAgentStatus(event.target.value as 'available' | 'away')}
                   >
                     <option value="available">Disponible</option>
@@ -215,6 +261,7 @@ export default function HelpdeskTicketDetailPage() {
                   <input
                     id="ticket-action-reason"
                     value={actionReason}
+                    disabled={helpdeskBackendMode === 'postgres'}
                     onChange={(event) => setActionReason(event.target.value)}
                     placeholder="reintento, falso positivo, operador caido..."
                   />
@@ -225,6 +272,7 @@ export default function HelpdeskTicketDetailPage() {
                   type="button"
                   className="btn primary"
                   disabled={
+                    helpdeskBackendMode === 'postgres' ||
                     actionBusy !== null ||
                     ticket.status !== 'queued' ||
                     availableAgents.length === 0 ||
@@ -251,7 +299,11 @@ export default function HelpdeskTicketDetailPage() {
                 <button
                   type="button"
                   className="btn secondary"
-                  disabled={actionBusy !== null || ticket.status === 'resolved'}
+                  disabled={
+                    helpdeskBackendMode === 'postgres' ||
+                    actionBusy !== null ||
+                    ticket.status === 'resolved'
+                  }
                   onClick={async () => {
                     setActionBusy('requeue');
                     setError(null);
@@ -273,7 +325,12 @@ export default function HelpdeskTicketDetailPage() {
                 <button
                   type="button"
                   className="btn secondary"
-                  disabled={actionBusy !== null || ticket.status === 'resolved' || ticket.status === 'cancelled'}
+                  disabled={
+                    helpdeskBackendMode === 'postgres' ||
+                    actionBusy !== null ||
+                    ticket.status === 'resolved' ||
+                    ticket.status === 'cancelled'
+                  }
                   onClick={async () => {
                     setActionBusy('cancel');
                     setError(null);
@@ -303,7 +360,7 @@ export default function HelpdeskTicketDetailPage() {
                     id="ticket-operational-difficulty"
                     value={operationalDifficulty}
                     onChange={(event) => setOperationalDifficulty(event.target.value)}
-                    disabled={operationalBusy}
+                    disabled={helpdeskBackendMode === 'postgres' || operationalBusy}
                   >
                     <option value="low">Baja</option>
                     <option value="medium">Media</option>
@@ -319,7 +376,7 @@ export default function HelpdeskTicketDetailPage() {
                     step="1"
                     value={operationalEstimatedMinutes}
                     onChange={(event) => setOperationalEstimatedMinutes(event.target.value)}
-                    disabled={operationalBusy}
+                    disabled={helpdeskBackendMode === 'postgres' || operationalBusy}
                   />
                 </div>
               </div>
@@ -327,7 +384,7 @@ export default function HelpdeskTicketDetailPage() {
                 <button
                   type="button"
                   className="btn secondary"
-                  disabled={operationalBusy}
+                  disabled={helpdeskBackendMode === 'postgres' || operationalBusy}
                   onClick={async () => {
                     setOperationalBusy(true);
                     setError(null);
