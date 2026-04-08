@@ -45,6 +45,14 @@ use crate::postgres_helpdesk::{
     update_helpdesk_ticket_operational_fields_pg, upsert_helpdesk_agent_presence_pg,
     upsert_helpdesk_authorized_agent_pg,
 };
+use crate::postgres_monitoring::{
+    claim_due_events_pg, cleanup_delivered_older_than_pg, cleanup_failed_older_than_pg,
+    cleanup_inactive_session_presence_older_than_pg, cleanup_session_events_older_than_pg,
+    expire_stale_presence_pg, get_dashboard_summary_pg, get_session_presence_pg,
+    init_postgres_monitoring_schema, insert_event_pg, list_active_session_presence_pg,
+    mark_delivered_pg, mark_failed_pg, query_session_report_rows_pg, query_timeline_events_pg,
+    reset_stuck_processing_pg, schedule_retry_pg,
+};
 use crate::storage::{
     add_helpdesk_ticket_agent_report, assign_helpdesk_ticket, cancel_helpdesk_ticket,
     claim_due_events, cleanup_delivered_older_than, cleanup_expired_dashboard_sessions,
@@ -79,6 +87,8 @@ struct AppState {
     pool: sqlx::SqlitePool,
     helpdesk_postgres: Option<sqlx::PgPool>,
     helpdesk_backend: HelpdeskBackend,
+    monitoring_backend: MonitoringBackend,
+    sqlite_fallback_enabled: bool,
     helpdesk_turso: Option<TursoSyncConfig>,
     metrics: Arc<Metrics>,
     dispatcher: WebhookDispatcher,
@@ -96,6 +106,12 @@ struct AuthContext {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HelpdeskBackend {
+    Sqlite,
+    Postgres,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MonitoringBackend {
     Sqlite,
     Postgres,
 }
@@ -238,10 +254,19 @@ pub async fn run(
         }) {
         Some(database_url) => match connect_postgres(&database_url).await {
             Ok(pool) => match init_postgres_helpdesk_schema(&pool).await {
-                Ok(()) => {
-                    info!("helpdesk Postgres pool initialized");
-                    Some(pool)
-                }
+                Ok(()) => match init_postgres_monitoring_schema(&pool).await {
+                    Ok(()) => {
+                        info!("Postgres helpdesk and monitoring pools initialized");
+                        Some(pool)
+                    }
+                    Err(err) => {
+                        error!(
+                            error = %err,
+                            "failed to initialize Postgres monitoring schema; continuing without Postgres-backed monitoring routes"
+                        );
+                        None
+                    }
+                },
                 Err(err) => {
                     error!(
                         error = %err,
@@ -263,6 +288,42 @@ pub async fn run(
             None
         }
     };
+
+    let monitoring_backend = match env::var("PRIMARY_DB_BACKEND")
+        .unwrap_or_else(|_| "sqlite".to_string())
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "postgres" if helpdesk_postgres.is_some() => {
+            info!("monitoring runtime configured to use Postgres as primary backend");
+            MonitoringBackend::Postgres
+        }
+        "postgres" => {
+            warn!(
+                "PRIMARY_DB_BACKEND=postgres was requested, but Postgres is unavailable; falling back to SQLite"
+            );
+            MonitoringBackend::Sqlite
+        }
+        "sqlite" => MonitoringBackend::Sqlite,
+        other => {
+            warn!(
+                value = other,
+                "unknown PRIMARY_DB_BACKEND value; falling back to SQLite"
+            );
+            MonitoringBackend::Sqlite
+        }
+    };
+
+    let sqlite_fallback_enabled = env::var("SQLITE_FALLBACK_ENABLED")
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(true);
 
     let helpdesk_backend = match env::var("HELPDESK_BACKEND")
         .unwrap_or_else(|_| "sqlite".to_string())
@@ -300,6 +361,8 @@ pub async fn run(
         pool,
         helpdesk_postgres,
         helpdesk_backend,
+        monitoring_backend,
+        sqlite_fallback_enabled,
         helpdesk_turso,
         metrics,
         dispatcher,
@@ -586,6 +649,14 @@ fn active_helpdesk_postgres_pool(state: &AppState) -> Option<&sqlx::PgPool> {
     }
 }
 
+fn active_monitoring_postgres_pool(state: &AppState) -> Option<&sqlx::PgPool> {
+    if state.monitoring_backend == MonitoringBackend::Postgres {
+        state.helpdesk_postgres.as_ref()
+    } else {
+        None
+    }
+}
+
 async fn should_store_session_event_for_active_helpdesk_backend(
     state: &AppState,
     event: &SessionEventV1,
@@ -596,6 +667,27 @@ async fn should_store_session_event_for_active_helpdesk_backend(
     }
 
     should_store_session_event(&state.pool, event, &state.config.monitoring).await
+}
+
+async fn insert_session_event_for_active_monitoring_backend(
+    state: &AppState,
+    event: &SessionEventV1,
+) -> anyhow::Result<InsertOutcome> {
+    if let Some(pool) = active_monitoring_postgres_pool(state) {
+        match insert_event_pg(pool, event).await {
+            Ok(outcome) => return Ok(outcome),
+            Err(err) if state.sqlite_fallback_enabled => {
+                warn!(
+                    error = %err,
+                    event_id = %event.event_id,
+                    "failed to persist session event in Postgres; falling back to SQLite buffer"
+                );
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    insert_event(&state.pool, event).await
 }
 
 async fn health_handler() -> impl IntoResponse {
@@ -2084,7 +2176,13 @@ async fn dashboard_summary_handler(
         return bad_request("from must be less than or equal to to");
     }
 
-    match get_dashboard_summary(&state.pool, from, to).await {
+    let summary_result = if let Some(pool) = active_monitoring_postgres_pool(&state) {
+        get_dashboard_summary_pg(pool, from, to).await
+    } else {
+        get_dashboard_summary(&state.pool, from, to).await
+    };
+
+    match summary_result {
         Ok(summary) => (StatusCode::OK, Json(summary)).into_response(),
         Err(err) => {
             error!(error = %err, "failed to query dashboard summary");
@@ -2138,7 +2236,13 @@ async fn events_list_handler(
         to,
     };
 
-    match query_timeline_events(&state.pool, &filter, page, page_size).await {
+    let query_result = if let Some(pool) = active_monitoring_postgres_pool(&state) {
+        query_timeline_events_pg(pool, &filter, page, page_size).await
+    } else {
+        query_timeline_events(&state.pool, &filter, page, page_size).await
+    };
+
+    match query_result {
         Ok((items, total)) => (
             StatusCode::OK,
             Json(PaginatedResponseV1 {
@@ -2179,7 +2283,13 @@ async fn session_timeline_handler(
         ..Default::default()
     };
 
-    match query_timeline_events(&state.pool, &filter, page, page_size).await {
+    let query_result = if let Some(pool) = active_monitoring_postgres_pool(&state) {
+        query_timeline_events_pg(pool, &filter, page, page_size).await
+    } else {
+        query_timeline_events(&state.pool, &filter, page, page_size).await
+    };
+
+    match query_result {
         Ok((items, total)) => (
             StatusCode::OK,
             Json(PaginatedResponseV1 {
@@ -2225,7 +2335,13 @@ async fn sessions_report_csv_handler(
         Err(err) => return bad_request(err),
     };
 
-    let rows = match query_session_report_rows(&state.pool, from, to, user_id, actor_type).await {
+    let rows_result = if let Some(pool) = active_monitoring_postgres_pool(&state) {
+        query_session_report_rows_pg(pool, from, to, user_id, actor_type).await
+    } else {
+        query_session_report_rows(&state.pool, from, to, user_id, actor_type).await
+    };
+
+    let rows = match rows_result {
         Ok(rows) => rows,
         Err(err) => {
             error!(error = %err, "failed to query session report rows");
@@ -2332,7 +2448,13 @@ async fn require_dashboard_auth(
 }
 
 async fn list_presence_sessions_handler(State(state): State<AppState>) -> impl IntoResponse {
-    match list_active_session_presence(&state.pool).await {
+    let sessions_result = if let Some(pool) = active_monitoring_postgres_pool(&state) {
+        list_active_session_presence_pg(pool).await
+    } else {
+        list_active_session_presence(&state.pool).await
+    };
+
+    match sessions_result {
         Ok(sessions) => (
             StatusCode::OK,
             Json(json!({
@@ -2353,7 +2475,13 @@ async fn get_session_presence_handler(
     State(state): State<AppState>,
     AxumPath(session_id): AxumPath<String>,
 ) -> impl IntoResponse {
-    match get_session_presence(&state.pool, &session_id).await {
+    let presence_result = if let Some(pool) = active_monitoring_postgres_pool(&state) {
+        get_session_presence_pg(pool, &session_id).await
+    } else {
+        get_session_presence(&state.pool, &session_id).await
+    };
+
+    match presence_result {
         Ok(Some(snapshot)) => (
             StatusCode::OK,
             Json(json!({
@@ -2469,7 +2597,7 @@ async fn ingest_session_event(
         }
     }
 
-    match insert_event(&state.pool, &event).await {
+    match insert_session_event_for_active_monitoring_backend(&state, &event).await {
         Ok(InsertOutcome::Inserted) => {
             state.metrics.inc_events_received();
             if event.event_type.affects_presence() {
@@ -2503,7 +2631,13 @@ async fn ingest_session_event(
 }
 
 async fn presence_snapshot_sse_event(state: &AppState, session_id: &str) -> Event {
-    match get_session_presence(&state.pool, session_id).await {
+    let presence_result = if let Some(pool) = active_monitoring_postgres_pool(state) {
+        get_session_presence_pg(pool, session_id).await
+    } else {
+        get_session_presence(&state.pool, session_id).await
+    };
+
+    match presence_result {
         Ok(Some(snapshot)) => Event::default().event("presence_snapshot").data(
             json!({
                 "session_id": session_id,
@@ -2707,7 +2841,13 @@ async fn webhook_worker(state: AppState) {
     loop {
         let now_ms = unix_millis_now();
 
-        match reset_stuck_processing(&state.pool, stuck_processing_threshold_ms, now_ms).await {
+        let reset_result = if let Some(pool) = active_monitoring_postgres_pool(&state) {
+            reset_stuck_processing_pg(pool, stuck_processing_threshold_ms, now_ms).await
+        } else {
+            reset_stuck_processing(&state.pool, stuck_processing_threshold_ms, now_ms).await
+        };
+
+        match reset_result {
             Ok(reset_count) if reset_count > 0 => {
                 warn!(reset_count, "reset stale processing rows");
             }
@@ -2726,7 +2866,13 @@ async fn webhook_worker(state: AppState) {
 
         let batch_limit = state.config.worker.concurrency.saturating_mul(2);
 
-        let due_events = match claim_due_events(&state.pool, batch_limit, now_ms).await {
+        let due_events_result = if let Some(pool) = active_monitoring_postgres_pool(&state) {
+            claim_due_events_pg(pool, batch_limit, now_ms).await
+        } else {
+            claim_due_events(&state.pool, batch_limit, now_ms).await
+        };
+
+        let due_events = match due_events_result {
             Ok(rows) => rows,
             Err(err) => {
                 error!(error = %err, "failed to claim due events");
@@ -2759,14 +2905,25 @@ async fn process_outbox_record(state: AppState, record: OutboxRecord) -> anyhow:
         Err(err) => {
             let attempts = record.attempts.saturating_add(1);
             let now_ms = unix_millis_now();
-            mark_failed(
-                &state.pool,
-                &record.event_id,
-                attempts,
-                &format!("invalid JSON payload in outbox: {err}"),
-                now_ms,
-            )
-            .await?;
+            if let Some(pool) = active_monitoring_postgres_pool(&state) {
+                mark_failed_pg(
+                    pool,
+                    &record.event_id,
+                    attempts,
+                    &format!("invalid JSON payload in outbox: {err}"),
+                    now_ms,
+                )
+                .await?;
+            } else {
+                mark_failed(
+                    &state.pool,
+                    &record.event_id,
+                    attempts,
+                    &format!("invalid JSON payload in outbox: {err}"),
+                    now_ms,
+                )
+                .await?;
+            }
             state.metrics.inc_webhook_failed();
             return Ok(());
         }
@@ -2778,7 +2935,11 @@ async fn process_outbox_record(state: AppState, record: OutboxRecord) -> anyhow:
     match state.dispatcher.send_event(&event).await {
         Ok(elapsed) => {
             state.circuit_breaker.on_success();
-            mark_delivered(&state.pool, &record.event_id, current_attempt, now_ms).await?;
+            if let Some(pool) = active_monitoring_postgres_pool(&state) {
+                mark_delivered_pg(pool, &record.event_id, current_attempt, now_ms).await?;
+            } else {
+                mark_delivered(&state.pool, &record.event_id, current_attempt, now_ms).await?;
+            }
             state
                 .metrics
                 .inc_webhook_sent(elapsed.as_millis().min(u128::from(u64::MAX)) as u64);
@@ -2789,14 +2950,25 @@ async fn process_outbox_record(state: AppState, record: OutboxRecord) -> anyhow:
             state.metrics.inc_webhook_failed();
 
             if current_attempt >= state.config.webhook.retry.max_attempts {
-                mark_failed(
-                    &state.pool,
-                    &record.event_id,
-                    current_attempt,
-                    &error_message,
-                    now_ms,
-                )
-                .await?;
+                if let Some(pool) = active_monitoring_postgres_pool(&state) {
+                    mark_failed_pg(
+                        pool,
+                        &record.event_id,
+                        current_attempt,
+                        &error_message,
+                        now_ms,
+                    )
+                    .await?;
+                } else {
+                    mark_failed(
+                        &state.pool,
+                        &record.event_id,
+                        current_attempt,
+                        &error_message,
+                        now_ms,
+                    )
+                    .await?;
+                }
                 warn!(
                     event_id = %record.event_id,
                     attempts = current_attempt,
@@ -2809,15 +2981,27 @@ async fn process_outbox_record(state: AppState, record: OutboxRecord) -> anyhow:
                 let backoff_ms = base.saturating_mul(1u64 << exponent);
                 let next_attempt_at = now_ms.saturating_add(backoff_ms);
 
-                schedule_retry(
-                    &state.pool,
-                    &record.event_id,
-                    current_attempt,
-                    next_attempt_at,
-                    &error_message,
-                    now_ms,
-                )
-                .await?;
+                if let Some(pool) = active_monitoring_postgres_pool(&state) {
+                    schedule_retry_pg(
+                        pool,
+                        &record.event_id,
+                        current_attempt,
+                        next_attempt_at,
+                        &error_message,
+                        now_ms,
+                    )
+                    .await?;
+                } else {
+                    schedule_retry(
+                        &state.pool,
+                        &record.event_id,
+                        current_attempt,
+                        next_attempt_at,
+                        &error_message,
+                        now_ms,
+                    )
+                    .await?;
+                }
                 state.metrics.inc_webhook_retry();
                 warn!(
                     event_id = %record.event_id,
@@ -2856,7 +3040,13 @@ async fn cleanup_worker(state: AppState) {
             .saturating_mul(1_000);
         let failed_cutoff_ms = now_ms.saturating_sub(failed_retention_ms);
 
-        match cleanup_failed_older_than(&state.pool, failed_cutoff_ms).await {
+        let cleanup_failed_result = if let Some(pool) = active_monitoring_postgres_pool(&state) {
+            cleanup_failed_older_than_pg(pool, failed_cutoff_ms).await
+        } else {
+            cleanup_failed_older_than(&state.pool, failed_cutoff_ms).await
+        };
+
+        match cleanup_failed_result {
             Ok(deleted) if deleted > 0 => info!(deleted, "cleaned old failed outbox events"),
             Ok(_) => {}
             Err(err) => error!(error = %err, "failed to cleanup old failed outbox events"),
@@ -2872,7 +3062,13 @@ async fn cleanup_worker(state: AppState) {
             .saturating_mul(1_000);
         let delivered_cutoff_ms = now_ms.saturating_sub(delivered_retention_ms);
 
-        match cleanup_delivered_older_than(&state.pool, delivered_cutoff_ms).await {
+        let cleanup_delivered_result = if let Some(pool) = active_monitoring_postgres_pool(&state) {
+            cleanup_delivered_older_than_pg(pool, delivered_cutoff_ms).await
+        } else {
+            cleanup_delivered_older_than(&state.pool, delivered_cutoff_ms).await
+        };
+
+        match cleanup_delivered_result {
             Ok(deleted) if deleted > 0 => {
                 info!(deleted, "cleaned old delivered outbox events")
             }
@@ -2890,7 +3086,14 @@ async fn cleanup_worker(state: AppState) {
             .saturating_mul(1_000);
         let session_event_cutoff_ms = now_ms.saturating_sub(session_event_retention_ms);
 
-        match cleanup_session_events_older_than(&state.pool, session_event_cutoff_ms).await {
+        let cleanup_session_events_result =
+            if let Some(pool) = active_monitoring_postgres_pool(&state) {
+                cleanup_session_events_older_than_pg(pool, session_event_cutoff_ms).await
+            } else {
+                cleanup_session_events_older_than(&state.pool, session_event_cutoff_ms).await
+            };
+
+        match cleanup_session_events_result {
             Ok(deleted) if deleted > 0 => info!(deleted, "cleaned old session events"),
             Ok(_) => {}
             Err(err) => error!(error = %err, "failed to cleanup old session events"),
@@ -2905,9 +3108,14 @@ async fn cleanup_worker(state: AppState) {
             .saturating_mul(1_000);
         let session_presence_cutoff_ms = now_ms.saturating_sub(session_presence_retention_ms);
 
-        match cleanup_inactive_session_presence_older_than(&state.pool, session_presence_cutoff_ms)
-            .await
-        {
+        let cleanup_presence_result = if let Some(pool) = active_monitoring_postgres_pool(&state) {
+            cleanup_inactive_session_presence_older_than_pg(pool, session_presence_cutoff_ms).await
+        } else {
+            cleanup_inactive_session_presence_older_than(&state.pool, session_presence_cutoff_ms)
+                .await
+        };
+
+        match cleanup_presence_result {
             Ok(deleted) if deleted > 0 => {
                 info!(deleted, "cleaned stale inactive session presence rows")
             }
@@ -2955,7 +3163,13 @@ async fn presence_cleanup_worker(state: AppState) {
         let now_ms = unix_millis_now();
         let stale_before_ms = now_ms.saturating_sub(stale_after_ms) as i64;
 
-        match expire_stale_presence(&state.pool, stale_before_ms, now_ms as i64).await {
+        let expire_result = if let Some(pool) = active_monitoring_postgres_pool(&state) {
+            expire_stale_presence_pg(pool, stale_before_ms, now_ms as i64).await
+        } else {
+            expire_stale_presence(&state.pool, stale_before_ms, now_ms as i64).await
+        };
+
+        match expire_result {
             Ok((expired_rows, touched_sessions)) if expired_rows > 0 => {
                 info!(
                     expired_rows,
@@ -3051,6 +3265,10 @@ async fn turso_sync_worker(state: AppState) {
             }
             Ok(_) => {}
             Err(err) => error!(error = %err, "failed to compute helpdesk Turso sync signature"),
+        }
+
+        if active_monitoring_postgres_pool(&state).is_some() {
+            continue;
         }
 
         match compute_monitoring_sync_signature(&state.pool, &sync_cfg).await {

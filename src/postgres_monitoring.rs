@@ -1,10 +1,13 @@
 use anyhow::Context;
+use chrono::{DateTime, TimeZone, Utc};
 use serde_json::Value;
-use sqlx::{PgPool, Postgres, Row, Transaction};
+use sqlx::{PgPool, Postgres, QueryBuilder, Row, Transaction};
 
-use crate::model::SessionEventType;
-use crate::model::SessionEventV1;
-use crate::storage::{unix_millis_now, InsertOutcome};
+use crate::model::{
+    DashboardSummaryV1, PresenceParticipantV1, PresenceSessionSummaryV1, SessionActorTypeV1,
+    SessionEventType, SessionEventV1, SessionPresenceV1, SessionReportRowV1, SessionTimelineItemV1,
+};
+use crate::storage::{unix_millis_now, EventQueryFilter, InsertOutcome, OutboxRecord};
 
 const POSTGRES_MONITORING_SCHEMA: &[&str] = &[
     r#"
@@ -407,4 +410,731 @@ fn meta_bool(meta: Option<&Value>, key: &str) -> Option<bool> {
 
 fn i64_to_u64(value: i64) -> u64 {
     value.max(0) as u64
+}
+
+#[derive(Debug, Clone, Default)]
+struct SessionActorReferenceIndex {
+    agent_ids: std::collections::HashSet<String>,
+    client_ids: std::collections::HashSet<String>,
+}
+
+impl SessionActorReferenceIndex {
+    fn classify(&self, user_id: &str) -> SessionActorTypeV1 {
+        let normalized_user_id = normalize_helpdesk_identity_id(user_id);
+        if normalized_user_id.is_empty() {
+            return SessionActorTypeV1::Unknown;
+        }
+        if self.agent_ids.contains(&normalized_user_id) {
+            return SessionActorTypeV1::Agent;
+        }
+        if self.client_ids.contains(&normalized_user_id) {
+            return SessionActorTypeV1::Client;
+        }
+        SessionActorTypeV1::Unknown
+    }
+}
+
+pub async fn claim_due_events_pg(
+    pool: &PgPool,
+    limit: usize,
+    now_ms: u64,
+) -> anyhow::Result<Vec<OutboxRecord>> {
+    let now_ms = now_ms as i64;
+    let rows = sqlx::query(
+        r#"
+        WITH due AS (
+            SELECT event_id
+            FROM outbox_events
+            WHERE status = 'pending'
+              AND next_attempt_at <= $1
+            ORDER BY created_at ASC
+            LIMIT $2
+            FOR UPDATE SKIP LOCKED
+        )
+        UPDATE outbox_events AS oe
+        SET status = 'processing',
+            updated_at = $1
+        FROM due
+        WHERE oe.event_id = due.event_id
+        RETURNING oe.event_id, oe.payload, oe.attempts
+        "#,
+    )
+    .bind(now_ms)
+    .bind(limit as i64)
+    .fetch_all(pool)
+    .await
+    .context("failed to claim due Postgres outbox events")?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| OutboxRecord {
+            event_id: row.get("event_id"),
+            payload: row.get("payload"),
+            attempts: u32::try_from(row.get::<i64, _>("attempts")).unwrap_or(u32::MAX),
+        })
+        .collect())
+}
+
+pub async fn mark_delivered_pg(
+    pool: &PgPool,
+    event_id: &str,
+    attempts: u32,
+    now_ms: u64,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE outbox_events
+        SET status = 'delivered',
+            attempts = $1,
+            updated_at = $2,
+            last_error = NULL
+        WHERE event_id = $3
+        "#,
+    )
+    .bind(attempts as i64)
+    .bind(now_ms as i64)
+    .bind(event_id)
+    .execute(pool)
+    .await
+    .with_context(|| format!("failed to mark Postgres outbox event '{event_id}' delivered"))?;
+    Ok(())
+}
+
+pub async fn schedule_retry_pg(
+    pool: &PgPool,
+    event_id: &str,
+    attempts: u32,
+    next_attempt_at_ms: u64,
+    error_message: &str,
+    now_ms: u64,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE outbox_events
+        SET status = 'pending',
+            attempts = $1,
+            next_attempt_at = $2,
+            updated_at = $3,
+            last_error = $4
+        WHERE event_id = $5
+        "#,
+    )
+    .bind(attempts as i64)
+    .bind(next_attempt_at_ms as i64)
+    .bind(now_ms as i64)
+    .bind(error_message)
+    .bind(event_id)
+    .execute(pool)
+    .await
+    .with_context(|| format!("failed to schedule Postgres retry for event '{event_id}'"))?;
+    Ok(())
+}
+
+pub async fn mark_failed_pg(
+    pool: &PgPool,
+    event_id: &str,
+    attempts: u32,
+    error_message: &str,
+    now_ms: u64,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE outbox_events
+        SET status = 'failed',
+            attempts = $1,
+            updated_at = $2,
+            next_attempt_at = $3,
+            last_error = $4
+        WHERE event_id = $5
+        "#,
+    )
+    .bind(attempts as i64)
+    .bind(now_ms as i64)
+    .bind(now_ms as i64)
+    .bind(error_message)
+    .bind(event_id)
+    .execute(pool)
+    .await
+    .with_context(|| format!("failed to mark Postgres outbox event '{event_id}' failed"))?;
+    Ok(())
+}
+
+pub async fn reset_stuck_processing_pg(
+    pool: &PgPool,
+    older_than_ms: u64,
+    now_ms: u64,
+) -> anyhow::Result<u64> {
+    let threshold = now_ms.saturating_sub(older_than_ms) as i64;
+    let result = sqlx::query(
+        r#"
+        UPDATE outbox_events
+        SET status = 'pending',
+            updated_at = $1
+        WHERE status = 'processing'
+          AND updated_at <= $2
+        "#,
+    )
+    .bind(now_ms as i64)
+    .bind(threshold)
+    .execute(pool)
+    .await
+    .context("failed to reset stuck Postgres processing rows")?;
+    Ok(result.rows_affected())
+}
+
+pub async fn cleanup_failed_older_than_pg(pool: &PgPool, cutoff_ms: u64) -> anyhow::Result<u64> {
+    let result = sqlx::query(
+        r#"
+        DELETE FROM outbox_events
+        WHERE status = 'failed'
+          AND updated_at < $1
+        "#,
+    )
+    .bind(cutoff_ms as i64)
+    .execute(pool)
+    .await
+    .context("failed to clean old failed Postgres outbox events")?;
+    Ok(result.rows_affected())
+}
+
+pub async fn cleanup_delivered_older_than_pg(pool: &PgPool, cutoff_ms: u64) -> anyhow::Result<u64> {
+    let result = sqlx::query(
+        r#"
+        DELETE FROM outbox_events
+        WHERE status = 'delivered'
+          AND updated_at < $1
+        "#,
+    )
+    .bind(cutoff_ms as i64)
+    .execute(pool)
+    .await
+    .context("failed to clean old delivered Postgres outbox events")?;
+    Ok(result.rows_affected())
+}
+
+pub async fn cleanup_session_events_older_than_pg(
+    pool: &PgPool,
+    cutoff_ms: u64,
+) -> anyhow::Result<u64> {
+    let result = sqlx::query(
+        r#"
+        DELETE FROM session_events
+        WHERE created_at < $1
+        "#,
+    )
+    .bind(cutoff_ms as i64)
+    .execute(pool)
+    .await
+    .context("failed to clean old Postgres session events")?;
+    Ok(result.rows_affected())
+}
+
+pub async fn cleanup_inactive_session_presence_older_than_pg(
+    pool: &PgPool,
+    cutoff_ms: u64,
+) -> anyhow::Result<u64> {
+    let result = sqlx::query(
+        r#"
+        DELETE FROM session_presence
+        WHERE updated_at < $1
+          AND is_active = FALSE
+        "#,
+    )
+    .bind(cutoff_ms as i64)
+    .execute(pool)
+    .await
+    .context("failed to clean stale inactive Postgres session presence rows")?;
+    Ok(result.rows_affected())
+}
+
+pub async fn expire_stale_presence_pg(
+    pool: &PgPool,
+    stale_before_ms: i64,
+    now_ms: i64,
+) -> anyhow::Result<(u64, Vec<String>)> {
+    let rows = sqlx::query(
+        r#"
+        SELECT DISTINCT session_id
+        FROM session_presence
+        WHERE is_active = TRUE
+          AND last_activity_at < $1
+        "#,
+    )
+    .bind(stale_before_ms)
+    .fetch_all(pool)
+    .await
+    .context("failed to query stale Postgres presence sessions")?;
+
+    if rows.is_empty() {
+        return Ok((0, Vec::new()));
+    }
+
+    let touched_sessions = rows
+        .into_iter()
+        .map(|row| row.get::<String, _>("session_id"))
+        .collect::<Vec<_>>();
+
+    let result = sqlx::query(
+        r#"
+        UPDATE session_presence
+        SET is_active = FALSE,
+            is_control_active = FALSE,
+            updated_at = $2
+        WHERE is_active = TRUE
+          AND last_activity_at < $1
+        "#,
+    )
+    .bind(stale_before_ms)
+    .bind(now_ms)
+    .execute(pool)
+    .await
+    .context("failed to expire stale Postgres session presence rows")?;
+
+    Ok((result.rows_affected(), touched_sessions))
+}
+
+pub async fn get_session_presence_pg(
+    pool: &PgPool,
+    session_id: &str,
+) -> anyhow::Result<Option<SessionPresenceV1>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            participant_id,
+            display_name,
+            avatar_url,
+            is_active,
+            is_control_active,
+            last_activity_at,
+            updated_at
+        FROM session_presence
+        WHERE session_id = $1
+        ORDER BY is_active DESC, last_activity_at DESC, participant_id ASC
+        "#,
+    )
+    .bind(session_id)
+    .fetch_all(pool)
+    .await
+    .with_context(|| format!("failed to query Postgres presence for session {session_id}"))?;
+
+    if rows.is_empty() {
+        return Ok(None);
+    }
+
+    let mut participants = Vec::with_capacity(rows.len());
+    let mut control_participant_id = None;
+    let mut newest_update_ms = 0_i64;
+
+    for row in rows {
+        let participant_id: String = row.get("participant_id");
+        let display_name: String = row.get("display_name");
+        let avatar_url: Option<String> = row.get("avatar_url");
+        let is_active: bool = row.get("is_active");
+        let is_control_active: bool = row.get("is_control_active");
+        let last_activity_at: i64 = row.get("last_activity_at");
+        let updated_at: i64 = row.get("updated_at");
+
+        if is_control_active && is_active {
+            control_participant_id = Some(participant_id.clone());
+        }
+        if updated_at > newest_update_ms {
+            newest_update_ms = updated_at;
+        }
+
+        participants.push(PresenceParticipantV1 {
+            participant_id,
+            display_name,
+            avatar_url,
+            is_active,
+            is_control_active,
+            last_activity_at: millis_to_utc(last_activity_at),
+        });
+    }
+
+    Ok(Some(SessionPresenceV1 {
+        session_id: session_id.to_string(),
+        control_participant_id,
+        participants,
+        updated_at: millis_to_utc(newest_update_ms),
+    }))
+}
+
+pub async fn list_active_session_presence_pg(
+    pool: &PgPool,
+) -> anyhow::Result<Vec<PresenceSessionSummaryV1>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            session_id,
+            COUNT(*) AS active_participants,
+            MAX(updated_at) AS updated_at
+        FROM session_presence
+        WHERE is_active = TRUE
+        GROUP BY session_id
+        ORDER BY updated_at DESC
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .context("failed to query active Postgres session presence")?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| PresenceSessionSummaryV1 {
+            session_id: row.get("session_id"),
+            active_participants: i64_to_u64(row.get("active_participants")),
+            updated_at: millis_to_utc(row.get("updated_at")),
+        })
+        .collect())
+}
+
+pub async fn get_dashboard_summary_pg(
+    pool: &PgPool,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+) -> anyhow::Result<DashboardSummaryV1> {
+    let from_str = from.to_rfc3339();
+    let to_str = to.to_rfc3339();
+    let from_ms = from.timestamp_millis();
+    let to_ms = to.timestamp_millis();
+
+    let row = sqlx::query(
+        r#"
+        SELECT
+            COUNT(*) AS events_total,
+            SUM(CASE WHEN event_type = 'session_started' THEN 1 ELSE 0 END) AS sessions_started,
+            SUM(CASE WHEN event_type = 'session_ended' THEN 1 ELSE 0 END) AS sessions_ended
+        FROM session_events
+        WHERE timestamp >= $1
+          AND timestamp <= $2
+        "#,
+    )
+    .bind(&from_str)
+    .bind(&to_str)
+    .fetch_one(pool)
+    .await
+    .context("failed to aggregate Postgres dashboard summary events")?;
+
+    let active_sessions_row = sqlx::query(
+        r#"
+        SELECT COUNT(DISTINCT session_id) AS active_sessions
+        FROM session_presence
+        WHERE is_active = TRUE
+        "#,
+    )
+    .fetch_one(pool)
+    .await
+    .context("failed to count active Postgres sessions")?;
+
+    let outbox_rows = sqlx::query(
+        r#"
+        SELECT status, COUNT(*) AS total
+        FROM outbox_events
+        WHERE created_at >= $1
+          AND created_at <= $2
+        GROUP BY status
+        "#,
+    )
+    .bind(from_ms)
+    .bind(to_ms)
+    .fetch_all(pool)
+    .await
+    .context("failed to aggregate Postgres outbox status counts")?;
+
+    let mut webhook_pending = 0_u64;
+    let mut webhook_failed = 0_u64;
+    let mut webhook_delivered = 0_u64;
+
+    for row in outbox_rows {
+        let status: String = row.get("status");
+        let total = i64_to_u64(row.get("total"));
+        match status.as_str() {
+            "pending" | "processing" => webhook_pending = webhook_pending.saturating_add(total),
+            "failed" => webhook_failed = total,
+            "delivered" => webhook_delivered = total,
+            _ => {}
+        }
+    }
+
+    Ok(DashboardSummaryV1 {
+        from,
+        to,
+        events_total: i64_to_u64(row.get("events_total")),
+        sessions_started: i64_to_u64(row.get("sessions_started")),
+        sessions_ended: i64_to_u64(row.get("sessions_ended")),
+        active_sessions: i64_to_u64(active_sessions_row.get("active_sessions")),
+        webhook_pending,
+        webhook_failed,
+        webhook_delivered,
+    })
+}
+
+pub async fn query_timeline_events_pg(
+    pool: &PgPool,
+    filter: &EventQueryFilter,
+    page: u64,
+    page_size: u64,
+) -> anyhow::Result<(Vec<SessionTimelineItemV1>, u64)> {
+    let page_size = page_size.clamp(1, 500);
+    let offset = page.saturating_sub(1).saturating_mul(page_size);
+
+    let mut count_qb =
+        QueryBuilder::<Postgres>::new("SELECT COUNT(*) AS total FROM session_events WHERE 1=1");
+    apply_event_filters_pg(&mut count_qb, filter);
+    let total_raw: i64 = count_qb
+        .build_query_scalar()
+        .fetch_one(pool)
+        .await
+        .context("failed to count filtered Postgres timeline events")?;
+    let total = i64_to_u64(total_raw);
+
+    let mut data_qb = QueryBuilder::<Postgres>::new("SELECT payload FROM session_events WHERE 1=1");
+    apply_event_filters_pg(&mut data_qb, filter);
+    data_qb.push(" ORDER BY timestamp DESC LIMIT ");
+    data_qb.push_bind(page_size as i64);
+    data_qb.push(" OFFSET ");
+    data_qb.push_bind(offset as i64);
+
+    let rows = data_qb
+        .build()
+        .fetch_all(pool)
+        .await
+        .context("failed to query filtered Postgres timeline events")?;
+
+    if rows.is_empty() {
+        return Ok((Vec::new(), total));
+    }
+
+    let actor_reference_index = load_session_actor_reference_index_pg(pool).await?;
+    let mut items = Vec::with_capacity(rows.len());
+    for row in rows {
+        let payload: String = row.get("payload");
+        let event: SessionEventV1 = serde_json::from_str(&payload)
+            .context("failed to deserialize event payload from Postgres session_events")?;
+        let actor_type = actor_reference_index.classify(&event.user_id);
+        items.push(event_to_timeline_item(event, actor_type));
+    }
+
+    Ok((items, total))
+}
+
+pub async fn query_session_report_rows_pg(
+    pool: &PgPool,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+    user_id: Option<&str>,
+    actor_type: Option<SessionActorTypeV1>,
+) -> anyhow::Result<Vec<SessionReportRowV1>> {
+    let mut qb = QueryBuilder::<Postgres>::new(
+        r#"
+        SELECT
+            session_id,
+            MIN(timestamp) AS started_at,
+            MAX(timestamp) AS last_event_at,
+            COUNT(*) AS events_total,
+            STRING_AGG(DISTINCT user_id, ',') AS users
+        FROM session_events
+        WHERE timestamp >= "#,
+    );
+    qb.push_bind(from.to_rfc3339());
+    qb.push(" AND timestamp <= ");
+    qb.push_bind(to.to_rfc3339());
+
+    if let Some(user_id) = user_id {
+        qb.push(" AND user_id = ");
+        qb.push_bind(user_id.trim().to_string());
+    }
+
+    if let Some(actor_type) = actor_type {
+        qb.push(" AND ");
+        push_session_actor_type_match_clause_pg(&mut qb, actor_type, "session_events.user_id");
+    }
+
+    qb.push(" GROUP BY session_id ORDER BY started_at DESC");
+
+    let rows = qb
+        .build()
+        .fetch_all(pool)
+        .await
+        .context("failed to query Postgres session report rows")?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let users_raw: Option<String> = row.get("users");
+        let mut users = users_raw
+            .unwrap_or_default()
+            .split(',')
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>();
+        users.sort();
+        users.dedup();
+
+        let started_at_str: String = row.get("started_at");
+        let last_event_at_str: String = row.get("last_event_at");
+
+        out.push(SessionReportRowV1 {
+            session_id: row.get("session_id"),
+            started_at: parse_rfc3339_to_utc(&started_at_str),
+            last_event_at: parse_rfc3339_to_utc(&last_event_at_str),
+            events_total: i64_to_u64(row.get("events_total")),
+            users,
+        });
+    }
+
+    Ok(out)
+}
+
+async fn load_session_actor_reference_index_pg(
+    pool: &PgPool,
+) -> anyhow::Result<SessionActorReferenceIndex> {
+    let mut actor_reference_index = SessionActorReferenceIndex::default();
+
+    let agent_ids = sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT agent_id FROM helpdesk_authorized_agents
+        UNION
+        SELECT agent_id FROM helpdesk_agents
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .context("failed to query Postgres helpdesk agent ids for session actor classification")?;
+
+    for agent_id in agent_ids {
+        let normalized = normalize_helpdesk_identity_id(&agent_id);
+        if !normalized.is_empty() {
+            actor_reference_index.agent_ids.insert(normalized);
+        }
+    }
+
+    let client_ids = sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT DISTINCT client_id
+        FROM helpdesk_tickets
+        WHERE client_id IS NOT NULL
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .context("failed to query Postgres helpdesk client ids for session actor classification")?;
+
+    for client_id in client_ids {
+        let normalized = normalize_helpdesk_identity_id(&client_id);
+        if !normalized.is_empty() {
+            actor_reference_index.client_ids.insert(normalized);
+        }
+    }
+
+    Ok(actor_reference_index)
+}
+
+fn apply_event_filters_pg(qb: &mut QueryBuilder<'_, Postgres>, filter: &EventQueryFilter) {
+    if let Some(session_id) = filter.session_id.as_ref() {
+        let session_id = session_id.trim();
+        if !session_id.is_empty() {
+            qb.push(" AND session_id = ");
+            qb.push_bind(session_id.to_string());
+        }
+    }
+    if let Some(user_id) = filter.user_id.as_ref() {
+        let user_id = user_id.trim();
+        if !user_id.is_empty() {
+            qb.push(" AND user_id = ");
+            qb.push_bind(user_id.to_string());
+        }
+    }
+    if let Some(event_type) = filter.event_type {
+        qb.push(" AND event_type = ");
+        qb.push_bind(event_type.as_str().to_string());
+    }
+    if let Some(actor_type) = filter.actor_type {
+        qb.push(" AND ");
+        push_session_actor_type_match_clause_pg(qb, actor_type, "session_events.user_id");
+    }
+    if let Some(from) = filter.from.as_ref() {
+        qb.push(" AND timestamp >= ");
+        qb.push_bind(from.to_rfc3339());
+    }
+    if let Some(to) = filter.to.as_ref() {
+        qb.push(" AND timestamp <= ");
+        qb.push_bind(to.to_rfc3339());
+    }
+}
+
+fn push_session_actor_type_match_clause_pg(
+    qb: &mut QueryBuilder<'_, Postgres>,
+    actor_type: SessionActorTypeV1,
+    user_id_expr: &str,
+) {
+    match actor_type {
+        SessionActorTypeV1::Agent => {
+            push_helpdesk_agent_match_clause_pg(qb, user_id_expr);
+        }
+        SessionActorTypeV1::Client => {
+            push_helpdesk_client_match_clause_pg(qb, user_id_expr);
+        }
+        SessionActorTypeV1::Unknown => {
+            qb.push("NOT (");
+            push_helpdesk_agent_match_clause_pg(qb, user_id_expr);
+            qb.push(") AND NOT (");
+            push_helpdesk_client_match_clause_pg(qb, user_id_expr);
+            qb.push(")");
+        }
+    }
+}
+
+fn push_helpdesk_agent_match_clause_pg(qb: &mut QueryBuilder<'_, Postgres>, user_id_expr: &str) {
+    let normalized_user_expr = format!("regexp_replace(trim({user_id_expr}), '\\s+', '', 'g')");
+    qb.push(format!(
+        "(EXISTS (SELECT 1 FROM helpdesk_authorized_agents haa WHERE regexp_replace(trim(haa.agent_id), '\\s+', '', 'g') = {normalized_user_expr}) \
+OR EXISTS (SELECT 1 FROM helpdesk_agents ha WHERE regexp_replace(trim(ha.agent_id), '\\s+', '', 'g') = {normalized_user_expr}))"
+    ));
+}
+
+fn push_helpdesk_client_match_clause_pg(qb: &mut QueryBuilder<'_, Postgres>, user_id_expr: &str) {
+    let normalized_user_expr = format!("regexp_replace(trim({user_id_expr}), '\\s+', '', 'g')");
+    qb.push(format!(
+        "EXISTS (SELECT 1 FROM helpdesk_tickets ht WHERE regexp_replace(trim(ht.client_id), '\\s+', '', 'g') = {normalized_user_expr})"
+    ));
+}
+
+fn normalize_helpdesk_identity_id(raw: &str) -> String {
+    raw.trim()
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect()
+}
+
+fn event_to_timeline_item(
+    event: SessionEventV1,
+    actor_type: SessionActorTypeV1,
+) -> SessionTimelineItemV1 {
+    SessionTimelineItemV1 {
+        event_id: event.event_id,
+        event_type: event.event_type,
+        session_id: event.session_id,
+        user_id: event.user_id,
+        actor_type,
+        direction: event.direction,
+        timestamp: event.timestamp,
+        host_info: event.host_info,
+        meta: event.meta,
+    }
+}
+
+fn parse_rfc3339_to_utc(value: &str) -> DateTime<Utc> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|parsed| parsed.with_timezone(&Utc))
+        .unwrap_or_else(|_| {
+            Utc.timestamp_millis_opt(0)
+                .single()
+                .unwrap_or_else(Utc::now)
+        })
+}
+
+fn millis_to_utc(value: i64) -> DateTime<Utc> {
+    Utc.timestamp_millis_opt(value)
+        .single()
+        .unwrap_or_else(Utc::now)
 }
