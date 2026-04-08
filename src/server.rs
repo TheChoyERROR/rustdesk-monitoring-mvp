@@ -352,8 +352,32 @@ pub async fn run(
             get(get_helpdesk_ticket_pg_handler),
         )
         .route(
+            "/api/v1/postgres/helpdesk/tickets/:ticket_id/assign",
+            post(assign_helpdesk_ticket_pg_handler),
+        )
+        .route(
+            "/api/v1/postgres/helpdesk/tickets/:ticket_id/operational",
+            post(update_helpdesk_ticket_operational_pg_handler),
+        )
+        .route(
+            "/api/v1/postgres/helpdesk/tickets/:ticket_id/report",
+            post(create_helpdesk_ticket_agent_report_pg_handler),
+        )
+        .route(
             "/api/v1/postgres/helpdesk/tickets/:ticket_id/audit",
             get(list_helpdesk_ticket_audit_pg_handler),
+        )
+        .route(
+            "/api/v1/postgres/helpdesk/tickets/:ticket_id/resolve",
+            post(resolve_helpdesk_ticket_pg_handler),
+        )
+        .route(
+            "/api/v1/postgres/helpdesk/tickets/:ticket_id/requeue",
+            post(requeue_helpdesk_ticket_pg_handler),
+        )
+        .route(
+            "/api/v1/postgres/helpdesk/tickets/:ticket_id/cancel",
+            post(cancel_helpdesk_ticket_pg_handler),
         )
         .route(
             "/api/v1/sessions/:session_id/timeline",
@@ -1239,6 +1263,52 @@ async fn create_helpdesk_ticket_pg_handler(
     }
 }
 
+async fn assign_helpdesk_ticket_pg_handler(
+    State(state): State<AppState>,
+    AxumPath(ticket_id): AxumPath<String>,
+    Json(payload): Json<HelpdeskTicketAssignRequestV1>,
+) -> impl IntoResponse {
+    let Some(pool) = state.helpdesk_postgres.as_ref() else {
+        return service_unavailable("helpdesk_postgres_not_configured");
+    };
+
+    let ticket_id = ticket_id.trim().to_string();
+    if ticket_id.is_empty() {
+        return bad_request("ticket_id cannot be empty");
+    }
+
+    if let Err(validation_error) = payload.validate() {
+        return bad_request(validation_error.to_string());
+    }
+
+    match assign_helpdesk_ticket_pg(
+        pool,
+        &ticket_id,
+        payload.agent_id.as_deref(),
+        payload.reason.as_deref(),
+    )
+    .await
+    {
+        Ok((ticket, agent)) => (
+            StatusCode::OK,
+            Json(json!({
+                "ticket": ticket,
+                "agent": agent,
+            })),
+        )
+            .into_response(),
+        Err(err) => {
+            error!(
+                error = %err,
+                ticket_id,
+                agent_id = payload.agent_id,
+                "failed to assign Postgres helpdesk ticket"
+            );
+            bad_request(err.to_string())
+        }
+    }
+}
+
 async fn assign_helpdesk_ticket_handler(
     State(state): State<AppState>,
     AxumPath(ticket_id): AxumPath<String>,
@@ -1306,6 +1376,56 @@ async fn assign_helpdesk_ticket_handler(
                 "failed to assign helpdesk ticket"
             );
             bad_request(err.to_string())
+        }
+    }
+}
+
+async fn update_helpdesk_ticket_operational_pg_handler(
+    State(state): State<AppState>,
+    AxumPath(ticket_id): AxumPath<String>,
+    Json(payload): Json<HelpdeskTicketOperationalUpdateRequestV1>,
+) -> impl IntoResponse {
+    let Some(pool) = state.helpdesk_postgres.as_ref() else {
+        return service_unavailable("helpdesk_postgres_not_configured");
+    };
+
+    let ticket_id = ticket_id.trim().to_string();
+    if ticket_id.is_empty() {
+        return bad_request("ticket_id cannot be empty");
+    }
+
+    if let Err(validation_error) = payload.validate() {
+        return bad_request(validation_error.to_string());
+    }
+
+    match update_helpdesk_ticket_operational_fields_pg(
+        pool,
+        &ticket_id,
+        payload.difficulty.as_deref(),
+        payload.estimated_minutes,
+    )
+    .await
+    {
+        Ok(ticket) => (
+            StatusCode::OK,
+            Json(json!({
+                "ticket": ticket,
+            })),
+        )
+            .into_response(),
+        Err(err) => {
+            if err
+                .to_string()
+                .contains("can no longer be updated operationally")
+            {
+                return bad_request(err.to_string());
+            }
+            error!(
+                error = %err,
+                ticket_id,
+                "failed to update Postgres helpdesk ticket operational fields"
+            );
+            internal_error()
         }
     }
 }
@@ -1389,6 +1509,46 @@ async fn update_helpdesk_ticket_operational_handler(
     }
 }
 
+async fn create_helpdesk_ticket_agent_report_pg_handler(
+    State(state): State<AppState>,
+    AxumPath(ticket_id): AxumPath<String>,
+    Json(payload): Json<HelpdeskTicketAgentReportCreateRequestV1>,
+) -> impl IntoResponse {
+    let Some(pool) = state.helpdesk_postgres.as_ref() else {
+        return service_unavailable("helpdesk_postgres_not_configured");
+    };
+
+    let ticket_id = ticket_id.trim().to_string();
+    if ticket_id.is_empty() {
+        return bad_request("ticket_id cannot be empty");
+    }
+
+    if let Err(validation_error) = payload.validate() {
+        return bad_request(validation_error.to_string());
+    }
+
+    match add_helpdesk_ticket_agent_report_pg(pool, &ticket_id, &payload.agent_id, &payload.note)
+        .await
+    {
+        Ok(ticket) => (
+            StatusCode::OK,
+            Json(json!({
+                "ticket": ticket,
+            })),
+        )
+            .into_response(),
+        Err(err) => {
+            error!(
+                error = %err,
+                ticket_id,
+                agent_id = payload.agent_id,
+                "failed to create Postgres helpdesk agent report"
+            );
+            bad_request(err.to_string())
+        }
+    }
+}
+
 async fn create_helpdesk_ticket_agent_report_handler(
     State(state): State<AppState>,
     AxumPath(ticket_id): AxumPath<String>,
@@ -1452,6 +1612,44 @@ async fn create_helpdesk_ticket_agent_report_handler(
                 ticket_id,
                 agent_id = payload.agent_id,
                 "failed to create helpdesk agent report"
+            );
+            bad_request(err.to_string())
+        }
+    }
+}
+
+async fn resolve_helpdesk_ticket_pg_handler(
+    State(state): State<AppState>,
+    AxumPath(ticket_id): AxumPath<String>,
+    Json(payload): Json<HelpdeskTicketResolveRequestV1>,
+) -> impl IntoResponse {
+    let Some(pool) = state.helpdesk_postgres.as_ref() else {
+        return service_unavailable("helpdesk_postgres_not_configured");
+    };
+
+    if let Err(validation_error) = payload.validate() {
+        return bad_request(validation_error.to_string());
+    }
+
+    let next_agent_status = payload
+        .next_agent_status
+        .unwrap_or(HelpdeskAgentStatus::Available);
+
+    match resolve_helpdesk_ticket_pg(pool, &ticket_id, &payload.agent_id, next_agent_status).await {
+        Ok((ticket, agent)) => (
+            StatusCode::OK,
+            Json(json!({
+                "ticket": ticket,
+                "agent": agent,
+            })),
+        )
+            .into_response(),
+        Err(err) => {
+            error!(
+                error = %err,
+                ticket_id,
+                agent_id = payload.agent_id,
+                "failed to resolve Postgres helpdesk ticket"
             );
             bad_request(err.to_string())
         }
@@ -1528,6 +1726,41 @@ async fn resolve_helpdesk_ticket_handler(
     }
 }
 
+async fn requeue_helpdesk_ticket_pg_handler(
+    State(state): State<AppState>,
+    AxumPath(ticket_id): AxumPath<String>,
+    Json(payload): Json<HelpdeskTicketSupervisorActionRequestV1>,
+) -> impl IntoResponse {
+    let Some(pool) = state.helpdesk_postgres.as_ref() else {
+        return service_unavailable("helpdesk_postgres_not_configured");
+    };
+
+    if let Err(validation_error) = payload.validate() {
+        return bad_request(validation_error.to_string());
+    }
+
+    let next_agent_status = payload
+        .next_agent_status
+        .unwrap_or(HelpdeskAgentStatus::Available);
+
+    match requeue_helpdesk_ticket_pg(pool, &ticket_id, next_agent_status, payload.reason.as_deref())
+        .await
+    {
+        Ok((ticket, agent)) => (
+            StatusCode::OK,
+            Json(json!({
+                "ticket": ticket,
+                "agent": agent,
+            })),
+        )
+            .into_response(),
+        Err(err) => {
+            error!(error = %err, ticket_id, "failed to requeue Postgres helpdesk ticket");
+            bad_request(err.to_string())
+        }
+    }
+}
+
 async fn requeue_helpdesk_ticket_handler(
     State(state): State<AppState>,
     AxumPath(ticket_id): AxumPath<String>,
@@ -1583,6 +1816,41 @@ async fn requeue_helpdesk_ticket_handler(
             .into_response(),
         Err(err) => {
             error!(error = %err, ticket_id, "failed to requeue helpdesk ticket");
+            bad_request(err.to_string())
+        }
+    }
+}
+
+async fn cancel_helpdesk_ticket_pg_handler(
+    State(state): State<AppState>,
+    AxumPath(ticket_id): AxumPath<String>,
+    Json(payload): Json<HelpdeskTicketSupervisorActionRequestV1>,
+) -> impl IntoResponse {
+    let Some(pool) = state.helpdesk_postgres.as_ref() else {
+        return service_unavailable("helpdesk_postgres_not_configured");
+    };
+
+    if let Err(validation_error) = payload.validate() {
+        return bad_request(validation_error.to_string());
+    }
+
+    let next_agent_status = payload
+        .next_agent_status
+        .unwrap_or(HelpdeskAgentStatus::Available);
+
+    match cancel_helpdesk_ticket_pg(pool, &ticket_id, next_agent_status, payload.reason.as_deref())
+        .await
+    {
+        Ok((ticket, agent)) => (
+            StatusCode::OK,
+            Json(json!({
+                "ticket": ticket,
+                "agent": agent,
+            })),
+        )
+            .into_response(),
+        Err(err) => {
+            error!(error = %err, ticket_id, "failed to cancel Postgres helpdesk ticket");
             bad_request(err.to_string())
         }
     }

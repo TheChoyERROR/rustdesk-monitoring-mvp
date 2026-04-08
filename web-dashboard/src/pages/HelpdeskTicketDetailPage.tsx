@@ -218,9 +218,9 @@ export default function HelpdeskTicketDetailPage() {
           {helpdeskBackendMode === 'postgres' ? (
             <div className="panel">
               <p className="activity-summary-line">
-                Este ticket se esta leyendo desde el flujo experimental de Postgres. Por ahora el
-                dashboard solo permite consulta, auditoria y creacion basica; despacho, recola,
-                cancelacion y campos operativos siguen viviendo en SQLite.
+                Este ticket se esta gestionando desde Postgres. Si el backend ya corre con
+                <code> HELPDESK_BACKEND=postgres </code>
+                el despacho y las acciones operativas deben funcionar aqui igual que en SQLite.
               </p>
             </div>
           ) : null}
@@ -233,7 +233,6 @@ export default function HelpdeskTicketDetailPage() {
                   <select
                     id="ticket-dispatch-agent"
                     value={dispatchAgentId}
-                    disabled={helpdeskBackendMode === 'postgres'}
                     onChange={(event) => setDispatchAgentId(event.target.value)}
                   >
                     <option value="">Selecciona un agente</option>
@@ -249,7 +248,6 @@ export default function HelpdeskTicketDetailPage() {
                   <select
                     id="ticket-next-agent-status"
                     value={nextAgentStatus}
-                    disabled={helpdeskBackendMode === 'postgres'}
                     onChange={(event) => setNextAgentStatus(event.target.value as 'available' | 'away')}
                   >
                     <option value="available">Disponible</option>
@@ -261,7 +259,6 @@ export default function HelpdeskTicketDetailPage() {
                   <input
                     id="ticket-action-reason"
                     value={actionReason}
-                    disabled={helpdeskBackendMode === 'postgres'}
                     onChange={(event) => setActionReason(event.target.value)}
                     placeholder="reintento, falso positivo, operador caido..."
                   />
@@ -272,7 +269,6 @@ export default function HelpdeskTicketDetailPage() {
                   type="button"
                   className="btn primary"
                   disabled={
-                    helpdeskBackendMode === 'postgres' ||
                     actionBusy !== null ||
                     ticket.status !== 'queued' ||
                     availableAgents.length === 0 ||
@@ -300,7 +296,6 @@ export default function HelpdeskTicketDetailPage() {
                   type="button"
                   className="btn secondary"
                   disabled={
-                    helpdeskBackendMode === 'postgres' ||
                     actionBusy !== null ||
                     ticket.status === 'resolved'
                   }
@@ -326,7 +321,6 @@ export default function HelpdeskTicketDetailPage() {
                   type="button"
                   className="btn secondary"
                   disabled={
-                    helpdeskBackendMode === 'postgres' ||
                     actionBusy !== null ||
                     ticket.status === 'resolved' ||
                     ticket.status === 'cancelled'
@@ -360,7 +354,7 @@ export default function HelpdeskTicketDetailPage() {
                     id="ticket-operational-difficulty"
                     value={operationalDifficulty}
                     onChange={(event) => setOperationalDifficulty(event.target.value)}
-                    disabled={helpdeskBackendMode === 'postgres' || operationalBusy}
+                    disabled={operationalBusy}
                   >
                     <option value="low">Baja</option>
                     <option value="medium">Media</option>
@@ -376,7 +370,7 @@ export default function HelpdeskTicketDetailPage() {
                     step="1"
                     value={operationalEstimatedMinutes}
                     onChange={(event) => setOperationalEstimatedMinutes(event.target.value)}
-                    disabled={helpdeskBackendMode === 'postgres' || operationalBusy}
+                    disabled={operationalBusy}
                   />
                 </div>
               </div>
@@ -384,7 +378,7 @@ export default function HelpdeskTicketDetailPage() {
                 <button
                   type="button"
                   className="btn secondary"
-                  disabled={helpdeskBackendMode === 'postgres' || operationalBusy}
+                  disabled={operationalBusy}
                   onClick={async () => {
                     setOperationalBusy(true);
                     setError(null);

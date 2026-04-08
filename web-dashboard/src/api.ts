@@ -105,18 +105,6 @@ function helpdeskBasePath(): string {
   return isHelpdeskPostgresModeEnabled() ? '/api/v1/postgres/helpdesk' : '/api/v1/helpdesk';
 }
 
-function ensureSqliteOnlyHelpdeskAction(action: string) {
-  if (!isHelpdeskPostgresModeEnabled()) {
-    return;
-  }
-
-  throw new ApiError(
-    `${action} todavia no esta habilitado en el modo experimental Postgres.`,
-    400,
-    { error: 'postgres_helpdesk_action_not_supported' },
-  );
-}
-
 export async function apiLogin(body: AuthLoginRequest): Promise<AuthLoginResponse> {
   return request<AuthLoginResponse>('/api/v1/auth/login', {
     method: 'POST',
@@ -292,9 +280,8 @@ export async function apiHelpdeskTicketAssign(
   ticketId: string,
   body: HelpdeskTicketAssignBody,
 ): Promise<HelpdeskTicket> {
-  ensureSqliteOnlyHelpdeskAction('El despacho manual');
   const response = await request<{ ticket: HelpdeskTicket }>(
-    `/api/v1/helpdesk/tickets/${encodeURIComponent(ticketId)}/assign`,
+    `${helpdeskBasePath()}/tickets/${encodeURIComponent(ticketId)}/assign`,
     {
       method: 'POST',
       body: JSON.stringify(body),
@@ -312,9 +299,8 @@ export async function apiHelpdeskTicketUpdateOperational(
   ticketId: string,
   body: HelpdeskTicketOperationalBody,
 ): Promise<HelpdeskTicket> {
-  ensureSqliteOnlyHelpdeskAction('La actualizacion de campos operativos');
   const response = await request<{ ticket: HelpdeskTicket }>(
-    `/api/v1/helpdesk/tickets/${encodeURIComponent(ticketId)}/operational`,
+    `${helpdeskBasePath()}/tickets/${encodeURIComponent(ticketId)}/operational`,
     {
       method: 'POST',
       body: JSON.stringify(body),
@@ -327,9 +313,8 @@ export async function apiHelpdeskTicketRequeue(
   ticketId: string,
   body: HelpdeskSupervisorActionBody,
 ): Promise<HelpdeskTicket | null> {
-  ensureSqliteOnlyHelpdeskAction('La recola de tickets');
   const response = await request<{ ticket: HelpdeskTicket | null }>(
-    `/api/v1/helpdesk/tickets/${encodeURIComponent(ticketId)}/requeue`,
+    `${helpdeskBasePath()}/tickets/${encodeURIComponent(ticketId)}/requeue`,
     {
       method: 'POST',
       body: JSON.stringify(body),
@@ -342,9 +327,8 @@ export async function apiHelpdeskTicketCancel(
   ticketId: string,
   body: HelpdeskSupervisorActionBody,
 ): Promise<HelpdeskTicket | null> {
-  ensureSqliteOnlyHelpdeskAction('La cancelacion de tickets');
   const response = await request<{ ticket: HelpdeskTicket | null }>(
-    `/api/v1/helpdesk/tickets/${encodeURIComponent(ticketId)}/cancel`,
+    `${helpdeskBasePath()}/tickets/${encodeURIComponent(ticketId)}/cancel`,
     {
       method: 'POST',
       body: JSON.stringify(body),
