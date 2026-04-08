@@ -9,14 +9,10 @@ use crate::model::{
     HelpdeskAuditEventV1, HelpdeskAuthorizedAgentUpsertRequestV1, HelpdeskAuthorizedAgentV1,
     HelpdeskTicketCreateRequestV1, HelpdeskTicketStatus, HelpdeskTicketV1,
 };
-use crate::postgres::init_postgres_helpdesk_schema;
-
 pub async fn upsert_helpdesk_authorized_agent_pg(
     pool: &PgPool,
     payload: &HelpdeskAuthorizedAgentUpsertRequestV1,
 ) -> Result<HelpdeskAuthorizedAgentV1> {
-    init_postgres_helpdesk_schema(pool).await?;
-
     let agent_id = normalize_helpdesk_agent_id(&payload.agent_id);
     let display_name = normalize_optional_text(payload.display_name.as_deref());
     ensure_helpdesk_agent_display_name_available_pg(pool, &agent_id, display_name.as_deref()).await?;
@@ -44,7 +40,6 @@ pub async fn upsert_helpdesk_authorized_agent_pg(
 }
 
 pub async fn list_helpdesk_authorized_agents_pg(pool: &PgPool) -> Result<Vec<HelpdeskAuthorizedAgentV1>> {
-    init_postgres_helpdesk_schema(pool).await?;
     let rows = sqlx::query(
         r#"
         SELECT agent_id, display_name, created_at, updated_at
@@ -63,8 +58,6 @@ pub async fn create_helpdesk_ticket_pg(
     pool: &PgPool,
     payload: &HelpdeskTicketCreateRequestV1,
 ) -> Result<HelpdeskTicketV1> {
-    init_postgres_helpdesk_schema(pool).await?;
-
     let now_ms = unix_millis_now();
     let ticket_id = Uuid::new_v4().to_string();
     let normalized_title = normalize_optional_text(payload.title.as_deref());
@@ -129,7 +122,6 @@ pub async fn create_helpdesk_ticket_pg(
 }
 
 pub async fn list_helpdesk_tickets_pg(pool: &PgPool) -> Result<Vec<HelpdeskTicketV1>> {
-    init_postgres_helpdesk_schema(pool).await?;
     let rows = sqlx::query(
         r#"
         SELECT ticket_id, client_id, client_display_name, device_id, requested_by, title,
@@ -148,7 +140,6 @@ pub async fn list_helpdesk_tickets_pg(pool: &PgPool) -> Result<Vec<HelpdeskTicke
 }
 
 pub async fn get_helpdesk_ticket_pg(pool: &PgPool, ticket_id: &str) -> Result<Option<HelpdeskTicketV1>> {
-    init_postgres_helpdesk_schema(pool).await?;
     let row = sqlx::query(
         r#"
         SELECT ticket_id, client_id, client_display_name, device_id, requested_by, title,
@@ -174,7 +165,6 @@ pub async fn append_helpdesk_audit_event_pg(
     event_type: &str,
     payload: Option<Value>,
 ) -> Result<()> {
-    init_postgres_helpdesk_schema(pool).await?;
     sqlx::query(
         r#"
         INSERT INTO helpdesk_audit_events (entity_type, entity_id, event_type, payload, created_at)
@@ -193,7 +183,6 @@ pub async fn append_helpdesk_audit_event_pg(
 }
 
 pub async fn list_helpdesk_ticket_audit_pg(pool: &PgPool, ticket_id: &str) -> Result<Vec<HelpdeskAuditEventV1>> {
-    init_postgres_helpdesk_schema(pool).await?;
     let rows = sqlx::query(
         r#"
         SELECT entity_type, entity_id, event_type, payload, created_at

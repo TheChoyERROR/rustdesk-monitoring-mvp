@@ -10,6 +10,7 @@ Este spike deja preparado un primer camino controlado hacia Render Postgres sin 
 - import inicial de datos `helpdesk` desde SQLite local
 - storage minimo de `helpdesk` sobre Postgres
 - smoke CRUD real de `helpdesk` sobre Render Postgres
+- integracion opcional al servidor mediante rutas protegidas
 
 ## Archivos
 
@@ -19,6 +20,7 @@ Este spike deja preparado un primer camino controlado hacia Render Postgres sin 
 - [src/bin/render-postgres-smoke.rs](/C:/Users/Choy/Desktop/rustdesk-monitoring-mvp/src/bin/render-postgres-smoke.rs)
 - [src/bin/render-postgres-helpdesk-bootstrap.rs](/C:/Users/Choy/Desktop/rustdesk-monitoring-mvp/src/bin/render-postgres-helpdesk-bootstrap.rs)
 - [src/bin/render-postgres-helpdesk-crud-smoke.rs](/C:/Users/Choy/Desktop/rustdesk-monitoring-mvp/src/bin/render-postgres-helpdesk-crud-smoke.rs)
+- [src/server.rs](/C:/Users/Choy/Desktop/rustdesk-monitoring-mvp/src/server.rs)
 
 ## Validado
 
@@ -30,6 +32,7 @@ Se valido contra la base Free creada en Render:
 - insercion de fila de prueba OK
 - bootstrap del schema de helpdesk OK
 - CRUD real de `helpdesk` OK
+- handlers protegidos sobre Postgres OK
 
 Salida observada:
 
@@ -38,6 +41,29 @@ Render Postgres OK: select_one=1, smoke_rows=2
 Render Postgres helpdesk bootstrap OK: authorized_agents=0, agents=0, tickets=0, assignments=0, heartbeats=0, audit_events=0
 Render Postgres helpdesk CRUD OK: authorized_agents=1, tickets=1, fetched_ticket=<uuid>, audit_events=2
 ```
+
+## Activar rutas experimentales en el servidor
+
+Configura una de estas variables:
+
+```text
+HELPDESK_POSTGRES_DATABASE_URL=<database-url>
+```
+
+o, como fallback:
+
+```text
+DATABASE_URL=<database-url>
+```
+
+Con eso el servidor habilita rutas protegidas por dashboard auth:
+
+- `GET/POST /api/v1/postgres/helpdesk/agent-authorizations`
+- `GET/POST /api/v1/postgres/helpdesk/tickets`
+- `GET /api/v1/postgres/helpdesk/tickets/:ticket_id`
+- `GET /api/v1/postgres/helpdesk/tickets/:ticket_id/audit`
+
+Si Postgres no esta configurado, esas rutas responden `503`.
 
 ## Como usar
 

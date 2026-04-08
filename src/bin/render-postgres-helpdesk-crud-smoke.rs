@@ -1,7 +1,7 @@
 use anyhow::Context;
 use clap::Parser;
 use rustdesk_monitoring_mvp::model::{HelpdeskAuthorizedAgentUpsertRequestV1, HelpdeskTicketCreateRequestV1};
-use rustdesk_monitoring_mvp::postgres::connect_postgres;
+use rustdesk_monitoring_mvp::postgres::{connect_postgres, init_postgres_helpdesk_schema};
 use rustdesk_monitoring_mvp::postgres_helpdesk::{
     append_helpdesk_audit_event_pg, create_helpdesk_ticket_pg, get_helpdesk_ticket_pg,
     list_helpdesk_authorized_agents_pg, list_helpdesk_ticket_audit_pg, list_helpdesk_tickets_pg,
@@ -27,6 +27,7 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
     let pool = connect_postgres(&args.database_url).await?;
+    init_postgres_helpdesk_schema(&pool).await?;
 
     let smoke_suffix = Uuid::new_v4().simple().to_string();
     let agent_id = format!("pgsmoke{}", &smoke_suffix[..8]);

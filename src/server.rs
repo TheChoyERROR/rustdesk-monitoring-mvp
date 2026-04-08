@@ -1,4 +1,5 @@
 use std::convert::Infallible;
+use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -33,6 +34,11 @@ use crate::model::{
     HelpdeskTicketSupervisorActionRequestV1, PaginatedResponseV1, SessionActorTypeV1,
     SessionEventType, SessionEventV1,
 };
+use crate::postgres::{connect_postgres, init_postgres_helpdesk_schema};
+use crate::postgres_helpdesk::{
+    create_helpdesk_ticket_pg, get_helpdesk_ticket_pg, list_helpdesk_authorized_agents_pg,
+    list_helpdesk_ticket_audit_pg, list_helpdesk_tickets_pg, upsert_helpdesk_authorized_agent_pg,
+};
 use crate::storage::{
     add_helpdesk_ticket_agent_report, assign_helpdesk_ticket, cancel_helpdesk_ticket, claim_due_events,
     cleanup_delivered_older_than, cleanup_expired_dashboard_sessions,
@@ -66,6 +72,7 @@ const HELPDESK_AGENT_STALE_AFTER_MS: i64 = 30_000;
 #[derive(Clone)]
 struct AppState {
     pool: sqlx::SqlitePool,
+    helpdesk_postgres: Option<sqlx::PgPool>,
     helpdesk_turso: Option<TursoSyncConfig>,
     metrics: Arc<Metrics>,
     dispatcher: WebhookDispatcher,
@@ -211,6 +218,40 @@ pub async fn run(
 
     let metrics = Arc::new(Metrics::default());
     let dispatcher = WebhookDispatcher::new(config.webhook.clone())?;
+    let helpdesk_postgres = match env::var("HELPDESK_POSTGRES_DATABASE_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| env::var("DATABASE_URL").ok().filter(|value| !value.trim().is_empty()))
+    {
+        Some(database_url) => match connect_postgres(&database_url).await {
+            Ok(pool) => {
+                match init_postgres_helpdesk_schema(&pool).await {
+                    Ok(()) => {
+                        info!("helpdesk Postgres pool initialized");
+                        Some(pool)
+                    }
+                    Err(err) => {
+                        error!(
+                            error = %err,
+                            "failed to initialize Postgres helpdesk schema; continuing without Postgres helpdesk routes"
+                        );
+                        None
+                    }
+                }
+            }
+            Err(err) => {
+                error!(
+                    error = %err,
+                    "failed to initialize helpdesk Postgres pool; continuing without Postgres helpdesk routes"
+                );
+                None
+            }
+        },
+        None => {
+            info!("helpdesk Postgres routes disabled; HELPDESK_POSTGRES_DATABASE_URL/DATABASE_URL not set");
+            None
+        }
+    };
 
     let circuit_breaker = Arc::new(CircuitBreaker::new(
         config.worker.circuit_breaker_threshold,
@@ -220,6 +261,7 @@ pub async fn run(
 
     let state = AppState {
         pool,
+        helpdesk_postgres,
         helpdesk_turso,
         metrics,
         dispatcher,
@@ -246,6 +288,23 @@ pub async fn run(
         .route(
             "/api/v1/helpdesk/agent-authorizations/:agent_id",
             axum::routing::delete(delete_helpdesk_authorized_agent_handler),
+        )
+        .route(
+            "/api/v1/postgres/helpdesk/agent-authorizations",
+            get(list_helpdesk_authorized_agents_pg_handler)
+                .post(upsert_helpdesk_authorized_agent_pg_handler),
+        )
+        .route(
+            "/api/v1/postgres/helpdesk/tickets",
+            get(list_helpdesk_tickets_pg_handler).post(create_helpdesk_ticket_pg_handler),
+        )
+        .route(
+            "/api/v1/postgres/helpdesk/tickets/:ticket_id",
+            get(get_helpdesk_ticket_pg_handler),
+        )
+        .route(
+            "/api/v1/postgres/helpdesk/tickets/:ticket_id/audit",
+            get(list_helpdesk_ticket_audit_pg_handler),
         )
         .route(
             "/api/v1/sessions/:session_id/timeline",
@@ -483,6 +542,22 @@ async fn list_helpdesk_authorized_agents_handler(
     }
 }
 
+async fn list_helpdesk_authorized_agents_pg_handler(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let Some(pool) = state.helpdesk_postgres.as_ref() else {
+        return service_unavailable("helpdesk_postgres_not_configured");
+    };
+
+    match list_helpdesk_authorized_agents_pg(pool).await {
+        Ok(agents) => (StatusCode::OK, Json(json!({ "agents": agents }))).into_response(),
+        Err(err) => {
+            error!(error = %err, "failed to list Postgres authorized helpdesk agents");
+            internal_error()
+        }
+    }
+}
+
 async fn upsert_helpdesk_authorized_agent_handler(
     State(state): State<AppState>,
     Json(payload): Json<HelpdeskAuthorizedAgentUpsertRequestV1>,
@@ -501,6 +576,34 @@ async fn upsert_helpdesk_authorized_agent_handler(
                 error = %err,
                 agent_id = payload.agent_id,
                 "failed to upsert authorized helpdesk agent"
+            );
+            internal_error()
+        }
+    }
+}
+
+async fn upsert_helpdesk_authorized_agent_pg_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<HelpdeskAuthorizedAgentUpsertRequestV1>,
+) -> impl IntoResponse {
+    let Some(pool) = state.helpdesk_postgres.as_ref() else {
+        return service_unavailable("helpdesk_postgres_not_configured");
+    };
+
+    if let Err(validation_error) = payload.validate() {
+        return bad_request(validation_error.to_string());
+    }
+
+    match upsert_helpdesk_authorized_agent_pg(pool, &payload).await {
+        Ok(agent) => (StatusCode::OK, Json(json!({ "agent": agent }))).into_response(),
+        Err(err) => {
+            if err.to_string().contains("display name '") {
+                return bad_request(err.to_string());
+            }
+            error!(
+                error = %err,
+                agent_id = payload.agent_id,
+                "failed to upsert Postgres authorized helpdesk agent"
             );
             internal_error()
         }
@@ -648,6 +751,20 @@ async fn list_helpdesk_tickets_handler(State(state): State<AppState>) -> impl In
     }
 }
 
+async fn list_helpdesk_tickets_pg_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let Some(pool) = state.helpdesk_postgres.as_ref() else {
+        return service_unavailable("helpdesk_postgres_not_configured");
+    };
+
+    match list_helpdesk_tickets_pg(pool).await {
+        Ok(tickets) => (StatusCode::OK, Json(json!({ "tickets": tickets }))).into_response(),
+        Err(err) => {
+            error!(error = %err, "failed to list Postgres helpdesk tickets");
+            internal_error()
+        }
+    }
+}
+
 async fn get_helpdesk_ticket_handler(
     State(state): State<AppState>,
     AxumPath(ticket_id): AxumPath<String>,
@@ -669,6 +786,36 @@ async fn get_helpdesk_ticket_handler(
             .into_response(),
         Err(err) => {
             error!(error = %err, ticket_id, "failed to get helpdesk ticket");
+            internal_error()
+        }
+    }
+}
+
+async fn get_helpdesk_ticket_pg_handler(
+    State(state): State<AppState>,
+    AxumPath(ticket_id): AxumPath<String>,
+) -> impl IntoResponse {
+    let Some(pool) = state.helpdesk_postgres.as_ref() else {
+        return service_unavailable("helpdesk_postgres_not_configured");
+    };
+
+    let ticket_id = ticket_id.trim().to_string();
+    if ticket_id.is_empty() {
+        return bad_request("ticket_id cannot be empty");
+    }
+
+    match get_helpdesk_ticket_pg(pool, &ticket_id).await {
+        Ok(Some(ticket)) => (StatusCode::OK, Json(json!({ "ticket": ticket }))).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "error": "ticket_not_found",
+                "ticket_id": ticket_id,
+            })),
+        )
+            .into_response(),
+        Err(err) => {
+            error!(error = %err, ticket_id, "failed to get Postgres helpdesk ticket");
             internal_error()
         }
     }
@@ -701,6 +848,37 @@ async fn list_helpdesk_ticket_audit_handler(
     }
 }
 
+async fn list_helpdesk_ticket_audit_pg_handler(
+    State(state): State<AppState>,
+    AxumPath(ticket_id): AxumPath<String>,
+    Query(query): Query<HelpdeskAuditQuery>,
+) -> impl IntoResponse {
+    let Some(pool) = state.helpdesk_postgres.as_ref() else {
+        return service_unavailable("helpdesk_postgres_not_configured");
+    };
+
+    let ticket_id = ticket_id.trim().to_string();
+    if ticket_id.is_empty() {
+        return bad_request("ticket_id cannot be empty");
+    }
+
+    let limit = query.limit.unwrap_or(100).clamp(1, 500) as usize;
+    match list_helpdesk_ticket_audit_pg(pool, &ticket_id).await {
+        Ok(events) => (
+            StatusCode::OK,
+            Json(json!({
+                "events": events.into_iter().take(limit).collect::<Vec<_>>(),
+                "ticket_id": ticket_id,
+            })),
+        )
+            .into_response(),
+        Err(err) => {
+            error!(error = %err, ticket_id, "failed to list Postgres helpdesk ticket audit");
+            internal_error()
+        }
+    }
+}
+
 async fn create_helpdesk_ticket_handler(
     State(state): State<AppState>,
     Json(payload): Json<HelpdeskTicketCreateRequestV1>,
@@ -713,6 +891,27 @@ async fn create_helpdesk_ticket_handler(
         Ok(ticket) => (StatusCode::CREATED, Json(json!({ "ticket": ticket }))).into_response(),
         Err(err) => {
             error!(error = %err, client_id = payload.client_id, "failed to create helpdesk ticket");
+            internal_error()
+        }
+    }
+}
+
+async fn create_helpdesk_ticket_pg_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<HelpdeskTicketCreateRequestV1>,
+) -> impl IntoResponse {
+    let Some(pool) = state.helpdesk_postgres.as_ref() else {
+        return service_unavailable("helpdesk_postgres_not_configured");
+    };
+
+    if let Err(validation_error) = payload.validate() {
+        return bad_request(validation_error.to_string());
+    }
+
+    match create_helpdesk_ticket_pg(pool, &payload).await {
+        Ok(ticket) => (StatusCode::CREATED, Json(json!({ "ticket": ticket }))).into_response(),
+        Err(err) => {
+            error!(error = %err, "failed to create Postgres helpdesk ticket");
             internal_error()
         }
     }
@@ -1677,6 +1876,16 @@ fn forbidden(message: impl Into<String>) -> Response {
         Json(json!({
             "error": "forbidden",
             "message": message.into(),
+        })),
+    )
+        .into_response()
+}
+
+fn service_unavailable(code: impl Into<String>) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "error": code.into(),
         })),
     )
         .into_response()
