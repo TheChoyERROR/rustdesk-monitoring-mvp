@@ -15,8 +15,7 @@ use crate::model::{
     HelpdeskAuditEventV1, HelpdeskAuthorizedAgentUpsertRequestV1, HelpdeskAuthorizedAgentV1,
     HelpdeskOperationalSummaryV1, HelpdeskTicketCreateRequestV1, HelpdeskTicketStatus,
     HelpdeskTicketV1, PresenceParticipantV1, PresenceSessionSummaryV1, SessionActorTypeV1,
-    SessionEventType, SessionEventV1, SessionPresenceV1, SessionReportRowV1,
-    SessionTimelineItemV1,
+    SessionEventType, SessionEventV1, SessionPresenceV1, SessionReportRowV1, SessionTimelineItemV1,
 };
 use crate::schema::init_sqlite_schema;
 
@@ -221,14 +220,18 @@ pub async fn should_store_session_event(
     monitoring: &MonitoringConfig,
 ) -> anyhow::Result<bool> {
     if monitoring.capture_non_agent_events {
-        return should_store_participant_activity(pool, event, monitoring).await;
+        return should_store_participant_activity_for_monitoring(pool, event, monitoring).await;
     }
 
     if !is_known_helpdesk_agent_id(pool, &event.user_id).await? {
         return Ok(false);
     }
 
-    should_store_participant_activity(pool, event, monitoring).await
+    if !helpdesk_agent_has_active_ticket(pool, &event.user_id).await? {
+        return Ok(false);
+    }
+
+    should_store_participant_activity_for_monitoring(pool, event, monitoring).await
 }
 
 pub async fn claim_due_events(
@@ -1286,11 +1289,18 @@ pub async fn update_helpdesk_ticket_operational_fields(
 
     let current_ticket = get_helpdesk_ticket_tx(&mut tx, ticket_id)
         .await?
-        .with_context(|| format!("helpdesk ticket '{}' not found before operational update", ticket_id))?;
+        .with_context(|| {
+            format!(
+                "helpdesk ticket '{}' not found before operational update",
+                ticket_id
+            )
+        })?;
 
     if matches!(
         current_ticket.status,
-        HelpdeskTicketStatus::Resolved | HelpdeskTicketStatus::Cancelled | HelpdeskTicketStatus::Failed
+        HelpdeskTicketStatus::Resolved
+            | HelpdeskTicketStatus::Cancelled
+            | HelpdeskTicketStatus::Failed
     ) {
         anyhow::bail!("ticket can no longer be updated operationally");
     }
@@ -1354,8 +1364,8 @@ pub async fn add_helpdesk_ticket_agent_report(
     let now_ms = unix_millis_now() as i64;
     let ticket_id = ticket_id.trim();
     let agent_id = agent_id.trim();
-    let normalized_note = normalize_optional_text(Some(note))
-        .context("agent report note cannot be empty")?;
+    let normalized_note =
+        normalize_optional_text(Some(note)).context("agent report note cannot be empty")?;
 
     let mut tx = pool
         .begin()
@@ -1364,7 +1374,12 @@ pub async fn add_helpdesk_ticket_agent_report(
 
     let current_ticket = get_helpdesk_ticket_tx(&mut tx, ticket_id)
         .await?
-        .with_context(|| format!("helpdesk ticket '{}' not found before agent report", ticket_id))?;
+        .with_context(|| {
+            format!(
+                "helpdesk ticket '{}' not found before agent report",
+                ticket_id
+            )
+        })?;
 
     if current_ticket.assigned_agent_id.as_deref() != Some(agent_id) {
         anyhow::bail!("ticket is not currently assigned to this agent");
@@ -1379,7 +1394,12 @@ pub async fn add_helpdesk_ticket_agent_report(
 
     let agent = get_helpdesk_agent_tx(&mut tx, agent_id)
         .await?
-        .with_context(|| format!("helpdesk agent '{}' not found before agent report", agent_id))?;
+        .with_context(|| {
+            format!(
+                "helpdesk agent '{}' not found before agent report",
+                agent_id
+            )
+        })?;
 
     sqlx::query(
         r#"
@@ -1397,7 +1417,12 @@ pub async fn add_helpdesk_ticket_agent_report(
     .bind(now_ms)
     .execute(&mut *tx)
     .await
-    .with_context(|| format!("failed to store latest agent report for ticket '{}'", ticket_id))?;
+    .with_context(|| {
+        format!(
+            "failed to store latest agent report for ticket '{}'",
+            ticket_id
+        )
+    })?;
 
     insert_helpdesk_audit_event_tx(
         &mut tx,
@@ -1415,7 +1440,12 @@ pub async fn add_helpdesk_ticket_agent_report(
 
     let ticket = get_helpdesk_ticket_tx(&mut tx, ticket_id)
         .await?
-        .with_context(|| format!("helpdesk ticket '{}' not found after agent report", ticket_id))?;
+        .with_context(|| {
+            format!(
+                "helpdesk ticket '{}' not found after agent report",
+                ticket_id
+            )
+        })?;
 
     tx.commit()
         .await
@@ -3005,7 +3035,7 @@ fn push_helpdesk_client_match_clause(qb: &mut QueryBuilder<'_, Sqlite>, user_id_
     ));
 }
 
-async fn should_store_participant_activity(
+pub async fn should_store_participant_activity_for_monitoring(
     pool: &SqlitePool,
     event: &SessionEventV1,
     monitoring: &MonitoringConfig,
@@ -3051,7 +3081,7 @@ async fn should_store_participant_activity(
     Ok(event_ms.saturating_sub(last_activity_at) >= min_interval_ms)
 }
 
-async fn is_known_helpdesk_agent_id(pool: &SqlitePool, user_id: &str) -> anyhow::Result<bool> {
+pub async fn is_known_helpdesk_agent_id(pool: &SqlitePool, user_id: &str) -> anyhow::Result<bool> {
     let normalized_user_id = normalize_helpdesk_identity_id(user_id);
     if normalized_user_id.is_empty() {
         return Ok(false);
@@ -3074,6 +3104,39 @@ async fn is_known_helpdesk_agent_id(pool: &SqlitePool, user_id: &str) -> anyhow:
     .fetch_one(pool)
     .await
     .context("failed to classify session actor against helpdesk agents")?;
+
+    Ok(exists != 0)
+}
+
+pub async fn helpdesk_agent_has_active_ticket(
+    pool: &SqlitePool,
+    user_id: &str,
+) -> anyhow::Result<bool> {
+    let normalized_user_id = normalize_helpdesk_identity_id(user_id);
+    if normalized_user_id.is_empty() {
+        return Ok(false);
+    }
+
+    let exists = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT EXISTS(
+            SELECT 1
+            FROM helpdesk_tickets ht
+            WHERE REPLACE(TRIM(COALESCE(ht.assigned_agent_id, '')), ' ', '') = ?1
+              AND ht.status IN ('opening', 'in_progress')
+            UNION
+            SELECT 1
+            FROM helpdesk_agents ha
+            WHERE REPLACE(TRIM(ha.agent_id), ' ', '') = ?1
+              AND ha.current_ticket_id IS NOT NULL
+              AND ha.status IN ('opening', 'busy')
+        )
+        "#,
+    )
+    .bind(normalized_user_id)
+    .fetch_one(pool)
+    .await
+    .context("failed to determine whether helpdesk agent has an active ticket")?;
 
     Ok(exists != 0)
 }
@@ -3377,7 +3440,10 @@ fn row_to_helpdesk_authorized_agent(
 }
 
 fn normalize_helpdesk_identity_id(raw: &str) -> String {
-    raw.trim().chars().filter(|ch| !ch.is_whitespace()).collect()
+    raw.trim()
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect()
 }
 
 fn normalize_helpdesk_agent_id(raw: &str) -> String {
@@ -3389,7 +3455,10 @@ async fn ensure_helpdesk_agent_display_name_available(
     agent_id: &str,
     display_name: Option<&str>,
 ) -> anyhow::Result<()> {
-    let Some(display_name) = display_name.map(str::trim).filter(|value| !value.is_empty()) else {
+    let Some(display_name) = display_name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
         return Ok(());
     };
 
@@ -3584,24 +3653,22 @@ mod tests {
     use crate::config::MonitoringConfig;
     use crate::model::{
         HelpdeskAgentPresenceUpdateV1, HelpdeskAgentStatus, HelpdeskAuthorizedAgentUpsertRequestV1,
-        HelpdeskTicketCreateRequestV1, HelpdeskTicketStatus, SessionActorTypeV1,
-        SessionDirection, SessionEventType, SessionEventV1,
+        HelpdeskTicketCreateRequestV1, HelpdeskTicketStatus, SessionActorTypeV1, SessionDirection,
+        SessionEventType, SessionEventV1,
     };
 
     use super::{
         add_helpdesk_ticket_agent_report, assign_helpdesk_ticket, cancel_helpdesk_ticket,
         cleanup_delivered_older_than, cleanup_helpdesk_agent_heartbeats_older_than,
         cleanup_inactive_session_presence_older_than, cleanup_session_events_older_than,
-        connect_sqlite, create_helpdesk_ticket,
-        expire_stale_presence, get_helpdesk_agent, get_helpdesk_agent_authorization_status,
-        get_helpdesk_assignment_for_agent, get_helpdesk_operational_summary, get_helpdesk_ticket,
-        get_session_presence, insert_event, list_active_session_presence,
-        list_helpdesk_ticket_audit_events, list_helpdesk_tickets, reconcile_helpdesk_runtime,
-        query_timeline_events, requeue_helpdesk_ticket, resolve_helpdesk_ticket,
-        should_store_session_event,
-        start_helpdesk_ticket, unix_millis_now, update_helpdesk_ticket_operational_fields,
-        upsert_helpdesk_agent_presence, upsert_helpdesk_authorized_agent, EventQueryFilter,
-        InsertOutcome,
+        connect_sqlite, create_helpdesk_ticket, expire_stale_presence, get_helpdesk_agent,
+        get_helpdesk_agent_authorization_status, get_helpdesk_assignment_for_agent,
+        get_helpdesk_operational_summary, get_helpdesk_ticket, get_session_presence, insert_event,
+        list_active_session_presence, list_helpdesk_ticket_audit_events, list_helpdesk_tickets,
+        query_timeline_events, reconcile_helpdesk_runtime, requeue_helpdesk_ticket,
+        resolve_helpdesk_ticket, should_store_session_event, start_helpdesk_ticket,
+        unix_millis_now, update_helpdesk_ticket_operational_fields, upsert_helpdesk_agent_presence,
+        upsert_helpdesk_authorized_agent, EventQueryFilter, InsertOutcome,
     };
 
     async fn authorize_agent(pool: &sqlx::SqlitePool, agent_id: &str, display_name: &str) {
@@ -3671,6 +3738,44 @@ mod tests {
         let pool = connect_sqlite(&db_path).await.expect("connect sqlite");
 
         authorize_agent(&pool, "278084673", "Edward soporte").await;
+        upsert_helpdesk_agent_presence(
+            &pool,
+            &HelpdeskAgentPresenceUpdateV1 {
+                agent_id: "278084673".to_string(),
+                display_name: Some("Edward soporte".to_string()),
+                avatar_url: None,
+                status: HelpdeskAgentStatus::Available,
+            },
+        )
+        .await
+        .expect("upsert agent presence");
+
+        let ticket = create_helpdesk_ticket(
+            &pool,
+            &HelpdeskTicketCreateRequestV1 {
+                client_id: "client-sampled".to_string(),
+                client_display_name: None,
+                device_id: None,
+                requested_by: None,
+                title: None,
+                description: None,
+                difficulty: None,
+                estimated_minutes: None,
+                summary: Some("Sampling".to_string()),
+                preferred_agent_id: None,
+            },
+        )
+        .await
+        .expect("create ticket");
+
+        assign_helpdesk_ticket(
+            &pool,
+            &ticket.ticket_id,
+            Some("278084673"),
+            Some("monitoring sampling test"),
+        )
+        .await
+        .expect("assign ticket");
 
         let base_ts = Utc::now();
         let first = SessionEventV1 {
@@ -3717,7 +3822,9 @@ mod tests {
                 .await
                 .expect("first activity should be stored")
         );
-        insert_event(&pool, &first).await.expect("insert first activity");
+        insert_event(&pool, &first)
+            .await
+            .expect("insert first activity");
 
         assert!(
             !should_store_session_event(&pool, &second, &MonitoringConfig::default())
@@ -3729,6 +3836,107 @@ mod tests {
                 .await
                 .expect("third activity should be stored")
         );
+    }
+
+    #[tokio::test]
+    async fn monitoring_policy_ignores_agent_events_without_active_ticket() {
+        let temp = tempdir().expect("create temp dir");
+        let db_path = temp.path().join("monitoring-agent-idle.db");
+        let pool = connect_sqlite(&db_path).await.expect("connect sqlite");
+
+        authorize_agent(&pool, "agent-idle", "Agente Idle").await;
+        upsert_helpdesk_agent_presence(
+            &pool,
+            &HelpdeskAgentPresenceUpdateV1 {
+                agent_id: "agent-idle".to_string(),
+                display_name: Some("Agente Idle".to_string()),
+                avatar_url: None,
+                status: HelpdeskAgentStatus::Available,
+            },
+        )
+        .await
+        .expect("upsert agent presence");
+
+        let event = SessionEventV1 {
+            event_id: Uuid::new_v4(),
+            event_type: SessionEventType::SessionStarted,
+            session_id: "sess-agent-idle".to_string(),
+            user_id: "agent-idle".to_string(),
+            direction: SessionDirection::Outgoing,
+            timestamp: Utc::now(),
+            host_info: None,
+            meta: None,
+        };
+
+        let should_store = should_store_session_event(&pool, &event, &MonitoringConfig::default())
+            .await
+            .expect("apply monitoring policy");
+
+        assert!(!should_store);
+    }
+
+    #[tokio::test]
+    async fn monitoring_policy_accepts_agent_events_with_active_ticket() {
+        let temp = tempdir().expect("create temp dir");
+        let db_path = temp.path().join("monitoring-agent-active.db");
+        let pool = connect_sqlite(&db_path).await.expect("connect sqlite");
+
+        authorize_agent(&pool, "agent-active", "Agente Activo").await;
+        upsert_helpdesk_agent_presence(
+            &pool,
+            &HelpdeskAgentPresenceUpdateV1 {
+                agent_id: "agent-active".to_string(),
+                display_name: Some("Agente Activo".to_string()),
+                avatar_url: None,
+                status: HelpdeskAgentStatus::Available,
+            },
+        )
+        .await
+        .expect("upsert agent presence");
+
+        let ticket = create_helpdesk_ticket(
+            &pool,
+            &HelpdeskTicketCreateRequestV1 {
+                client_id: "client-active".to_string(),
+                client_display_name: None,
+                device_id: None,
+                requested_by: None,
+                title: None,
+                description: None,
+                difficulty: None,
+                estimated_minutes: None,
+                summary: Some("Active monitoring".to_string()),
+                preferred_agent_id: None,
+            },
+        )
+        .await
+        .expect("create ticket");
+
+        assign_helpdesk_ticket(
+            &pool,
+            &ticket.ticket_id,
+            Some("agent-active"),
+            Some("monitoring active test"),
+        )
+        .await
+        .expect("assign ticket");
+
+        let event = SessionEventV1 {
+            event_id: Uuid::new_v4(),
+            event_type: SessionEventType::SessionStarted,
+            session_id: "sess-agent-active".to_string(),
+            user_id: "agent-active".to_string(),
+            direction: SessionDirection::Outgoing,
+            timestamp: Utc::now(),
+            host_info: None,
+            meta: None,
+        };
+
+        let should_store = should_store_session_event(&pool, &event, &MonitoringConfig::default())
+            .await
+            .expect("apply monitoring policy");
+
+        assert!(should_store);
     }
 
     #[tokio::test]
@@ -3760,7 +3968,9 @@ mod tests {
             host_info: None,
             meta: None,
         };
-        insert_event(&pool, &event).await.expect("insert session event");
+        insert_event(&pool, &event)
+            .await
+            .expect("insert session event");
 
         let cutoff_ms = unix_millis_now() + 1_000;
 
@@ -4374,9 +4584,14 @@ mod tests {
         .await
         .expect("create ticket");
 
-        assign_helpdesk_ticket(&pool, &ticket.ticket_id, Some("agent-life"), Some("manual test"))
-            .await
-            .expect("assign ticket");
+        assign_helpdesk_ticket(
+            &pool,
+            &ticket.ticket_id,
+            Some("agent-life"),
+            Some("manual test"),
+        )
+        .await
+        .expect("assign ticket");
 
         let (started_ticket, started_agent) =
             start_helpdesk_ticket(&pool, "agent-life", &ticket.ticket_id)
@@ -4823,9 +5038,10 @@ mod tests {
         .await
         .expect("create ticket");
 
-        let error = assign_helpdesk_ticket(&pool, &ticket.ticket_id, None, Some("no agent selected"))
-            .await
-            .expect_err("assignment without explicit agent must fail");
+        let error =
+            assign_helpdesk_ticket(&pool, &ticket.ticket_id, None, Some("no agent selected"))
+                .await
+                .expect_err("assignment without explicit agent must fail");
         assert!(error.to_string().contains("agent_id is required"));
     }
 
@@ -4889,7 +5105,9 @@ mod tests {
     #[tokio::test]
     async fn agent_assignment_reflects_operational_fields_updated_by_supervisor() {
         let temp = tempdir().expect("create temp dir");
-        let db_path = temp.path().join("helpdesk-assignment-operational-fields.db");
+        let db_path = temp
+            .path()
+            .join("helpdesk-assignment-operational-fields.db");
         let pool = connect_sqlite(&db_path).await.expect("connect sqlite");
         authorize_agent(&pool, "agent-operational", "Agent Operational").await;
 
@@ -5017,13 +5235,18 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("backup profile"));
-        assert_eq!(updated.latest_agent_report_by.as_deref(), Some("Agent Report"));
+        assert_eq!(
+            updated.latest_agent_report_by.as_deref(),
+            Some("Agent Report")
+        );
         assert!(updated.latest_agent_report_at.is_some());
 
         let audit = list_helpdesk_ticket_audit_events(&pool, &ticket.ticket_id, 50)
             .await
             .expect("list audit");
-        assert!(audit.iter().any(|event| event.event_type == "agent_report_added"));
+        assert!(audit
+            .iter()
+            .any(|event| event.event_type == "agent_report_added"));
 
         let requeued = requeue_helpdesk_ticket(
             &pool,

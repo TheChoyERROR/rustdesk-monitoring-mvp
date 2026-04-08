@@ -5,12 +5,13 @@ use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
+use crate::config::MonitoringConfig;
 use crate::model::{
     HelpdeskAgentAuthorizationStatusV1, HelpdeskAgentPresenceUpdateV1, HelpdeskAgentStatus,
     HelpdeskAgentV1, HelpdeskAssignmentV1, HelpdeskAuditEventV1,
     HelpdeskAuthorizedAgentUpsertRequestV1, HelpdeskAuthorizedAgentV1,
     HelpdeskOperationalSummaryV1, HelpdeskTicketCreateRequestV1, HelpdeskTicketStatus,
-    HelpdeskTicketV1,
+    HelpdeskTicketV1, SessionEventType, SessionEventV1,
 };
 use crate::storage::HelpdeskRuntimeReconcileResult;
 
@@ -1741,6 +1742,98 @@ pub async fn get_helpdesk_agent_pg(
     .with_context(|| format!("failed to query Postgres helpdesk agent '{}'", agent_id))?;
 
     row.map(row_to_helpdesk_agent_pg).transpose()
+}
+
+pub async fn is_known_helpdesk_agent_id_pg(pool: &PgPool, user_id: &str) -> Result<bool> {
+    let normalized_user_id = normalize_helpdesk_agent_id(user_id);
+    if normalized_user_id.is_empty() {
+        return Ok(false);
+    }
+
+    let exists = sqlx::query_scalar::<_, bool>(
+        r#"
+        SELECT EXISTS(
+            SELECT 1
+            FROM helpdesk_authorized_agents haa
+            WHERE regexp_replace(trim(haa.agent_id), '\s+', '', 'g') = $1
+            UNION
+            SELECT 1
+            FROM helpdesk_agents ha
+            WHERE regexp_replace(trim(ha.agent_id), '\s+', '', 'g') = $1
+        )
+        "#,
+    )
+    .bind(&normalized_user_id)
+    .fetch_one(pool)
+    .await
+    .context("failed to classify Postgres session actor against helpdesk agents")?;
+
+    Ok(exists)
+}
+
+pub async fn helpdesk_agent_has_active_ticket_pg(pool: &PgPool, user_id: &str) -> Result<bool> {
+    let normalized_user_id = normalize_helpdesk_agent_id(user_id);
+    if normalized_user_id.is_empty() {
+        return Ok(false);
+    }
+
+    let exists = sqlx::query_scalar::<_, bool>(
+        r#"
+        SELECT EXISTS(
+            SELECT 1
+            FROM helpdesk_tickets ht
+            WHERE regexp_replace(trim(COALESCE(ht.assigned_agent_id, '')), '\s+', '', 'g') = $1
+              AND ht.status IN ('opening', 'in_progress')
+            UNION
+            SELECT 1
+            FROM helpdesk_agents ha
+            WHERE regexp_replace(trim(ha.agent_id), '\s+', '', 'g') = $1
+              AND ha.current_ticket_id IS NOT NULL
+              AND ha.status IN ('opening', 'busy')
+        )
+        "#,
+    )
+    .bind(&normalized_user_id)
+    .fetch_one(pool)
+    .await
+    .context("failed to determine whether Postgres helpdesk agent has an active ticket")?;
+
+    Ok(exists)
+}
+
+pub async fn should_store_session_event_pg(
+    sqlite_pool: &sqlx::SqlitePool,
+    helpdesk_pool: &PgPool,
+    event: &SessionEventV1,
+    monitoring: &MonitoringConfig,
+) -> Result<bool> {
+    if monitoring.capture_non_agent_events {
+        return crate::storage::should_store_participant_activity_for_monitoring(
+            sqlite_pool,
+            event,
+            monitoring,
+        )
+        .await;
+    }
+
+    if !is_known_helpdesk_agent_id_pg(helpdesk_pool, &event.user_id).await? {
+        return Ok(false);
+    }
+
+    if !helpdesk_agent_has_active_ticket_pg(helpdesk_pool, &event.user_id).await? {
+        return Ok(false);
+    }
+
+    if event.event_type == SessionEventType::ParticipantActivity {
+        return crate::storage::should_store_participant_activity_for_monitoring(
+            sqlite_pool,
+            event,
+            monitoring,
+        )
+        .await;
+    }
+
+    Ok(true)
 }
 
 async fn get_helpdesk_authorized_agent_pg(

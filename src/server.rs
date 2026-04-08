@@ -41,8 +41,9 @@ use crate::postgres_helpdesk::{
     get_helpdesk_operational_summary_pg, get_helpdesk_ticket_pg, list_helpdesk_agents_pg,
     list_helpdesk_authorized_agents_pg, list_helpdesk_ticket_audit_pg, list_helpdesk_tickets_pg,
     reconcile_helpdesk_runtime_pg, requeue_helpdesk_ticket_pg, resolve_helpdesk_ticket_pg,
-    start_helpdesk_ticket_pg, update_helpdesk_ticket_operational_fields_pg,
-    upsert_helpdesk_agent_presence_pg, upsert_helpdesk_authorized_agent_pg,
+    should_store_session_event_pg, start_helpdesk_ticket_pg,
+    update_helpdesk_ticket_operational_fields_pg, upsert_helpdesk_agent_presence_pg,
+    upsert_helpdesk_authorized_agent_pg,
 };
 use crate::storage::{
     add_helpdesk_ticket_agent_report, assign_helpdesk_ticket, cancel_helpdesk_ticket,
@@ -583,6 +584,18 @@ fn active_helpdesk_postgres_pool(state: &AppState) -> Option<&sqlx::PgPool> {
     } else {
         None
     }
+}
+
+async fn should_store_session_event_for_active_helpdesk_backend(
+    state: &AppState,
+    event: &SessionEventV1,
+) -> anyhow::Result<bool> {
+    if let Some(pool) = active_helpdesk_postgres_pool(state) {
+        return should_store_session_event_pg(&state.pool, pool, event, &state.config.monitoring)
+            .await;
+    }
+
+    should_store_session_event(&state.pool, event, &state.config.monitoring).await
 }
 
 async fn health_handler() -> impl IntoResponse {
@@ -1743,8 +1756,13 @@ async fn requeue_helpdesk_ticket_pg_handler(
         .next_agent_status
         .unwrap_or(HelpdeskAgentStatus::Available);
 
-    match requeue_helpdesk_ticket_pg(pool, &ticket_id, next_agent_status, payload.reason.as_deref())
-        .await
+    match requeue_helpdesk_ticket_pg(
+        pool,
+        &ticket_id,
+        next_agent_status,
+        payload.reason.as_deref(),
+    )
+    .await
     {
         Ok((ticket, agent)) => (
             StatusCode::OK,
@@ -1838,8 +1856,13 @@ async fn cancel_helpdesk_ticket_pg_handler(
         .next_agent_status
         .unwrap_or(HelpdeskAgentStatus::Available);
 
-    match cancel_helpdesk_ticket_pg(pool, &ticket_id, next_agent_status, payload.reason.as_deref())
-        .await
+    match cancel_helpdesk_ticket_pg(
+        pool,
+        &ticket_id,
+        next_agent_status,
+        payload.reason.as_deref(),
+    )
+    .await
     {
         Ok((ticket, agent)) => (
             StatusCode::OK,
@@ -2423,7 +2446,7 @@ async fn ingest_session_event(
         );
     }
 
-    match should_store_session_event(&state.pool, &event, &state.config.monitoring).await {
+    match should_store_session_event_for_active_helpdesk_backend(&state, &event).await {
         Ok(false) => {
             return (
                 StatusCode::ACCEPTED,

@@ -15,12 +15,6 @@ import type {
   SessionEventType,
 } from './types';
 
-export type HelpdeskBackendMode = 'sqlite' | 'postgres';
-
-const HELP_DESK_BACKEND_MODE_KEY = 'helpdesk_backend_mode';
-const DEFAULT_HELPDESK_BACKEND_MODE: HelpdeskBackendMode =
-  import.meta.env.VITE_HELPDESK_BACKEND === 'postgres' ? 'postgres' : 'sqlite';
-
 class ApiError extends Error {
   status: number;
   payload: unknown;
@@ -56,36 +50,6 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return payload as T;
 }
 
-function readStoredHelpdeskBackendMode(): HelpdeskBackendMode | null {
-  if (typeof window === 'undefined') {
-    return null;
-  }
-
-  const rawValue = window.localStorage.getItem(HELP_DESK_BACKEND_MODE_KEY);
-  return rawValue === 'postgres' || rawValue === 'sqlite' ? rawValue : null;
-}
-
-export function getHelpdeskBackendMode(): HelpdeskBackendMode {
-  return readStoredHelpdeskBackendMode() ?? DEFAULT_HELPDESK_BACKEND_MODE;
-}
-
-export function isHelpdeskPostgresModeEnabled(): boolean {
-  return getHelpdeskBackendMode() === 'postgres';
-}
-
-export function setHelpdeskBackendMode(mode: HelpdeskBackendMode) {
-  if (typeof window === 'undefined') {
-    return;
-  }
-
-  window.localStorage.setItem(HELP_DESK_BACKEND_MODE_KEY, mode);
-  window.dispatchEvent(
-    new CustomEvent('helpdesk-backend-mode-changed', {
-      detail: { mode },
-    }),
-  );
-}
-
 function buildQuery(params: Record<string, unknown>): string {
   const search = new URLSearchParams();
   Object.entries(params).forEach(([key, value]) => {
@@ -102,7 +66,7 @@ function buildQuery(params: Record<string, unknown>): string {
 }
 
 function helpdeskBasePath(): string {
-  return isHelpdeskPostgresModeEnabled() ? '/api/v1/postgres/helpdesk' : '/api/v1/helpdesk';
+  return '/api/v1/helpdesk';
 }
 
 export async function apiLogin(body: AuthLoginRequest): Promise<AuthLoginResponse> {

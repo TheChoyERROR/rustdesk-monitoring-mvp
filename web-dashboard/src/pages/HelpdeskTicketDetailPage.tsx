@@ -9,8 +9,6 @@ import {
   apiHelpdeskTicketCancel,
   apiHelpdeskTicketRequeue,
   apiHelpdeskTicketUpdateOperational,
-  getHelpdeskBackendMode,
-  type HelpdeskBackendMode,
 } from '../api';
 import { formatDateTime } from '../lib/time';
 import type {
@@ -94,8 +92,6 @@ export default function HelpdeskTicketDetailPage() {
   const { ticketId = '' } = useParams();
   const decodedTicketId = useMemo(() => decodeURIComponent(ticketId), [ticketId]);
 
-  const [helpdeskBackendMode, setHelpdeskBackendMode] =
-    useState<HelpdeskBackendMode>(getHelpdeskBackendMode());
   const [ticket, setTicket] = useState<HelpdeskTicket | null>(null);
   const [agents, setAgents] = useState<HelpdeskAgent[]>([]);
   const [audit, setAudit] = useState<HelpdeskAuditEvent[]>([]);
@@ -139,35 +135,11 @@ export default function HelpdeskTicketDetailPage() {
   }, [load]);
 
   useEffect(() => {
-    const syncMode = () => {
-      setHelpdeskBackendMode(getHelpdeskBackendMode());
-    };
-
-    const onStorage = (event: StorageEvent) => {
-      if (event.key === 'helpdesk_backend_mode') {
-        syncMode();
-      }
-    };
-
-    window.addEventListener('helpdesk-backend-mode-changed', syncMode);
-    window.addEventListener('storage', onStorage);
-
-    return () => {
-      window.removeEventListener('helpdesk-backend-mode-changed', syncMode);
-      window.removeEventListener('storage', onStorage);
-    };
-  }, []);
-
-  useEffect(() => {
     const timer = window.setInterval(() => {
       void load(true);
     }, 5000);
     return () => window.clearInterval(timer);
-  }, [load, helpdeskBackendMode]);
-
-  useEffect(() => {
-    void load();
-  }, [helpdeskBackendMode, load]);
+  }, [load]);
 
   const availableAgents = useMemo(() => {
     return agents.filter((agent) => agent.status === 'available');
@@ -196,12 +168,6 @@ export default function HelpdeskTicketDetailPage() {
           </p>
           <h2>{ticket ? ticketHeadline(ticket) : decodedTicketId}</h2>
           {ticket ? <p className="activity-summary-line">{ticket.ticket_id}</p> : null}
-          <p className="activity-summary-line">
-            Backend activo:{' '}
-            <strong>
-              {helpdeskBackendMode === 'postgres' ? 'Postgres experimental' : 'SQLite actual'}
-            </strong>
-          </p>
         </div>
         <button type="button" className="btn secondary" onClick={() => void load()} disabled={refreshing}>
           {refreshing ? 'Actualizando...' : 'Refrescar'}
@@ -215,16 +181,6 @@ export default function HelpdeskTicketDetailPage() {
 
       {ticket && (
         <>
-          {helpdeskBackendMode === 'postgres' ? (
-            <div className="panel">
-              <p className="activity-summary-line">
-                Este ticket se esta gestionando desde Postgres. Si el backend ya corre con
-                <code> HELPDESK_BACKEND=postgres </code>
-                el despacho y las acciones operativas deben funcionar aqui igual que en SQLite.
-              </p>
-            </div>
-          ) : null}
-
           <div className="panel">
             <div className="detail-actions">
               <div className="filter-grid">
