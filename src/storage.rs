@@ -427,6 +427,21 @@ pub async fn cleanup_delivered_older_than(
     Ok(result.rows_affected())
 }
 
+pub async fn delete_outbox_event(pool: &SqlitePool, event_id: &str) -> anyhow::Result<u64> {
+    let result = sqlx::query(
+        r#"
+        DELETE FROM outbox_events
+        WHERE event_id = ?1
+        "#,
+    )
+    .bind(event_id)
+    .execute(pool)
+    .await
+    .with_context(|| format!("failed to delete outbox event {event_id}"))?;
+
+    Ok(result.rows_affected())
+}
+
 pub async fn cleanup_session_events_older_than(
     pool: &SqlitePool,
     cutoff_ms: u64,

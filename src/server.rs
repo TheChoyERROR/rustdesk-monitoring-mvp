@@ -59,15 +59,16 @@ use crate::storage::{
     cleanup_failed_older_than, cleanup_helpdesk_agent_heartbeats_older_than,
     cleanup_inactive_session_presence_older_than, cleanup_session_events_older_than,
     connect_sqlite, create_helpdesk_ticket, delete_dashboard_session,
-    delete_helpdesk_authorized_agent, expire_stale_presence, get_dashboard_session_by_token,
-    get_dashboard_summary, get_dashboard_user_by_username, get_helpdesk_agent_authorization_status,
-    get_helpdesk_assignment_for_agent, get_helpdesk_operational_summary, get_helpdesk_ticket,
-    get_session_presence, insert_event, list_active_session_presence, list_helpdesk_agents,
-    list_helpdesk_authorized_agents, list_helpdesk_ticket_audit_events, list_helpdesk_tickets,
-    mark_delivered, mark_failed, query_session_report_rows, query_timeline_events,
-    reconcile_helpdesk_runtime, requeue_helpdesk_ticket, reset_stuck_processing,
-    resolve_helpdesk_ticket, schedule_retry, should_store_session_event, start_helpdesk_ticket,
-    unix_millis_now, update_helpdesk_ticket_operational_fields, upsert_dashboard_user,
+    delete_helpdesk_authorized_agent, delete_outbox_event, expire_stale_presence,
+    get_dashboard_session_by_token, get_dashboard_summary, get_dashboard_user_by_username,
+    get_helpdesk_agent_authorization_status, get_helpdesk_assignment_for_agent,
+    get_helpdesk_operational_summary, get_helpdesk_ticket, get_session_presence, insert_event,
+    list_active_session_presence, list_helpdesk_agents, list_helpdesk_authorized_agents,
+    list_helpdesk_ticket_audit_events, list_helpdesk_tickets, mark_delivered, mark_failed,
+    query_session_report_rows, query_timeline_events, reconcile_helpdesk_runtime,
+    requeue_helpdesk_ticket, reset_stuck_processing, resolve_helpdesk_ticket, schedule_retry,
+    should_store_session_event, start_helpdesk_ticket, unix_millis_now,
+    update_helpdesk_ticket_operational_fields, upsert_dashboard_user,
     upsert_helpdesk_agent_presence, upsert_helpdesk_authorized_agent, EventQueryFilter,
     InsertOutcome, OutboxRecord,
 };
@@ -568,6 +569,7 @@ pub async fn run(
         background_jobs.push(tokio::spawn(turso_sync_worker(state.clone())));
     }
     background_jobs.push(tokio::spawn(cleanup_worker(state.clone())));
+    background_jobs.push(tokio::spawn(sqlite_fallback_replay_worker(state.clone())));
 
     let listener = tokio::net::TcpListener::bind(bind_addr)
         .await
@@ -688,6 +690,112 @@ async fn insert_session_event_for_active_monitoring_backend(
     }
 
     insert_event(&state.pool, event).await
+}
+
+async fn query_dashboard_summary_for_active_monitoring_backend(
+    state: &AppState,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+) -> anyhow::Result<crate::model::DashboardSummaryV1> {
+    if let Some(pool) = active_monitoring_postgres_pool(state) {
+        match get_dashboard_summary_pg(pool, from, to).await {
+            Ok(summary) => return Ok(summary),
+            Err(err) if state.sqlite_fallback_enabled => {
+                warn!(
+                    error = %err,
+                    "failed to query dashboard summary from Postgres; falling back to SQLite"
+                );
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    get_dashboard_summary(&state.pool, from, to).await
+}
+
+async fn query_timeline_events_for_active_monitoring_backend(
+    state: &AppState,
+    filter: &EventQueryFilter,
+    page: u64,
+    page_size: u64,
+) -> anyhow::Result<(Vec<crate::model::SessionTimelineItemV1>, u64)> {
+    if let Some(pool) = active_monitoring_postgres_pool(state) {
+        match query_timeline_events_pg(pool, filter, page, page_size).await {
+            Ok(result) => return Ok(result),
+            Err(err) if state.sqlite_fallback_enabled => {
+                warn!(
+                    error = %err,
+                    "failed to query timeline events from Postgres; falling back to SQLite"
+                );
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    query_timeline_events(&state.pool, filter, page, page_size).await
+}
+
+async fn query_session_report_rows_for_active_monitoring_backend(
+    state: &AppState,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+    user_id: Option<&str>,
+    actor_type: Option<SessionActorTypeV1>,
+) -> anyhow::Result<Vec<crate::model::SessionReportRowV1>> {
+    if let Some(pool) = active_monitoring_postgres_pool(state) {
+        match query_session_report_rows_pg(pool, from, to, user_id, actor_type).await {
+            Ok(rows) => return Ok(rows),
+            Err(err) if state.sqlite_fallback_enabled => {
+                warn!(
+                    error = %err,
+                    "failed to query session report rows from Postgres; falling back to SQLite"
+                );
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    query_session_report_rows(&state.pool, from, to, user_id, actor_type).await
+}
+
+async fn list_active_session_presence_for_active_monitoring_backend(
+    state: &AppState,
+) -> anyhow::Result<Vec<crate::model::PresenceSessionSummaryV1>> {
+    if let Some(pool) = active_monitoring_postgres_pool(state) {
+        match list_active_session_presence_pg(pool).await {
+            Ok(rows) => return Ok(rows),
+            Err(err) if state.sqlite_fallback_enabled => {
+                warn!(
+                    error = %err,
+                    "failed to list active session presence from Postgres; falling back to SQLite"
+                );
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    list_active_session_presence(&state.pool).await
+}
+
+async fn get_session_presence_for_active_monitoring_backend(
+    state: &AppState,
+    session_id: &str,
+) -> anyhow::Result<Option<crate::model::SessionPresenceV1>> {
+    if let Some(pool) = active_monitoring_postgres_pool(state) {
+        match get_session_presence_pg(pool, session_id).await {
+            Ok(snapshot) => return Ok(snapshot),
+            Err(err) if state.sqlite_fallback_enabled => {
+                warn!(
+                    error = %err,
+                    session_id,
+                    "failed to query session presence from Postgres; falling back to SQLite"
+                );
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    get_session_presence(&state.pool, session_id).await
 }
 
 async fn health_handler() -> impl IntoResponse {
@@ -2176,13 +2284,7 @@ async fn dashboard_summary_handler(
         return bad_request("from must be less than or equal to to");
     }
 
-    let summary_result = if let Some(pool) = active_monitoring_postgres_pool(&state) {
-        get_dashboard_summary_pg(pool, from, to).await
-    } else {
-        get_dashboard_summary(&state.pool, from, to).await
-    };
-
-    match summary_result {
+    match query_dashboard_summary_for_active_monitoring_backend(&state, from, to).await {
         Ok(summary) => (StatusCode::OK, Json(summary)).into_response(),
         Err(err) => {
             error!(error = %err, "failed to query dashboard summary");
@@ -2236,13 +2338,9 @@ async fn events_list_handler(
         to,
     };
 
-    let query_result = if let Some(pool) = active_monitoring_postgres_pool(&state) {
-        query_timeline_events_pg(pool, &filter, page, page_size).await
-    } else {
-        query_timeline_events(&state.pool, &filter, page, page_size).await
-    };
-
-    match query_result {
+    match query_timeline_events_for_active_monitoring_backend(&state, &filter, page, page_size)
+        .await
+    {
         Ok((items, total)) => (
             StatusCode::OK,
             Json(PaginatedResponseV1 {
@@ -2283,13 +2381,9 @@ async fn session_timeline_handler(
         ..Default::default()
     };
 
-    let query_result = if let Some(pool) = active_monitoring_postgres_pool(&state) {
-        query_timeline_events_pg(pool, &filter, page, page_size).await
-    } else {
-        query_timeline_events(&state.pool, &filter, page, page_size).await
-    };
-
-    match query_result {
+    match query_timeline_events_for_active_monitoring_backend(&state, &filter, page, page_size)
+        .await
+    {
         Ok((items, total)) => (
             StatusCode::OK,
             Json(PaginatedResponseV1 {
@@ -2335,13 +2429,11 @@ async fn sessions_report_csv_handler(
         Err(err) => return bad_request(err),
     };
 
-    let rows_result = if let Some(pool) = active_monitoring_postgres_pool(&state) {
-        query_session_report_rows_pg(pool, from, to, user_id, actor_type).await
-    } else {
-        query_session_report_rows(&state.pool, from, to, user_id, actor_type).await
-    };
-
-    let rows = match rows_result {
+    let rows = match query_session_report_rows_for_active_monitoring_backend(
+        &state, from, to, user_id, actor_type,
+    )
+    .await
+    {
         Ok(rows) => rows,
         Err(err) => {
             error!(error = %err, "failed to query session report rows");
@@ -2448,13 +2540,7 @@ async fn require_dashboard_auth(
 }
 
 async fn list_presence_sessions_handler(State(state): State<AppState>) -> impl IntoResponse {
-    let sessions_result = if let Some(pool) = active_monitoring_postgres_pool(&state) {
-        list_active_session_presence_pg(pool).await
-    } else {
-        list_active_session_presence(&state.pool).await
-    };
-
-    match sessions_result {
+    match list_active_session_presence_for_active_monitoring_backend(&state).await {
         Ok(sessions) => (
             StatusCode::OK,
             Json(json!({
@@ -2475,13 +2561,7 @@ async fn get_session_presence_handler(
     State(state): State<AppState>,
     AxumPath(session_id): AxumPath<String>,
 ) -> impl IntoResponse {
-    let presence_result = if let Some(pool) = active_monitoring_postgres_pool(&state) {
-        get_session_presence_pg(pool, &session_id).await
-    } else {
-        get_session_presence(&state.pool, &session_id).await
-    };
-
-    match presence_result {
+    match get_session_presence_for_active_monitoring_backend(&state, &session_id).await {
         Ok(Some(snapshot)) => (
             StatusCode::OK,
             Json(json!({
@@ -2631,13 +2711,7 @@ async fn ingest_session_event(
 }
 
 async fn presence_snapshot_sse_event(state: &AppState, session_id: &str) -> Event {
-    let presence_result = if let Some(pool) = active_monitoring_postgres_pool(state) {
-        get_session_presence_pg(pool, session_id).await
-    } else {
-        get_session_presence(&state.pool, session_id).await
-    };
-
-    match presence_result {
+    match get_session_presence_for_active_monitoring_backend(state, session_id).await {
         Ok(Some(snapshot)) => Event::default().event("presence_snapshot").data(
             json!({
                 "session_id": session_id,
@@ -2899,6 +2973,72 @@ async fn webhook_worker(state: AppState) {
     }
 }
 
+async fn sqlite_fallback_replay_worker(state: AppState) {
+    if active_monitoring_postgres_pool(&state).is_none() || !state.sqlite_fallback_enabled {
+        return;
+    }
+
+    let poll_interval = Duration::from_millis(state.config.worker.poll_interval_ms);
+    let stuck_processing_threshold_ms = state
+        .config
+        .webhook
+        .timeout_ms
+        .saturating_mul(4)
+        .max(30_000);
+
+    info!("SQLite fallback replay worker enabled for Postgres monitoring backend");
+
+    loop {
+        let now_ms = unix_millis_now();
+
+        match reset_stuck_processing(&state.pool, stuck_processing_threshold_ms, now_ms).await {
+            Ok(reset_count) if reset_count > 0 => {
+                warn!(reset_count, "reset stale SQLite fallback processing rows");
+            }
+            Ok(_) => {}
+            Err(err) => {
+                error!(
+                    error = %err,
+                    "failed to reset stale SQLite fallback processing rows"
+                );
+                tokio::time::sleep(poll_interval).await;
+                continue;
+            }
+        }
+
+        let batch_limit = state.config.worker.concurrency.saturating_mul(2);
+        let due_events = match claim_due_events(&state.pool, batch_limit, now_ms).await {
+            Ok(rows) => rows,
+            Err(err) => {
+                error!(error = %err, "failed to claim SQLite fallback events");
+                tokio::time::sleep(poll_interval).await;
+                continue;
+            }
+        };
+
+        if due_events.is_empty() {
+            tokio::time::sleep(poll_interval).await;
+            continue;
+        }
+
+        futures::stream::iter(due_events)
+            .for_each_concurrent(state.config.worker.concurrency, |record| {
+                let worker_state = state.clone();
+                async move {
+                    let event_id = record.event_id.clone();
+                    if let Err(err) = process_sqlite_fallback_record(worker_state, record).await {
+                        error!(
+                            error = %err,
+                            event_id = %event_id,
+                            "error while replaying SQLite fallback event into Postgres"
+                        );
+                    }
+                }
+            })
+            .await;
+    }
+}
+
 async fn process_outbox_record(state: AppState, record: OutboxRecord) -> anyhow::Result<()> {
     let event: SessionEventV1 = match serde_json::from_str(&record.payload) {
         Ok(payload) => payload,
@@ -3017,6 +3157,103 @@ async fn process_outbox_record(state: AppState, record: OutboxRecord) -> anyhow:
     Ok(())
 }
 
+async fn process_sqlite_fallback_record(
+    state: AppState,
+    record: OutboxRecord,
+) -> anyhow::Result<()> {
+    let event: SessionEventV1 = match serde_json::from_str(&record.payload) {
+        Ok(payload) => payload,
+        Err(err) => {
+            let attempts = record.attempts.saturating_add(1);
+            let now_ms = unix_millis_now();
+            mark_failed(
+                &state.pool,
+                &record.event_id,
+                attempts,
+                &format!("invalid JSON payload in SQLite fallback outbox: {err}"),
+                now_ms,
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    let Some(pool) = active_monitoring_postgres_pool(&state) else {
+        let now_ms = unix_millis_now();
+        let current_attempt = record.attempts.saturating_add(1);
+        let next_attempt_at =
+            now_ms.saturating_add(state.config.webhook.retry.backoff_ms.max(1_000));
+        schedule_retry(
+            &state.pool,
+            &record.event_id,
+            current_attempt,
+            next_attempt_at,
+            "Postgres monitoring backend unavailable during SQLite fallback replay",
+            now_ms,
+        )
+        .await?;
+        return Ok(());
+    };
+
+    let current_attempt = record.attempts.saturating_add(1);
+    let now_ms = unix_millis_now();
+
+    match insert_event_pg(pool, &event).await {
+        Ok(InsertOutcome::Inserted) | Ok(InsertOutcome::Duplicate) => {
+            delete_outbox_event(&state.pool, &record.event_id).await?;
+            if event.event_type.affects_presence() {
+                let _ = state.presence_updates.send(event.session_id.clone());
+            }
+            debug!(
+                event_id = %record.event_id,
+                "replayed SQLite fallback event into Postgres"
+            );
+        }
+        Err(err) => {
+            let error_message = truncate_error(&err.to_string());
+            if current_attempt >= state.config.webhook.retry.max_attempts {
+                mark_failed(
+                    &state.pool,
+                    &record.event_id,
+                    current_attempt,
+                    &error_message,
+                    now_ms,
+                )
+                .await?;
+                warn!(
+                    event_id = %record.event_id,
+                    attempts = current_attempt,
+                    error = %error_message,
+                    "SQLite fallback replay permanently failed"
+                );
+            } else {
+                let base = state.config.webhook.retry.backoff_ms;
+                let exponent = current_attempt.saturating_sub(1).min(16);
+                let backoff_ms = base.saturating_mul(1u64 << exponent);
+                let next_attempt_at = now_ms.saturating_add(backoff_ms);
+                schedule_retry(
+                    &state.pool,
+                    &record.event_id,
+                    current_attempt,
+                    next_attempt_at,
+                    &error_message,
+                    now_ms,
+                )
+                .await?;
+                warn!(
+                    event_id = %record.event_id,
+                    attempts = current_attempt,
+                    next_attempt_at,
+                    error = %error_message,
+                    "scheduled SQLite fallback replay retry"
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
 async fn cleanup_worker(state: AppState) {
     let interval = Duration::from_secs(
         state
@@ -3030,6 +3267,8 @@ async fn cleanup_worker(state: AppState) {
         tokio::time::sleep(interval).await;
 
         let now_ms = unix_millis_now();
+        let cleanup_sqlite_fallback =
+            active_monitoring_postgres_pool(&state).is_some() && state.sqlite_fallback_enabled;
         let failed_retention_ms = state
             .config
             .retention
@@ -3050,6 +3289,19 @@ async fn cleanup_worker(state: AppState) {
             Ok(deleted) if deleted > 0 => info!(deleted, "cleaned old failed outbox events"),
             Ok(_) => {}
             Err(err) => error!(error = %err, "failed to cleanup old failed outbox events"),
+        }
+
+        if cleanup_sqlite_fallback {
+            match cleanup_failed_older_than(&state.pool, failed_cutoff_ms).await {
+                Ok(deleted) if deleted > 0 => {
+                    info!(deleted, "cleaned old failed SQLite fallback outbox events")
+                }
+                Ok(_) => {}
+                Err(err) => error!(
+                    error = %err,
+                    "failed to cleanup old failed SQLite fallback outbox events"
+                ),
+            }
         }
 
         let delivered_retention_ms = state
@@ -3076,6 +3328,22 @@ async fn cleanup_worker(state: AppState) {
             Err(err) => error!(error = %err, "failed to cleanup old delivered outbox events"),
         }
 
+        if cleanup_sqlite_fallback {
+            match cleanup_delivered_older_than(&state.pool, delivered_cutoff_ms).await {
+                Ok(deleted) if deleted > 0 => {
+                    info!(
+                        deleted,
+                        "cleaned old delivered SQLite fallback outbox events"
+                    )
+                }
+                Ok(_) => {}
+                Err(err) => error!(
+                    error = %err,
+                    "failed to cleanup old delivered SQLite fallback outbox events"
+                ),
+            }
+        }
+
         let session_event_retention_ms = state
             .config
             .monitoring
@@ -3097,6 +3365,19 @@ async fn cleanup_worker(state: AppState) {
             Ok(deleted) if deleted > 0 => info!(deleted, "cleaned old session events"),
             Ok(_) => {}
             Err(err) => error!(error = %err, "failed to cleanup old session events"),
+        }
+
+        if cleanup_sqlite_fallback {
+            match cleanup_session_events_older_than(&state.pool, session_event_cutoff_ms).await {
+                Ok(deleted) if deleted > 0 => {
+                    info!(deleted, "cleaned old SQLite fallback session events")
+                }
+                Ok(_) => {}
+                Err(err) => error!(
+                    error = %err,
+                    "failed to cleanup old SQLite fallback session events"
+                ),
+            }
         }
 
         let session_presence_retention_ms = state
@@ -3121,6 +3402,27 @@ async fn cleanup_worker(state: AppState) {
             }
             Ok(_) => {}
             Err(err) => error!(error = %err, "failed to cleanup session presence rows"),
+        }
+
+        if cleanup_sqlite_fallback {
+            match cleanup_inactive_session_presence_older_than(
+                &state.pool,
+                session_presence_cutoff_ms,
+            )
+            .await
+            {
+                Ok(deleted) if deleted > 0 => {
+                    info!(
+                        deleted,
+                        "cleaned stale inactive SQLite fallback session presence rows"
+                    )
+                }
+                Ok(_) => {}
+                Err(err) => error!(
+                    error = %err,
+                    "failed to cleanup SQLite fallback session presence rows"
+                ),
+            }
         }
 
         let heartbeat_retention_ms = state
@@ -3162,6 +3464,8 @@ async fn presence_cleanup_worker(state: AppState) {
 
         let now_ms = unix_millis_now();
         let stale_before_ms = now_ms.saturating_sub(stale_after_ms) as i64;
+        let cleanup_sqlite_fallback =
+            active_monitoring_postgres_pool(&state).is_some() && state.sqlite_fallback_enabled;
 
         let expire_result = if let Some(pool) = active_monitoring_postgres_pool(&state) {
             expire_stale_presence_pg(pool, stale_before_ms, now_ms as i64).await
@@ -3184,6 +3488,28 @@ async fn presence_cleanup_worker(state: AppState) {
             }
             Ok(_) => {}
             Err(err) => error!(error = %err, "failed to cleanup stale session presence rows"),
+        }
+
+        if cleanup_sqlite_fallback {
+            match expire_stale_presence(&state.pool, stale_before_ms, now_ms as i64).await {
+                Ok((expired_rows, touched_sessions)) if expired_rows > 0 => {
+                    info!(
+                        expired_rows,
+                        sessions = touched_sessions.len(),
+                        stale_after_seconds = state.config.presence.stale_after_seconds,
+                        "expired stale SQLite fallback session presence rows"
+                    );
+
+                    for session_id in touched_sessions {
+                        let _ = state.presence_updates.send(session_id);
+                    }
+                }
+                Ok(_) => {}
+                Err(err) => error!(
+                    error = %err,
+                    "failed to cleanup stale SQLite fallback session presence rows"
+                ),
+            }
         }
     }
 }
